@@ -1,0 +1,6 @@
+pandas>=2.2.0
+openpyxl>=3.1.2
+pyautogui>=0.9.54
+pywinauto>=0.6.8
+pywin32>=306; platform_system == "Windows"
+Pillow>=10.2.0

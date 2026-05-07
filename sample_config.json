@@ -1,0 +1,19 @@
+{
+  "install_paths": {
+    "qb_2023_path": "C:\\Program Files\\Intuit\\QuickBooks 2023\\QBWPremierAccountant.exe",
+    "qb_2021_path": "C:\\Program Files (x86)\\Intuit\\QuickBooks 2021\\QBW32PremierAccountant.exe"
+  },
+  "timeouts": {
+    "launch_qb_seconds": 90,
+    "open_company_seconds": 90,
+    "export_seconds": 180,
+    "import_seconds": 300,
+    "report_seconds": 240,
+    "app_close_seconds": 45
+  },
+  "default_output_dir": "C:\\QBDowngrade\\Results",
+  "retry_attempts": 2,
+  "retry_delay_seconds": 5,
+  "continue_on_error": true,
+  "dry_run": true
+}
