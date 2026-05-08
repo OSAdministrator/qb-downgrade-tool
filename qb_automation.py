@@ -68,6 +68,10 @@ class QuickBooksAutomationEngine:
         self.validator = ValidationReportBuilder()
         self._qb2023_app: Optional[object] = None
         self._qb2021_app: Optional[object] = None
+        # Tracks whether password was already entered during QB startup dialogs.
+        # Used to prevent redundant _open_company_file() call in _export_from_qb2023().
+        # See bug note in _export_from_qb2023() for details.
+        self._startup_password_handled: bool = False
 
     def _emit(self, msg: str, log_fn: Optional[LogFn]) -> None:
         self.logger.info(msg)
@@ -1376,6 +1380,7 @@ class QuickBooksAutomationEngine:
                     send_keys("{ENTER}")
 
                     password_entered = True
+                    self._startup_password_handled = True
                     self._emit("Password entered at startup (type + Enter)", log_fn)
                     time.sleep(5)  # Wait for QB to process login
 
@@ -1385,6 +1390,7 @@ class QuickBooksAutomationEngine:
                         self._emit("Password may have been incorrect, dismissing warning", log_fn)
                         self._click_first_button(warning_dlg, ["OK", "Close"])
                         password_entered = False  # Allow retry
+                        self._startup_password_handled = False  # Reset — password was wrong
                         time.sleep(1)
                     continue
                 else:
@@ -1465,9 +1471,34 @@ class QuickBooksAutomationEngine:
         main_window = self._find_qb_main_window(self._qb2023_app, "2023", self.config.timeouts.launch_qb_seconds)
         self._dismiss_common_dialogs(log_fn)
 
-        # Check if the company is already open (QB remembers last opened company)
+        # =====================================================================
+        # FIX (2026-05-08): Prevent redundant company reopen after startup
+        # password entry.
+        #
+        # BUG: When _handle_startup_dialogs() successfully enters the admin
+        # password, the company IS already open — but QB's main window title
+        # hasn't updated yet at this point.  _is_company_already_open() checks
+        # the window title, so it returns False, causing _open_company_file()
+        # to close and reopen the company.  This triggers a *second* password
+        # prompt, which the user must answer manually (the tool already typed
+        # the password once during startup).
+        #
+        # FIX: Track whether the password was entered during startup via the
+        # instance flag self._startup_password_handled.  If True, the company
+        # is already open — skip the _open_company_file() call entirely.
+        # =====================================================================
         company_hint = job.qbw_path.stem.split(" ")[0]  # e.g., "joshs" from "joshs gold coast ii 23"
-        if self._is_company_already_open(main_window, company_hint):
+
+        if self._startup_password_handled:
+            # Password was entered during startup — company is already open.
+            # Do NOT call _open_company_file(); it would close & reopen,
+            # causing a duplicate password prompt.
+            self._emit(
+                "Startup password was already handled — company is open, "
+                "skipping redundant File->Open",
+                log_fn,
+            )
+        elif self._is_company_already_open(main_window, company_hint):
             self._emit("Company already open in QB 2023, skipping File->Open", log_fn)
         else:
             self._emit("Company not open, opening company file...", log_fn)
