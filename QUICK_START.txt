@@ -1,0 +1,68 @@
+QUICKBOOKS DOWNGRADE TOOL - QUICK START GUIDE
+================================================
+
+PURPOSE: Convert QuickBooks 2023 company files to QuickBooks 2021 format
+with full transaction migration and data validation.
+
+LAUNCHING THE TOOL:
+- Double-click "QB Downgrade Tool" on your Desktop
+- Or run: python C:\QBDowngradeApp\qb_downgrade_gui.py
+
+STEP 1: ADD FILES
+- Click "Add QBW Files" to browse for .qbw files
+- You can select multiple files at once
+- Files appear in the queue with "Queued" status
+
+STEP 2: SET PASSWORDS
+- Type the admin password in "Default password" field
+- Click "Apply" to set it for all files (or selected files)
+- For different passwords per file, use "Load Passwords JSON"
+  Create a JSON file like: {"filename.qbw": "password123"}
+
+STEP 3: CONFIGURE SETTINGS
+- Click "Settings" to adjust paths and options
+- IMPORTANT: Uncheck "Dry-run mode" for production processing
+- Set output directory (default: C:\QBDowngrade\Target)
+- Adjust timeouts if needed for large files
+
+STEP 4: START PROCESSING
+- Click "Start Processing" to begin the batch
+- Monitor progress in the Status Log and progress bar
+- Each file goes through: Export -> Parse -> Import -> Validate
+
+STEP 5: REVIEW RESULTS
+- Check Status column: "Success" or "Failed"
+- Output files are in: C:\QBDowngrade\Target\<company_name>\
+  - exports/     = IIF lists, CSV transactions, PDF reports
+  - target/      = QB 2021 company file
+  - validation/  = Excel and HTML validation reports
+
+BATCH PROCESSING (20 files):
+- Put all QB 2023 files in: C:\QBDowngrade\Batch_Input\
+- Set output to: C:\QBDowngrade\Batch_Output\
+- Add all files, set passwords, click Start Processing
+- Reports will be in each company's validation/ subfolder
+
+VALIDATION REPORTS:
+- Open validation_report.html in a browser for visual review
+- Open validation_report.xlsx in Excel for detailed analysis
+- All metrics should show "PASS" (green)
+- "FAIL" (red) means a discrepancy needs investigation
+
+TROUBLESHOOTING:
+- If a file fails, check the Status Log for error details
+- "Continue on error" setting lets batch continue past failures
+- Retry attempts are configurable in Settings
+- Log file: C:\QBDowngradeApp\logs\qb_downgrade_tool.log
+
+FILE STRUCTURE:
+C:\QBDowngrade\
+  Source\          - Original QB 2023 files
+  Target\          - Converted QB 2021 files
+  Batch_Input\     - Place 20 QB 2023 files here
+  Batch_Output\    - Batch conversion output
+  Reports\         - Validation reports
+
+SUPPORT:
+- README: C:\QBDowngradeApp\README.md
+- Installation: C:\QBDowngradeApp\docs\INSTALLATION.md

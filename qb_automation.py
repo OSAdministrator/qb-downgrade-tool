@@ -196,15 +196,26 @@ class QuickBooksAutomationEngine:
                 continue
         return False
 
-    def _set_edit_value(self, parent, value: str) -> bool:
+    def _set_edit_value(self, parent, value: str, edit_index: int = 0) -> bool:
         try:
             edits = parent.descendants(control_type="Edit")
-            if not edits:
+            if not edits or edit_index >= len(edits):
                 return False
-            edit = edits[0]
+            edit = edits[edit_index]
             edit.set_focus()
-            edit.set_edit_text("")
-            edit.type_keys(value, with_spaces=True, pause=0.02)
+            time.sleep(0.1)
+            # Select all existing text first, then replace
+            if send_keys is not None:
+                send_keys("^a")
+                time.sleep(0.05)
+            try:
+                edit.set_edit_text(value)
+            except Exception:  # noqa: BLE001
+                # Fallback: type the value character by character
+                if send_keys is not None:
+                    send_keys("{DELETE}")
+                    time.sleep(0.05)
+                    edit.type_keys(value, with_spaces=True, pause=0.02)
             return True
         except Exception:  # noqa: BLE001
             return False
@@ -235,10 +246,43 @@ class QuickBooksAutomationEngine:
                 title = dialog.window_text() or ""
                 if not title:
                     continue
-                if re.search(self.QB_WINDOW_RE, title):
+                # Skip the main QB window itself
+                if re.search(self.QB_WINDOW_RE, title) and "login" not in title.lower():
                     continue
 
                 title_l = title.lower()
+
+                # Handle password/login dialogs at startup
+                if "login" in title_l or "password" in title_l:
+                    # Don't dismiss these - they need special handling
+                    continue
+
+                # Handle "Set Up an External Accountant User" dialog
+                if "external accountant" in title_l or "accountant user" in title_l:
+                    clicked = self._click_first_button(dialog, ["No", "Cancel", "Close"])
+                    if clicked:
+                        self._emit(f"Dismissed dialog: {title}", log_fn)
+                    continue
+
+                # Handle "Enter Memorized Transactions" dialog
+                if "memorized transaction" in title_l:
+                    clicked = self._click_first_button(dialog, ["Enter All Later", "Close", "Cancel", "No"])
+                    if clicked:
+                        self._emit(f"Dismissed dialog: {title}", log_fn)
+                    time.sleep(0.5)
+                    # There may be a follow-up "Enter Memorized Transactions Later" dialog
+                    followup = self._find_active_dialog(title_re=r"(?i)memorized.*later")
+                    if followup is not None:
+                        self._click_first_button(followup, ["OK", "Close"])
+                        try:
+                            # Try clicking the X button
+                            followup.close()
+                        except Exception:  # noqa: BLE001
+                            if send_keys is not None:
+                                send_keys("{ENTER}")
+                        self._emit("Dismissed memorized transactions follow-up dialog", log_fn)
+                    continue
+
                 if any(
                     x in title_l
                     for x in [
@@ -249,16 +293,91 @@ class QuickBooksAutomationEngine:
                         "information",
                         "warning",
                         "microsoft office",
+                        "register",
+                        "product information",
+                        "new feature",
+                        "intuit",
                     ]
                 ):
                     clicked = self._click_first_button(
                         dialog,
-                        ["No", "Don't Save", "Continue", "Yes", "OK", "Close", "Cancel"],
+                        ["No", "Don't Save", "Continue", "Yes", "OK", "Close", "Cancel", "Later", "Skip"],
                     )
                     if clicked:
                         self._emit(f"Dismissed dialog: {title}", log_fn)
             except Exception:  # noqa: BLE001
                 continue
+
+    def _close_popup_windows(self, main_window, log_fn: Optional[LogFn]) -> None:
+        """Close QB popup/helper windows that steal focus after login.
+
+        Common culprits include the Accountant Center, Getting Started,
+        Learning Center, What's New, and Home Page windows.  These are
+        enumerated from the desktop and closed individually so that the
+        main QuickBooks company window can regain focus for menu navigation.
+        """
+        desktop = self._get_desktop()
+
+        # Substrings (lower-cased) of window titles that should be closed
+        popup_hints = [
+            "accountant center",
+            "getting started",
+            "what's new",
+            "whats new",
+            "tips",
+            "quickbooks learning center",
+            "learning center",
+            "home page",
+            "quickbooks home",
+            "new feature",
+            "coach",
+            "did you know",
+            "quickbooks desktop",  # generic splash / promo windows
+        ]
+
+        closed_any = False
+        for win in desktop.windows():
+            try:
+                if not win.is_visible():
+                    continue
+                title = win.window_text() or ""
+                if not title:
+                    continue
+
+                # Never close the main company window itself
+                if win.handle == getattr(main_window, "handle", None):
+                    continue
+                # Also skip anything that looks like the main QB window
+                if re.search(self.QB_WINDOW_RE, title) and not any(h in title.lower() for h in popup_hints):
+                    continue
+
+                title_l = title.lower()
+                if any(hint in title_l for hint in popup_hints):
+                    # Try clicking common close/dismiss buttons first
+                    clicked = self._click_first_button(
+                        win, ["Close", "OK", "No", "Cancel", "Skip", "Later", "X"]
+                    )
+                    if not clicked:
+                        # Fall back to closing the window directly
+                        try:
+                            win.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    self._emit(f"Closed popup window: {title}", log_fn)
+                    closed_any = True
+                    time.sleep(0.5)
+            except Exception:  # noqa: BLE001
+                continue
+
+        if closed_any:
+            time.sleep(1)
+
+        # Ensure the main window has focus for subsequent menu navigation
+        try:
+            self._focus_window(main_window)
+            time.sleep(0.5)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _invoke_menu(self, window, menu_path: str, fallback_keys: Optional[str], log_fn: Optional[LogFn]) -> None:
         self._focus_window(window)
@@ -416,44 +535,73 @@ class QuickBooksAutomationEngine:
     def _export_single_list_iif(self, main_window, list_name: str, out_path: Path, log_fn: Optional[LogFn]) -> None:
         self._emit(f"Exporting list '{list_name}' -> {out_path}", log_fn)
 
-        self._invoke_menu(
-            main_window,
-            "File->Utilities->Export->Lists to IIF Files...",
-            "%fue",
-            log_fn,
-        )
-        time.sleep(1)
+        self._focus_window(main_window)
+        time.sleep(0.5)
 
-        dlg = self._find_active_dialog(title_re=r"(?i)(export.*iif|list.*iif|export)")
+        # Navigate: File -> Utilities -> Export -> Lists to IIF Files...
+        # Use keyboard shortcuts since menu_select often fails with QB
+        if send_keys is not None:
+            send_keys("%f")  # Alt+F for File menu
+            time.sleep(0.5)
+            send_keys("u")   # Utilities
+            time.sleep(0.5)
+            send_keys("e")   # Export
+            time.sleep(0.5)
+            send_keys("l")   # Lists to IIF Files
+            time.sleep(1)
+        else:
+            self._invoke_menu(
+                main_window,
+                "File->Utilities->Export->Lists to IIF Files...",
+                "%fuel",
+                log_fn,
+            )
+            time.sleep(1)
+
+        dlg = self._find_active_dialog(title_re=r"(?i)(export|iif|list)")
         if dlg is None:
             raise RuntimeError("Export Lists to IIF dialog did not appear")
 
         self._focus_window(dlg)
 
+        # QB's Export dialog uses checkboxes for each list type.
+        # Try to find and check the appropriate checkbox.
         selected = False
-        # Try selecting list type from list/combobox controls.
-        for ctrl_type in ["List", "Tree", "ComboBox"]:
-            try:
-                ctrls = dlg.descendants(control_type=ctrl_type)
-                for ctrl in ctrls:
-                    try:
-                        ctrl.select(list_name)
+        try:
+            checkboxes = dlg.descendants(control_type="CheckBox")
+            for cb in checkboxes:
+                try:
+                    cb_text = cb.window_text() or ""
+                    if list_name.lower() in cb_text.lower():
+                        if not cb.get_toggle_state():
+                            cb.toggle()
                         selected = True
-                        break
-                    except Exception:  # noqa: BLE001
-                        continue
-                if selected:
-                    break
-            except Exception:  # noqa: BLE001
-                continue
+                        self._emit(f"Selected checkbox: {cb_text}", log_fn)
+                    else:
+                        # Uncheck other checkboxes to export only the desired list
+                        if cb.get_toggle_state():
+                            cb.toggle()
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
 
-        if not selected and send_keys is not None:
-            # Best effort keyboard search/select.
-            send_keys("^f")
-            time.sleep(0.2)
-            send_keys(list_name, with_spaces=True)
-            time.sleep(0.3)
-            send_keys("{ENTER}")
+        if not selected:
+            # Try list/combobox controls as fallback
+            for ctrl_type in ["List", "Tree", "ComboBox"]:
+                try:
+                    ctrls = dlg.descendants(control_type=ctrl_type)
+                    for ctrl in ctrls:
+                        try:
+                            ctrl.select(list_name)
+                            selected = True
+                            break
+                        except Exception:  # noqa: BLE001
+                            continue
+                    if selected:
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
 
         if not self._click_first_button(dlg, ["OK", "Export", "Save"]):
             if send_keys is not None:
@@ -470,55 +618,80 @@ class QuickBooksAutomationEngine:
 
     def _export_transaction_list_csv(self, main_window, out_csv: Path, log_fn: Optional[LogFn]) -> None:
         self._emit(f"Exporting Transaction List by Date report -> {out_csv}", log_fn)
-        self._open_report(
-            main_window,
-            "Reports->Accountant & Taxes->Transaction List by Date",
-            "%rat",
-            log_fn,
-        )
 
-        # Attempt to set date range to All.
-        report_window = self._find_qb_main_window(self._qb2023_app, "2023", self.config.timeouts.report_seconds)
-        self._focus_window(report_window)
+        self._focus_window(main_window)
+        time.sleep(0.5)
 
-        try:
-            # Common QB shortcut in report windows to open date dropdown then type All.
-            if send_keys is not None:
-                send_keys("%d")
+        # Navigate: Reports -> Accountant & Taxes -> Transaction List by Date
+        if send_keys is not None:
+            send_keys("%r")  # Alt+R for Reports menu
+            time.sleep(0.5)
+            send_keys("a")   # Accountant & Taxes
+            time.sleep(0.5)
+            send_keys("t")   # Transaction List by Date
+            time.sleep(3)
+        else:
+            self._open_report(
+                main_window,
+                "Reports->Accountant & Taxes->Transaction List by Date",
+                "%rat",
+                log_fn,
+            )
+
+        # Wait for report window to appear
+        time.sleep(3)
+        self._dismiss_common_dialogs(log_fn)
+
+        # Try to set date range to All
+        if send_keys is not None:
+            try:
+                send_keys("%d")  # Focus date dropdown
                 time.sleep(0.3)
                 send_keys("all{ENTER}")
-        except Exception:  # noqa: BLE001
-            pass
+                time.sleep(2)
+            except Exception:  # noqa: BLE001
+                pass
 
-        time.sleep(1)
-
-        # Export report (Ctrl+E usually opens Excel export in QB Desktop reports).
+        # Export report using File -> Export -> Excel/CSV
         if send_keys is None:
             raise RuntimeError("Keyboard automation unavailable for transaction CSV export")
-        send_keys("^e")
-        time.sleep(1)
 
-        export_dlg = self._find_active_dialog(title_re=r"(?i)(send report|excel|export)")
+        # Try Ctrl+E first (Excel export shortcut)
+        send_keys("^e")
+        time.sleep(2)
+
+        export_dlg = self._find_active_dialog(title_re=r"(?i)(send report|excel|export|save)")
         if export_dlg is not None:
             self._focus_window(export_dlg)
-            # Try selecting CSV option if present.
+            # Try selecting CSV option if present
             try:
                 for txt in [
-                    "Create new worksheet",
-                    "Create a comma separated values",
-                    "Export as CSV",
+                    "comma separated values",
+                    "Create a comma separated",
+                    "CSV",
                 ]:
-                    option = export_dlg.child_window(title_re=fr"(?i){re.escape(txt)}")
-                    if option.exists(timeout=1):
-                        option.click_input()
-                        break
+                    try:
+                        option = export_dlg.child_window(title_re=fr"(?i){re.escape(txt)}")
+                        if option.exists(timeout=1):
+                            option.click_input()
+                            self._emit(f"Selected export option: {txt}", log_fn)
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
             except Exception:  # noqa: BLE001
                 pass
 
             self._click_first_button(export_dlg, ["Export", "OK", "Next", "Create"])
+            time.sleep(1)
 
         self._handle_standard_file_dialog(out_csv, save_mode=True, timeout_s=self.config.timeouts.export_seconds, log_fn=log_fn)
         self._dismiss_common_dialogs(log_fn)
+
+        # Close the report window
+        if send_keys is not None:
+            send_keys("^{F4}")
+            time.sleep(1)
+            self._dismiss_common_dialogs(log_fn)
 
     def _export_report_pdf(self, main_window, report_menu_path: str, fallback_keys: str, out_pdf: Path, log_fn: Optional[LogFn]) -> None:
         self._emit(f"Generating validation report: {out_pdf.name}", log_fn)
@@ -549,6 +722,17 @@ class QuickBooksAutomationEngine:
             return None
 
         self._ensure_automation_ready()
+
+        # Check if QB is already running by looking for its window
+        exe_name = Path(exe_path).name
+        try:
+            app = Application(backend="uia").connect(path=exe_path)
+            self._emit(f"Connected to already-running QuickBooks: {exe_name}", log_fn)
+            return app
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Not running, start it
         app = Application(backend="uia").start(exe_path)
         return app
 
@@ -572,6 +756,92 @@ class QuickBooksAutomationEngine:
                 app.kill()
             except Exception:  # noqa: BLE001
                 pass
+
+    def _is_company_already_open(self, main_window, company_name_hint: str) -> bool:
+        """Check if the desired company is already open in QB."""
+        try:
+            title = main_window.window_text() or ""
+            # If the title contains the company name and doesn't say "No Company Open"
+            if "No Company Open" not in title and company_name_hint.lower() in title.lower():
+                return True
+            # Also check if any company is open (title doesn't say "No Company Open")
+            if "No Company Open" not in title and "QuickBooks" in title:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _handle_startup_dialogs(self, password: str, timeout_s: int, log_fn: Optional[LogFn]) -> None:
+        """Handle dialogs that appear when QB starts up (password, accountant user, memorized transactions)."""
+        password_entered = False
+        start = time.time()
+        while time.time() - start < timeout_s:
+            # Check for password/login dialog first
+            login_dlg = self._find_active_dialog(title_re=r"(?i)(password|login)")
+            if login_dlg is not None and not password_entered:
+                self._emit("Found startup login dialog, entering password", log_fn)
+                self._focus_window(login_dlg)
+                time.sleep(0.5)
+
+                # Clear and enter password using keyboard
+                if send_keys is not None:
+                    edits = login_dlg.descendants(control_type="Edit")
+                    if edits:
+                        edit = edits[0]
+                        edit.set_focus()
+                        time.sleep(0.2)
+                        # Use set_edit_text to directly set the value
+                        try:
+                            edit.set_edit_text(password)
+                        except Exception:  # noqa: BLE001
+                            # Fallback: select all, delete, then type
+                            send_keys("^a{DELETE}")
+                            time.sleep(0.1)
+                            edit.type_keys(password, with_spaces=True, pause=0.03)
+                        time.sleep(0.3)
+
+                    # Click OK button
+                    if not self._click_first_button(login_dlg, ["OK", "Continue", "Login", "Open"]):
+                        send_keys("{ENTER}")
+
+                    password_entered = True
+                    self._emit("Password entered at startup", log_fn)
+                    time.sleep(5)  # Wait for QB to process login
+
+                    # Check if a "wrong password" warning appeared
+                    warning_dlg = self._find_active_dialog(title_re=r"(?i)(warning|error|incorrect)")
+                    if warning_dlg is not None:
+                        self._emit("Password may have been incorrect, dismissing warning", log_fn)
+                        self._click_first_button(warning_dlg, ["OK", "Close"])
+                        password_entered = False  # Allow retry
+                        time.sleep(1)
+                    continue
+
+            elif login_dlg is not None and password_entered:
+                # Password was already entered but dialog is still showing - wait
+                time.sleep(2)
+                continue
+
+            # Dismiss other common startup dialogs
+            self._dismiss_common_dialogs(log_fn)
+            time.sleep(1)
+
+            # Check if we're past all startup dialogs
+            desktop = self._get_desktop()
+            blocking_dialogs = False
+            for w in desktop.windows():
+                try:
+                    if not w.is_visible():
+                        continue
+                    t = (w.window_text() or "").lower()
+                    if any(x in t for x in ["login", "password", "external accountant", "memorized transaction"]):
+                        blocking_dialogs = True
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+
+            if not blocking_dialogs:
+                break
 
     def _export_from_qb2023(self, job: CompanyJob, export_dir: Path, log_fn: Optional[LogFn]) -> Dict[str, Path]:
         """Exports list IIF, transaction CSV, and report PDFs from QB 2023.
@@ -616,15 +886,32 @@ class QuickBooksAutomationEngine:
         if self._qb2023_app is None:
             raise RuntimeError("QB 2023 app instance is not initialized")
 
+        # Handle any startup dialogs (password, accountant user, memorized transactions)
+        self._handle_startup_dialogs(job.password, timeout_s=30, log_fn=log_fn)
+
         main_window = self._find_qb_main_window(self._qb2023_app, "2023", self.config.timeouts.launch_qb_seconds)
         self._dismiss_common_dialogs(log_fn)
-        self._open_company_file(
-            main_window,
-            job.qbw_path,
-            job.password,
-            timeout_s=self.config.timeouts.open_company_seconds,
-            log_fn=log_fn,
-        )
+
+        # Check if the company is already open (QB remembers last opened company)
+        company_hint = job.qbw_path.stem.split(" ")[0]  # e.g., "joshs" from "joshs gold coast ii 23"
+        if self._is_company_already_open(main_window, company_hint):
+            self._emit("Company already open in QB 2023, skipping File->Open", log_fn)
+        else:
+            self._open_company_file(
+                main_window,
+                job.qbw_path,
+                job.password,
+                timeout_s=self.config.timeouts.open_company_seconds,
+                log_fn=log_fn,
+            )
+
+        # Re-dismiss any dialogs that appeared after company loaded
+        time.sleep(2)
+        self._dismiss_common_dialogs(log_fn)
+
+        # Close popup/helper windows (Accountant Center, Getting Started, etc.)
+        # that steal focus and prevent menu navigation
+        self._close_popup_windows(main_window, log_fn)
 
         # Export required list IIF files one-by-one.
         list_exports = {
