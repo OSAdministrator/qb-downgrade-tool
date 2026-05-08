@@ -229,8 +229,8 @@ class QuickBooksAutomationEngine:
 
         Args:
             title_re: Optional regex to match against window titles.
-            parent_window: Optional parent window to search children of.
-                If provided, searches parent_window.children(visible_only=True)
+            parent_window: Optional parent window to search descendants of.
+                If provided, searches parent_window.descendants()
                 instead of Desktop().windows().
 
         # FIX: Search child dialogs of QB main window instead of desktop-level windows.
@@ -245,11 +245,12 @@ class QuickBooksAutomationEngine:
         # provided, we can detect these modal dialogs reliably and avoid the timeout loop.
         """
         if parent_window is not None:
-            # Search child windows of the given parent (e.g., QB main window).
-            # This is the correct approach for modal dialogs like Export/Save As
-            # which are children of the main QB window, not top-level desktop windows.
+            # Search descendant windows of the given parent (e.g., QB main window).
+            # FIX: Use descendants() instead of children() to find nested modal dialogs.
+            # children() only returns direct children, missing deeply nested dialogs
+            # that QB creates inside intermediate container windows.
             try:
-                children = parent_window.children()
+                children = parent_window.descendants()
             except Exception:  # noqa: BLE001
                 children = []
             for w in children:
@@ -1182,78 +1183,58 @@ class QuickBooksAutomationEngine:
 
         # ── Wait for and dismiss the export success confirmation dialog ──
         # After a successful IIF export, QuickBooks shows a modal dialog titled
-        # "QuickBooks Desktop Information" (or a variant such as "QuickBooks
-        # Information" / "Information") containing the message:
+        # "QuickBooks Desktop Information" with the message:
         #     "Your data has been exported successfully."
-        # Bug found 2026-05-08: The tool exported the file correctly but never
-        # dismissed this dialog, which blocked all subsequent menu interactions
-        # because QB keeps the modal in front of the main window.
         #
-        # Bug fixed 2026-05-08: Was passing arguments in wrong order (main_window
-        # as title_re, list as parent_window) and passing a list instead of regex
-        # string, plus an extra log_fn arg that caused a silent TypeError.
-        # Also need to check child Static/Text controls for the actual message
-        # text since window_text() on the dialog itself only returns the title.
-        #
-        # Strategy:
-        #   1. Poll for up to 30 seconds (1 s intervals) for a dialog whose
-        #      title matches one of the known success-dialog titles.
-        #   2. Inspect the dialog's child Static/Text controls for the keywords
-        #      "successfully" or "exported" to confirm it is indeed the success
-        #      message (and not an unrelated error dialog with a similar title).
-        #   3. Click the "OK" button to dismiss.  If the button click fails for
-        #      any reason, fall back to sending {ENTER} which achieves the same
-        #      result because OK is the default-focused button.
-        # Wait for and dismiss success confirmation dialog
+        # Bug fix 2026-05-08: Success dialog uses Pane controls, NOT Text/Static
+        # controls. Searching descendants for text like "successfully" returns
+        # nothing because the message is rendered inside Pane wrappers (similar
+        # to the Export Lists checkbox dialog). The correct approach is to match
+        # the dialog by its title alone ("QuickBooks Desktop Information") and
+        # click OK without inspecting text content.
         log_fn("Waiting for export success confirmation dialog...")
         dialog_dismissed = False
 
         for i in range(30):
             try:
-                # Try child window first
+                # Search for dialog by title - it's a Pane, no text controls to check
                 success_dialog = self._find_active_dialog(
                     parent_window=main_window,
-                    title_re="(QuickBooks|Information)"
+                    title_re=r"(?i)QuickBooks.*Information"
                 )
 
-                # Fallback: try desktop level if not found as child
-                if not success_dialog:
-                    success_dialog = self._find_active_dialog(
-                        parent_window=None,
-                        title_re="(QuickBooks|Information)"
-                    )
-
                 if success_dialog:
-                    log_fn(f"Found potential success dialog: {success_dialog.window_text()}")
-                    # Check for success message in child controls
-                    static_controls = success_dialog.descendants(control_type="Text")
-                    for static in static_controls:
-                        text = static.window_text().lower()
-                        if "success" in text or "export" in text or "complete" in text:
-                            log_fn(f"✅ SUCCESS CONFIRMED: {text}")
-                            # Try clicking OK
-                            try:
-                                ok_btn = success_dialog.child_window(title="OK", control_type="Button")
-                                ok_btn.click()
-                                log_fn("Clicked OK button")
-                            except Exception:
-                                # Fallback: ESC or Enter key
-                                log_fn("Button click failed, trying ESC key")
-                                success_dialog.type_keys("{ESC}")
-                            time.sleep(1)
+                    title = success_dialog.window_text()
+                    log_fn(f"✅ Found success dialog: '{title}'")
+
+                    # Click OK button (don't search for text - dialog uses Panes)
+                    try:
+                        ok_btn = success_dialog.child_window(title_re=r"(?i)ok", control_type="Button")
+                        ok_btn.click()
+                        log_fn("Clicked OK button")
+                        dialog_dismissed = True
+                        break
+                    except Exception as e:
+                        log_fn(f"OK button click failed: {e}, trying ESC key")
+                        try:
+                            success_dialog.type_keys("{ESC}")
+                            log_fn("Sent ESC key")
                             dialog_dismissed = True
                             break
-
-                if dialog_dismissed:
-                    break
+                        except:
+                            pass
+                else:
+                    if i % 5 == 0:  # Log every 5 attempts to reduce noise
+                        log_fn(f"[Attempt {i+1}/30] Waiting for success dialog...")
 
             except Exception as e:
-                log_fn(f"Error in success dialog detection (attempt {i+1}/30): {e}")
+                if i % 5 == 0:
+                    log_fn(f"[Attempt {i+1}/30] Exception: {e}")
 
             time.sleep(1)
 
         if not dialog_dismissed:
-            raise RuntimeError("Export success dialog was not dismissed - cannot continue to next list")
+            raise RuntimeError("Export success dialog 'QuickBooks Desktop Information' was not found/dismissed after 30 seconds")
 
         log_fn("✅ Export completed and success dialog dismissed")
 
