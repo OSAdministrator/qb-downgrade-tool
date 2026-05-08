@@ -1204,49 +1204,58 @@ class QuickBooksAutomationEngine:
         #   3. Click the "OK" button to dismiss.  If the button click fails for
         #      any reason, fall back to sending {ENTER} which achieves the same
         #      result because OK is the default-focused button.
+        # Wait for and dismiss success confirmation dialog
         log_fn("Waiting for export success confirmation dialog...")
-        for i in range(30):  # Wait up to 30 seconds
+        dialog_dismissed = False
+
+        for i in range(30):
             try:
-                # Correct argument order: parent_window first, then title regex
+                # Try child window first
                 success_dialog = self._find_active_dialog(
                     parent_window=main_window,
-                    title_re="(QuickBooks.*Information|Information)"
+                    title_re="(QuickBooks|Information)"
                 )
+
+                # Fallback: try desktop level if not found as child
+                if not success_dialog:
+                    success_dialog = self._find_active_dialog(
+                        parent_window=None,
+                        title_re="(QuickBooks|Information)"
+                    )
+
                 if success_dialog:
-                    log_fn(f"Found dialog: {success_dialog.window_text()}")
-                    # Check child Static controls for the actual message text
-                    try:
-                        static_controls = success_dialog.descendants(control_type="Text")
-                        for static in static_controls:
-                            text = static.window_text().lower()
-                            if "successfully" in text or "exported" in text:
-                                log_fn(f"Success message confirmed: {text}")
-                                # Click OK button
-                                try:
-                                    ok_btn = success_dialog.child_window(title="OK", control_type="Button")
-                                    ok_btn.click()
-                                    log_fn("Clicked OK on success dialog")
-                                except Exception:
-                                    # Fallback: press Enter (OK is the default button)
-                                    success_dialog.type_keys("{ENTER}")
-                                    log_fn("Pressed ENTER to dismiss success dialog (fallback)")
-                                time.sleep(0.5)
-                                break  # break inner for-loop
-                        else:
-                            # No matching text found in any static control
-                            log_fn(f"Dialog found but no success text in static controls (attempt {i+1}/30)")
+                    log_fn(f"Found potential success dialog: {success_dialog.window_text()}")
+                    # Check for success message in child controls
+                    static_controls = success_dialog.descendants(control_type="Text")
+                    for static in static_controls:
+                        text = static.window_text().lower()
+                        if "success" in text or "export" in text or "complete" in text:
+                            log_fn(f"✅ SUCCESS CONFIRMED: {text}")
+                            # Try clicking OK
+                            try:
+                                ok_btn = success_dialog.child_window(title="OK", control_type="Button")
+                                ok_btn.click()
+                                log_fn("Clicked OK button")
+                            except Exception:
+                                # Fallback: ESC or Enter key
+                                log_fn("Button click failed, trying ESC key")
+                                success_dialog.type_keys("{ESC}")
                             time.sleep(1)
-                            continue  # continue outer for-loop
-                        break  # break outer for-loop (success path hit inner break)
-                    except Exception as e:
-                        log_fn(f"Error checking dialog text: {e}")
-                        time.sleep(1)
-                        continue
+                            dialog_dismissed = True
+                            break
+
+                if dialog_dismissed:
+                    break
+
             except Exception as e:
-                log_fn(f"Error finding success dialog (attempt {i+1}/30): {e}")
+                log_fn(f"Error in success dialog detection (attempt {i+1}/30): {e}")
+
             time.sleep(1)
-        else:
-            log_fn("Warning: Success dialog not detected within 30 seconds")
+
+        if not dialog_dismissed:
+            raise RuntimeError("Export success dialog was not dismissed - cannot continue to next list")
+
+        log_fn("✅ Export completed and success dialog dismissed")
 
         self._dismiss_common_dialogs(log_fn)
 
