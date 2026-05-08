@@ -972,37 +972,91 @@ class QuickBooksAutomationEngine:
 
         self._focus_window(dlg)
 
-        # QB's Export dialog uses checkboxes for each list type.
-        # Try to find and check the appropriate checkbox.
+        # ----------------------------------------------------------------
+        # LIST SELECTION LOGIC
+        # ----------------------------------------------------------------
+        # QB's "Export Lists to IIF" dialog presents checkboxes for each
+        # list type (Chart of Accounts, Customers, Vendors, Items,
+        # Employees, etc.).  We MUST check the correct one AND uncheck
+        # the others before clicking OK, otherwise QB shows:
+        #   "Please select a file to export"
+        #
+        # Strategy (ordered by reliability):
+        #   1. Find CheckBox descendants via pywinauto, match by text
+        #   2. Try Button descendants (QB sometimes exposes checkboxes as
+        #      Button controls with BS_CHECKBOX / BS_AUTOCHECKBOX style)
+        #   3. Try List / Tree / ComboBox .select() API
+        #   4. Keyboard fallback: Tab through controls and Space to toggle
+        # ----------------------------------------------------------------
+
         selected = False
+
+        # --- Attempt 1: CheckBox controls via pywinauto ---
         try:
             checkboxes = dlg.descendants(control_type="CheckBox")
+            self._emit(f"  Found {len(checkboxes)} CheckBox control(s) in dialog", log_fn)
             for cb in checkboxes:
                 try:
-                    cb_text = cb.window_text() or ""
+                    cb_text = (cb.window_text() or "").strip()
+                    self._emit(f"    CheckBox: '{cb_text}'", log_fn)
                     if list_name.lower() in cb_text.lower():
-                        if not cb.get_toggle_state():
-                            cb.toggle()
+                        # This is the one we want — make sure it's checked
+                        try:
+                            if not cb.get_toggle_state():
+                                cb.toggle()
+                        except Exception:  # noqa: BLE001
+                            # toggle() failed — try clicking directly
+                            cb.click_input()
                         selected = True
-                        self._emit(f"Selected checkbox: {cb_text}", log_fn)
+                        self._emit(f"  ✓ Selected checkbox: '{cb_text}'", log_fn)
                     else:
-                        # Uncheck other checkboxes to export only the desired list
-                        if cb.get_toggle_state():
-                            cb.toggle()
-                except Exception:  # noqa: BLE001
+                        # Uncheck any OTHER list so we only export the one we want
+                        try:
+                            if cb.get_toggle_state():
+                                cb.toggle()
+                                self._emit(f"    Unchecked: '{cb_text}'", log_fn)
+                        except Exception:  # noqa: BLE001
+                            pass
+                except Exception as exc:  # noqa: BLE001
+                    self._emit(f"    (could not inspect checkbox: {exc})", log_fn)
                     continue
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            self._emit(f"  CheckBox search failed: {exc}", log_fn)
 
+        # --- Attempt 2: Button controls with checkbox style ---
         if not selected:
-            # Try list/combobox controls as fallback
-            for ctrl_type in ["List", "Tree", "ComboBox"]:
+            try:
+                buttons = dlg.descendants(control_type="Button")
+                self._emit(f"  Trying {len(buttons)} Button control(s) as checkbox fallback", log_fn)
+                for btn in buttons:
+                    try:
+                        btn_text = (btn.window_text() or "").strip()
+                        if not btn_text:
+                            continue
+                        # Skip OK / Cancel / Export / etc.
+                        if btn_text.lower() in ("ok", "cancel", "export", "save", "help"):
+                            continue
+                        self._emit(f"    Button: '{btn_text}'", log_fn)
+                        if list_name.lower() in btn_text.lower():
+                            btn.click_input()
+                            selected = True
+                            self._emit(f"  ✓ Clicked button-checkbox: '{btn_text}'", log_fn)
+                    except Exception:  # noqa: BLE001
+                        continue
+            except Exception as exc:  # noqa: BLE001
+                self._emit(f"  Button-checkbox search failed: {exc}", log_fn)
+
+        # --- Attempt 3: List / Tree / ComboBox .select() ---
+        if not selected:
+            for ctrl_type in ["List", "ListView", "Tree", "TreeView", "ComboBox"]:
                 try:
                     ctrls = dlg.descendants(control_type=ctrl_type)
                     for ctrl in ctrls:
                         try:
+                            self._emit(f"  Trying {ctrl_type}.select('{list_name}')", log_fn)
                             ctrl.select(list_name)
                             selected = True
+                            self._emit(f"  ✓ Selected via {ctrl_type}", log_fn)
                             break
                         except Exception:  # noqa: BLE001
                             continue
@@ -1011,6 +1065,56 @@ class QuickBooksAutomationEngine:
                 except Exception:  # noqa: BLE001
                     continue
 
+        # --- Attempt 4: Keyboard fallback ---
+        # Tab through all controls looking for one whose text matches,
+        # then press Space to toggle the checkbox.
+        if not selected and send_keys is not None:
+            self._emit("  Trying keyboard Tab+Space fallback for list selection", log_fn)
+            self._focus_window(dlg)
+            time.sleep(0.3)
+            # Press Home to move to top of the control list, then Tab through
+            send_keys("{HOME}")
+            time.sleep(0.2)
+            for _attempt in range(20):
+                send_keys("{TAB}")
+                time.sleep(0.3)
+                # Read the focused control's text
+                try:
+                    focused = dlg.get_focus()
+                    focused_text = (focused.window_text() or "").strip() if focused else ""
+                    self._emit(f"    Focused control: '{focused_text}'", log_fn)
+                    if focused_text and list_name.lower() in focused_text.lower():
+                        send_keys(" ")  # Space toggles a checkbox
+                        selected = True
+                        self._emit(f"  ✓ Selected via keyboard: '{focused_text}'", log_fn)
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+
+        # ----------------------------------------------------------------
+        # GUARD: Do NOT click OK if we failed to select a list.
+        # Clicking OK without a selection causes QB to show an error
+        # dialog ("Please select a file to export") and wastes a retry.
+        # ----------------------------------------------------------------
+        if not selected:
+            # Log all controls in the dialog for post-mortem debugging
+            try:
+                all_ctrls = dlg.descendants()
+                self._emit(f"  DEBUG: Dialog has {len(all_ctrls)} total controls:", log_fn)
+                for c in all_ctrls[:30]:  # cap at 30 to avoid log spam
+                    try:
+                        self._emit(f"    type={c.friendly_class_name()!r}  text={c.window_text()!r}", log_fn)
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError(
+                f"Could not select list '{list_name}' in Export dialog. "
+                "No matching checkbox, list item, or focusable control was found. "
+                "See log above for dialog control details."
+            )
+
+        # Now safe to click OK — a list is selected
         if not self._click_first_button(dlg, ["OK", "Export", "Save"]):
             if send_keys is not None:
                 send_keys("{ENTER}")
