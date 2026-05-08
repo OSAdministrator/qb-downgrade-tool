@@ -456,23 +456,57 @@ class QuickBooksAutomationEngine:
     def _handle_password_prompt(self, password: str, timeout_s: int, log_fn: Optional[LogFn]) -> None:
         """Wait for a password/login dialog and enter credentials.
 
-        This method is called AFTER a company file open has been triggered.
-        It waits for the password dialog to appear, enters credentials,
-        and clicks OK/Login. It does NOT dismiss any other dialogs.
+        =====================================================================
+        WHY THIS IS SIMPLIFIED (2026-05-08 debugging session):
+        =====================================================================
+        The previous implementation tried to:
+          - Detect dialog type (username+password vs password-only)
+          - Enumerate Edit controls via pywinauto descendants()
+          - Focus specific edit fields by index
+          - Use set_edit_text() or type_keys() with fallbacks
+          - Click specific OK/Login buttons by label
+
+        This was UNRELIABLE because:
+          1. QuickBooks password dialogs use non-standard Win32 controls
+             that pywinauto often can't enumerate or interact with properly.
+          2. Edit field detection via descendants(control_type="Edit") would
+             sometimes return 0 fields even when the dialog was visible.
+          3. set_edit_text() would silently fail on password fields.
+          4. Button clicking via child_window() was fragile with QB's UI.
+
+        The SIMPLE approach that actually works:
+          1. Wait 3-5 seconds for the password dialog to appear
+          2. Just type the password using send_keys (it goes to the
+             focused field, which QB sets to the password field by default)
+          3. Press Enter (equivalent to clicking OK)
+
+        This works because when QB opens a company file via command-line
+        parameter, the password dialog appears with the cursor already in
+        the password field. We don't need to find or focus anything — just
+        type and press Enter.
+        =====================================================================
         """
         self._emit("  [Password] Checking if password was provided...", log_fn)
         if not password:
             self._emit("  [Password] No password provided – skipping password entry.", log_fn)
             return
 
-        self._emit(f"  [Password] Password provided (length={len(password)}). "
-                   f"Scanning for dialog up to {min(timeout_s, 20)}s...", log_fn)
+        if send_keys is None:
+            self._emit("  [Password] WARNING: send_keys unavailable, cannot enter password.", log_fn)
+            return
 
-        dialog_box: Dict[str, object] = {}
+        self._emit(f"  [Password] Password provided (length={len(password)}). "
+                   f"Waiting up to {min(timeout_s, 20)}s for password dialog...", log_fn)
+
+        # --- Step 1: Wait for the password dialog to appear ---
+        # We use a simple poll loop looking for any dialog with "password"
+        # or "login" in the title. We don't need to interact with the dialog
+        # object itself — we just need to know it's on screen.
+        dialog_found = False
         poll_count = 0
 
         def _cond() -> bool:
-            nonlocal poll_count
+            nonlocal poll_count, dialog_found
             poll_count += 1
             dlg = self._find_active_dialog(title_re=r"(?i)(password|login)")
             if dlg is not None:
@@ -481,7 +515,7 @@ class QuickBooksAutomationEngine:
                 except Exception:  # noqa: BLE001
                     dlg_title = "<unknown>"
                 self._emit(f"  [Password] Dialog FOUND on poll #{poll_count}: '{dlg_title}'", log_fn)
-                dialog_box["dlg"] = dlg
+                dialog_found = True
                 return True
             return False
 
@@ -489,75 +523,21 @@ class QuickBooksAutomationEngine:
             self._emit(f"  [Password] No password/login dialog detected after {poll_count} polls; continuing.", log_fn)
             return
 
-        dialog = dialog_box["dlg"]
-        self._emit("  [Password] Focusing password dialog...", log_fn)
-        self._focus_window(dialog)
+        # --- Step 2: Brief pause to let the dialog fully render ---
+        # QB sometimes needs a moment after the dialog appears before it
+        # accepts keyboard input reliably.
+        time.sleep(1)
+
+        # --- Step 3: Just type the password and press Enter ---
+        # The password dialog has focus and the cursor is in the password
+        # field by default. No need to find edit controls or click buttons.
+        # send_keys types the password, then {ENTER} submits the dialog.
+        self._emit("  [Password] Typing password and pressing Enter...", log_fn)
+        send_keys(password, pause=0.02)
         time.sleep(0.3)
+        send_keys("{ENTER}")
 
-        # Enumerate edit fields to determine dialog type
-        try:
-            edits = dialog.descendants(control_type="Edit")
-            self._emit(f"  [Password] Found {len(edits)} edit field(s) in dialog.", log_fn)
-        except Exception as e:  # noqa: BLE001
-            self._emit(f"  [Password] WARNING: Could not enumerate edit fields: {e}", log_fn)
-            edits = []
-
-        if len(edits) >= 2:
-            # ----- Username + Password dialog -----
-            self._emit(f"  [Password] Dialog type: USERNAME + PASSWORD ({len(edits)} fields)", log_fn)
-
-            # Clear and set username (field 0)
-            self._emit("  [Password] Step A: Setting username field to 'Admin'...", log_fn)
-            if send_keys is not None:
-                try:
-                    edits[0].set_focus()
-                    time.sleep(0.1)
-                    send_keys("^a{DELETE}")
-                    time.sleep(0.1)
-                    self._emit("  [Password] Username field cleared via Ctrl+A, Delete.", log_fn)
-                except Exception as e:  # noqa: BLE001
-                    self._emit(f"  [Password] WARNING: Could not clear username field: {e}", log_fn)
-            if not self._set_edit_value(dialog, "Admin", edit_index=0):
-                self._emit("  [Password] WARNING: _set_edit_value failed for username field.", log_fn)
-            else:
-                self._emit("  [Password] Username field set to 'Admin'.", log_fn)
-
-            # Clear and set password (field 1)
-            self._emit("  [Password] Step B: Setting password field...", log_fn)
-            if send_keys is not None:
-                try:
-                    edits[1].set_focus()
-                    time.sleep(0.1)
-                    send_keys("^a{DELETE}")
-                    time.sleep(0.1)
-                    self._emit("  [Password] Password field cleared via Ctrl+A, Delete.", log_fn)
-                except Exception as e:  # noqa: BLE001
-                    self._emit(f"  [Password] WARNING: Could not clear password field: {e}", log_fn)
-            if not self._set_edit_value(dialog, password, edit_index=1):
-                raise RuntimeError("Password dialog detected but failed to set password in edit field 1")
-            self._emit("  [Password] Password field set successfully.", log_fn)
-
-        else:
-            # ----- Password-only dialog -----
-            self._emit("  [Password] Dialog type: PASSWORD ONLY (single field)", log_fn)
-            self._emit("  [Password] Setting password in the single edit field...", log_fn)
-            if not self._set_edit_value(dialog, password):
-                raise RuntimeError("Password dialog detected but failed to set password")
-            self._emit("  [Password] Password field set successfully.", log_fn)
-
-        # Click OK / Login button
-        self._emit("  [Password] Step C: Clicking OK/Login button...", log_fn)
-        btn_clicked = self._click_first_button(dialog, ["OK", "Continue", "Login", "Open"])
-        if btn_clicked:
-            self._emit("  [Password] Button click succeeded.", log_fn)
-        else:
-            if send_keys is not None:
-                self._emit("  [Password] Button click failed – sending Enter key as fallback.", log_fn)
-                send_keys("{ENTER}")
-            else:
-                self._emit("  [Password] WARNING: Button click failed and send_keys unavailable.", log_fn)
-
-        self._emit("  [Password] Password entry sequence complete.", log_fn)
+        self._emit("  [Password] Password entry complete (type + Enter).", log_fn)
 
     def _wait_for_company_ready(self, main_window, timeout_s: int, log_fn: Optional[LogFn]) -> None:
         """Wait for the company to finish loading by checking the window title.
@@ -612,15 +592,49 @@ class QuickBooksAutomationEngine:
     def _open_company_file(self, main_window, qbw_path: Path, password: str, timeout_s: int, log_fn: Optional[LogFn]) -> None:
         """Open a QuickBooks company file using QB's command-line parameter.
 
-        Instead of navigating File → Open menus and file dialogs, we launch
-        (or re-launch) QuickBooks with the .qbw file path as a command-line
-        argument.  QB will automatically open the company file and prompt for
-        the admin password – we just need to wait for that dialog and handle it.
+        =====================================================================
+        WHY WE USE COMMAND-LINE LAUNCH (2026-05-08 debugging session):
+        =====================================================================
+        Earlier versions tried to open company files via File → Open menu
+        navigation. This was UNRELIABLE because:
+          1. The File menu often didn't respond to Alt+F keystrokes when
+             popup windows (Accountant Center, Learning Center, etc.) had
+             stolen focus after QB launched.
+          2. Navigating File → Open → file dialog → browse to .qbw was a
+             multi-step process with many failure points.
+          3. Each step required waiting for specific dialogs that might or
+             might not appear depending on QB's state.
+
+        The command-line approach is far simpler and more reliable:
+          - Launch QB with: "QBW.exe" "path/to/file.qbw"
+          - QB automatically opens the company file
+          - QB automatically shows the password dialog
+          - We just type the password and press Enter
+          - Done!
+        =====================================================================
+
+        =====================================================================
+        WHY POPUPS ARE DISMISSED AFTER COMPANY LOADS (not before):
+        =====================================================================
+        QB shows various popup windows (Accountant Center, Getting Started,
+        Memorized Transactions, etc.) AFTER the company finishes loading.
+        If we try to dismiss them too early:
+          1. They haven't appeared yet, so we miss them
+          2. Dismissing them while the company is still loading can cause
+             focus issues that prevent the company from loading properly
+          3. New popups can appear AFTER we've already dismissed earlier ones
+
+        So the correct order is:
+          1. Launch QB with .qbw → password dialog → type + Enter
+          2. Wait for company to fully load (title bar shows company name)
+          3. THEN dismiss all popups (they're all present now)
+          4. THEN proceed with menu navigation (File → Export, etc.)
+        =====================================================================
 
         Steps:
           1. Launch QB with the .qbw file as a parameter (auto-opens the file)
           2. Wait for the password dialog to appear
-          3. Handle the password dialog (already coded in _handle_password_prompt)
+          3. Handle the password dialog (simplified: just type + Enter)
           4. Wait for the company to fully load
           5. Dismiss post-login popups
         """
@@ -1056,7 +1070,20 @@ class QuickBooksAutomationEngine:
         return False
 
     def _handle_startup_dialogs(self, password: str, timeout_s: int, log_fn: Optional[LogFn]) -> None:
-        """Handle dialogs that appear when QB starts up (password, accountant user, memorized transactions)."""
+        """Handle dialogs that appear when QB starts up.
+
+        =====================================================================
+        WHY THIS USES THE SIMPLE "type + Enter" APPROACH (2026-05-08):
+        =====================================================================
+        Same rationale as _handle_password_prompt() — trying to detect dialog
+        types, enumerate edit fields, and click specific buttons was unreliable
+        with QB's non-standard controls. Instead, we just:
+          1. Detect the password dialog exists (by title)
+          2. Wait a moment for it to render
+          3. Type the password and press Enter
+        See _handle_password_prompt() docstring for full explanation.
+        =====================================================================
+        """
         password_entered = False
         start = time.time()
         while time.time() - start < timeout_s:
@@ -1064,70 +1091,17 @@ class QuickBooksAutomationEngine:
             login_dlg = self._find_active_dialog(title_re=r"(?i)(password|login)")
             if login_dlg is not None and not password_entered:
                 self._emit("Found startup login dialog, entering password", log_fn)
-                self._focus_window(login_dlg)
-                time.sleep(0.5)
 
-                # Clear and enter credentials using keyboard
+                # Simple approach: just type the password and press Enter.
+                # The dialog appears with cursor in the password field by default.
                 if send_keys is not None:
-                    edits = login_dlg.descendants(control_type="Edit")
-                    if edits:
-                        if len(edits) >= 2:
-                            # Username + Password login dialog
-                            self._emit(f"Detected username+password login ({len(edits)} edit fields)", log_fn)
-                            # First edit = username field - clear and set
-                            username_edit = edits[0]
-                            username_edit.set_focus()
-                            time.sleep(0.2)
-                            send_keys("^a")
-                            time.sleep(0.05)
-                            send_keys("{DELETE}")
-                            time.sleep(0.1)
-                            try:
-                                username_edit.set_edit_text("Admin")
-                            except Exception:  # noqa: BLE001
-                                username_edit.type_keys("Admin", with_spaces=True, pause=0.03)
-                            time.sleep(0.3)
-                            # Second edit = password field - clear and set
-                            password_edit = edits[1]
-                            password_edit.set_focus()
-                            time.sleep(0.2)
-                            send_keys("^a")
-                            time.sleep(0.05)
-                            send_keys("{DELETE}")
-                            time.sleep(0.1)
-                            try:
-                                password_edit.set_edit_text(password)
-                            except Exception:  # noqa: BLE001
-                                password_edit.type_keys(password, with_spaces=True, pause=0.03)
-                            time.sleep(0.3)
-                        else:
-                            # Password-only login dialog (single edit field)
-                            self._emit("Detected password-only login (1 edit field)", log_fn)
-                            edit = edits[0]
-                            edit.set_focus()
-                            time.sleep(0.2)
-                            send_keys("^a")
-                            time.sleep(0.05)
-                            send_keys("{DELETE}")
-                            time.sleep(0.1)
-                            try:
-                                edit.set_edit_text(password)
-                            except Exception:  # noqa: BLE001
-                                edit.type_keys(password, with_spaces=True, pause=0.03)
-                            time.sleep(0.3)
-
-                    # Click OK button - try multiple approaches
-                    if not self._click_first_button(login_dlg, ["OK", "Continue", "Login", "Open"]):
-                        self._emit("Button click failed, trying Enter key", log_fn)
-                        # Focus the OK button area and press Enter
-                        send_keys("{ENTER}")
-                        time.sleep(0.5)
-                        # If dialog still exists, try Tab+Enter
-                        if self._find_active_dialog(title_re=r"(?i)(password|login)") is not None:
-                            send_keys("{TAB}{ENTER}")
+                    time.sleep(1)  # Let dialog fully render
+                    send_keys(password, pause=0.02)
+                    time.sleep(0.3)
+                    send_keys("{ENTER}")
 
                     password_entered = True
-                    self._emit("Password entered at startup", log_fn)
+                    self._emit("Password entered at startup (type + Enter)", log_fn)
                     time.sleep(5)  # Wait for QB to process login
 
                     # Check if a "wrong password" warning appeared
@@ -1138,6 +1112,8 @@ class QuickBooksAutomationEngine:
                         password_entered = False  # Allow retry
                         time.sleep(1)
                     continue
+                else:
+                    self._emit("WARNING: send_keys unavailable, cannot enter password", log_fn)
 
             elif login_dlg is not None and password_entered:
                 # Password was already entered but dialog is still showing - wait
