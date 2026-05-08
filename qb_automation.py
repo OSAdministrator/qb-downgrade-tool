@@ -986,6 +986,12 @@ class QuickBooksAutomationEngine:
         #   "Please select a file to export"
         #
         # Strategy (ordered by reliability):
+        #   0. [QB 2023] Find Pane descendants — QB 2023 renders its
+        #      checkboxes as custom Pane controls, NOT standard CheckBox
+        #      or Button controls.  pywinauto sees them as type="Pane"
+        #      even though they look like checkboxes on screen.
+        #      Bug found 2026-05-08: Dialog shows checkboxes visually
+        #      but exposes them as Pane type in the UI Automation tree.
         #   1. Find CheckBox descendants via pywinauto, match by text
         #   2. Try Button descendants (QB sometimes exposes checkboxes as
         #      Button controls with BS_CHECKBOX / BS_AUTOCHECKBOX style)
@@ -995,37 +1001,78 @@ class QuickBooksAutomationEngine:
 
         selected = False
 
-        # --- Attempt 1: CheckBox controls via pywinauto ---
+        # --- Attempt 0: Pane controls (QB 2023 custom checkbox rendering) ---
+        # QB 2023 uses custom Pane controls instead of standard CheckBox
+        # or Button controls for its Export Lists dialog.  The checkboxes
+        # appear visually as checkboxes but are exposed to UI Automation
+        # as generic Pane elements with the list name as window_text.
+        # We click matching panes to toggle them on, and click non-matching
+        # panes to toggle them off (ensuring only our target list is selected).
         try:
-            checkboxes = dlg.descendants(control_type="CheckBox")
-            self._emit(f"  Found {len(checkboxes)} CheckBox control(s) in dialog", log_fn)
-            for cb in checkboxes:
+            panes = dlg.descendants(control_type="Pane")
+            # Filter to panes that look like list-item checkboxes:
+            # they have non-empty text and are NOT standard dialog buttons
+            skip_texts = {"ok", "cancel", "help", "export", "save", ""}
+            list_panes = []
+            for pane in panes:
                 try:
-                    cb_text = (cb.window_text() or "").strip()
-                    self._emit(f"    CheckBox: '{cb_text}'", log_fn)
-                    if list_name.lower() in cb_text.lower():
-                        # This is the one we want — make sure it's checked
-                        try:
-                            if not cb.get_toggle_state():
-                                cb.toggle()
-                        except Exception:  # noqa: BLE001
-                            # toggle() failed — try clicking directly
-                            cb.click_input()
+                    text = (pane.window_text() or "").strip()
+                    if text.lower() not in skip_texts:
+                        list_panes.append((pane, text))
+                except Exception:  # noqa: BLE001
+                    continue
+
+            if list_panes:
+                self._emit(f"  Found {len(list_panes)} Pane control(s) that look like list checkboxes", log_fn)
+                for pane, text in list_panes:
+                    self._emit(f"    Pane: '{text}'", log_fn)
+                    if list_name.lower() in text.lower():
+                        # This is the list we want — click to check it
+                        pane.click_input()
                         selected = True
-                        self._emit(f"  ✓ Selected checkbox: '{cb_text}'", log_fn)
+                        self._emit(f"  ✓ Selected pane-checkbox: '{text}'", log_fn)
                     else:
-                        # Uncheck any OTHER list so we only export the one we want
+                        # Uncheck other lists by clicking them off
                         try:
-                            if cb.get_toggle_state():
-                                cb.toggle()
-                                self._emit(f"    Unchecked: '{cb_text}'", log_fn)
+                            pane.click_input()
+                            self._emit(f"    Toggled off pane: '{text}'", log_fn)
                         except Exception:  # noqa: BLE001
                             pass
-                except Exception as exc:  # noqa: BLE001
-                    self._emit(f"    (could not inspect checkbox: {exc})", log_fn)
-                    continue
         except Exception as exc:  # noqa: BLE001
-            self._emit(f"  CheckBox search failed: {exc}", log_fn)
+            self._emit(f"  Pane search failed: {exc}", log_fn)
+
+        # --- Attempt 1: CheckBox controls via pywinauto (older QB versions) ---
+        if not selected:
+            try:
+                checkboxes = dlg.descendants(control_type="CheckBox")
+                self._emit(f"  Found {len(checkboxes)} CheckBox control(s) in dialog", log_fn)
+                for cb in checkboxes:
+                    try:
+                        cb_text = (cb.window_text() or "").strip()
+                        self._emit(f"    CheckBox: '{cb_text}'", log_fn)
+                        if list_name.lower() in cb_text.lower():
+                            # This is the one we want — make sure it's checked
+                            try:
+                                if not cb.get_toggle_state():
+                                    cb.toggle()
+                            except Exception:  # noqa: BLE001
+                                # toggle() failed — try clicking directly
+                                cb.click_input()
+                            selected = True
+                            self._emit(f"  ✓ Selected checkbox: '{cb_text}'", log_fn)
+                        else:
+                            # Uncheck any OTHER list so we only export the one we want
+                            try:
+                                if cb.get_toggle_state():
+                                    cb.toggle()
+                                    self._emit(f"    Unchecked: '{cb_text}'", log_fn)
+                            except Exception:  # noqa: BLE001
+                                pass
+                    except Exception as exc:  # noqa: BLE001
+                        self._emit(f"    (could not inspect checkbox: {exc})", log_fn)
+                        continue
+            except Exception as exc:  # noqa: BLE001
+                self._emit(f"  CheckBox search failed: {exc}", log_fn)
 
         # --- Attempt 2: Button controls with checkbox style ---
         if not selected:
