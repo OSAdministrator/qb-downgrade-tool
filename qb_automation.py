@@ -616,13 +616,20 @@ class QuickBooksAutomationEngine:
         save_mode: bool,
         timeout_s: int,
         log_fn: Optional[LogFn],
+        parent_window=None,
     ) -> None:
+        # FIX: Save As dialog is modal child of QB window, not desktop-level
+        # Must search parent_window.children() like we do for Export Lists dialog
+        # Bug found 2026-05-08: Tool selects lists correctly but can't find Save As dialog
         target = str(file_path)
 
         dialog_box: Dict[str, object] = {}
 
         def _cond() -> bool:
-            dlg = self._find_active_dialog(title_re=r"(?i)(open|save as|import|export|create company)")
+            dlg = self._find_active_dialog(
+                title_re=r"(?i)(open|save as|import|export|create company)",
+                parent_window=parent_window,
+            )
             if dlg is not None:
                 dialog_box["dlg"] = dlg
                 return True
@@ -1171,7 +1178,7 @@ class QuickBooksAutomationEngine:
                 send_keys("{ENTER}")
 
         time.sleep(1)
-        self._handle_standard_file_dialog(out_path, save_mode=True, timeout_s=self.config.timeouts.export_seconds, log_fn=log_fn)
+        self._handle_standard_file_dialog(out_path, save_mode=True, timeout_s=self.config.timeouts.export_seconds, log_fn=log_fn, parent_window=main_window)
         self._dismiss_common_dialogs(log_fn)
 
     def _open_report(self, main_window, menu_path: str, fallback_keys: str, log_fn: Optional[LogFn]) -> None:
@@ -1247,7 +1254,7 @@ class QuickBooksAutomationEngine:
             self._click_first_button(export_dlg, ["Export", "OK", "Next", "Create"])
             time.sleep(1)
 
-        self._handle_standard_file_dialog(out_csv, save_mode=True, timeout_s=self.config.timeouts.export_seconds, log_fn=log_fn)
+        self._handle_standard_file_dialog(out_csv, save_mode=True, timeout_s=self.config.timeouts.export_seconds, log_fn=log_fn, parent_window=main_window)
         self._dismiss_common_dialogs(log_fn)
 
         # Close the report window
@@ -1272,7 +1279,7 @@ class QuickBooksAutomationEngine:
             self._focus_window(print_dlg)
             self._click_first_button(print_dlg, ["Print", "OK"])
 
-        self._handle_standard_file_dialog(out_pdf, save_mode=True, timeout_s=self.config.timeouts.report_seconds, log_fn=log_fn)
+        self._handle_standard_file_dialog(out_pdf, save_mode=True, timeout_s=self.config.timeouts.report_seconds, log_fn=log_fn, parent_window=main_window)
         self._dismiss_common_dialogs(log_fn)
 
     # -------- QB 2023 extraction --------
@@ -1689,7 +1696,7 @@ class QuickBooksAutomationEngine:
         self._click_first_button(wizard, ["Next", "Continue", "Create Company", "Finish"])
 
         # Save file location.
-        self._handle_standard_file_dialog(target_qbw, save_mode=True, timeout_s=self.config.timeouts.open_company_seconds, log_fn=log_fn)
+        self._handle_standard_file_dialog(target_qbw, save_mode=True, timeout_s=self.config.timeouts.open_company_seconds, log_fn=log_fn, parent_window=main_window)
 
         self._wait_for_company_ready(main_window, timeout_s=self.config.timeouts.open_company_seconds, log_fn=log_fn)
         self._dismiss_common_dialogs(log_fn)
@@ -1703,7 +1710,7 @@ class QuickBooksAutomationEngine:
         self._invoke_menu(main_window, "File->Utilities->Import->IIF Files...", "%fui", log_fn)
         time.sleep(1)
 
-        self._handle_standard_file_dialog(iif_path, save_mode=False, timeout_s=timeout_s, log_fn=log_fn)
+        self._handle_standard_file_dialog(iif_path, save_mode=False, timeout_s=timeout_s, log_fn=log_fn, parent_window=main_window)
 
         # Common QuickBooks import warnings/confirmations.
         start = time.time()
