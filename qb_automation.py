@@ -610,25 +610,22 @@ class QuickBooksAutomationEngine:
         time.sleep(2)
 
     def _open_company_file(self, main_window, qbw_path: Path, password: str, timeout_s: int, log_fn: Optional[LogFn]) -> None:
-        """Open a QuickBooks company file using a strict sequential approach.
+        """Open a QuickBooks company file using QB's command-line parameter.
 
-        IMPORTANT: The .qbw file is opened WITHOUT passing a password on the
-        command line.  Instead we follow this sequence:
+        Instead of navigating File → Open menus and file dialogs, we launch
+        (or re-launch) QuickBooks with the .qbw file path as a command-line
+        argument.  QB will automatically open the company file and prompt for
+        the admin password – we just need to wait for that dialog and handle it.
 
-          1. Open the .qbw via File ▸ Open (no password in the command)
-          2. WAIT for the password/login dialog to appear
-          3. Enter the password into the dialog that QB presents
-          4. Click OK / Login
-          5. WAIT for the company to FULLY load (company name in title bar,
-             "No Company Open" is gone)
-          6. ONLY THEN call _dismiss_common_dialogs() and
-             _close_popup_windows() to clear post-login popups
-
-        Each step emits detailed log messages so the operator can trace
-        exactly where the process is at any moment.
+        Steps:
+          1. Launch QB with the .qbw file as a parameter (auto-opens the file)
+          2. Wait for the password dialog to appear
+          3. Handle the password dialog (already coded in _handle_password_prompt)
+          4. Wait for the company to fully load
+          5. Dismiss post-login popups
         """
         self._emit("=" * 60, log_fn)
-        self._emit("  OPENING COMPANY FILE  –  Sequential Approach", log_fn)
+        self._emit("  OPENING COMPANY FILE  –  Command-Line Parameter Approach", log_fn)
         self._emit("=" * 60, log_fn)
         self._emit(f"  File path : {qbw_path}", log_fn)
         self._emit(f"  Password  : {'(provided, length=%d)' % len(password) if password else '(none)'}", log_fn)
@@ -640,80 +637,48 @@ class QuickBooksAutomationEngine:
         self._emit(f"  File confirmed on disk ({qbw_path.stat().st_size:,} bytes).", log_fn)
 
         # ==================================================================
-        # STEP 1 – Trigger File ▸ Open (no password in the command)
+        # STEP 1 – Launch QB with the .qbw file as a command-line parameter
         # ==================================================================
-        self._emit("[STEP 1/6] Triggering File ▸ Open menu (password is NOT passed here)...", log_fn)
+        self._emit("[STEP 1/5] Launching QB with company file as command-line parameter...", log_fn)
 
-        opened = False
-        menu_attempts = [
-            ("File->Open or Restore Company...", "^o"),
-            ("File->Open Company...", "^o"),
-        ]
-        for idx, (menu_path, fallback) in enumerate(menu_attempts, 1):
-            try:
-                self._emit(f"  [Open] Menu attempt {idx}/{len(menu_attempts)}: {menu_path}", log_fn)
-                self._invoke_menu(main_window, menu_path, fallback, log_fn)
-                opened = True
-                self._emit(f"  [Open] ✓ Menu action succeeded: {menu_path}", log_fn)
-                break
-            except Exception as e:  # noqa: BLE001
-                self._emit(f"  [Open] Menu attempt failed: {e}", log_fn)
-                continue
+        # Close the existing QB instance so we can re-launch with the file arg
+        if self._qb2023_app is not None:
+            self._emit("  [Launch] Closing existing QB instance to re-launch with file parameter...", log_fn)
+            self._close_qb(self._qb2023_app, log_fn)
+            self._qb2023_app = None
+            time.sleep(2)
 
-        if not opened:
-            if send_keys is None:
-                self._emit("  [Open] ERROR: All menu attempts failed and send_keys unavailable.", log_fn)
-                raise RuntimeError("Unable to trigger company open action")
-            self._emit("  [Open] All menu attempts failed – using Ctrl+O keyboard fallback.", log_fn)
-            self._focus_window(main_window)
-            send_keys("^o")
-            self._emit("  [Open] Ctrl+O sent.", log_fn)
+        # Launch QB with the .qbw path – QB will auto-open the company file
+        qb_exe = self.config.install_paths.qb_2023_path
+        self._qb2023_app = self._launch_qb(qb_exe, log_fn, qbw_path=qbw_path)
 
-        self._emit("  [Open] Waiting 1s for file dialog to render...", log_fn)
-        time.sleep(1)
+        self._emit("[STEP 1/5] ✓ QB launched with company file parameter.", log_fn)
 
-        # Navigate the standard file-open dialog to select the .qbw file
-        self._emit("[STEP 1b] Selecting company file in file-open dialog...", log_fn)
-        self._emit(f"  [Open] Target file: {qbw_path}", log_fn)
-        self._handle_standard_file_dialog(qbw_path, save_mode=False, timeout_s=timeout_s, log_fn=log_fn)
-        self._emit("  [Open] File selected in dialog.", log_fn)
-
-        # Handle Open/Restore wizard if it appears
-        self._emit("  [Open] Checking for Open/Restore wizard overlay...", log_fn)
-        dlg = self._find_active_dialog(title_re=r"(?i)(open|restore)")
-        if dlg is not None:
-            try:
-                dlg_title = dlg.window_text()
-            except Exception:  # noqa: BLE001
-                dlg_title = "<unknown>"
-            self._emit(f"  [Open] Open/Restore wizard detected ('{dlg_title}') – clicking through...", log_fn)
-            self._click_first_button(dlg, ["Open a company file", "Next", "Open"])
-            time.sleep(0.5)
-        else:
-            self._emit("  [Open] No Open/Restore wizard detected.", log_fn)
-
-        self._emit("[STEP 1/6] ✓ File open command sent – file path submitted to QB.", log_fn)
+        # Re-acquire the main window reference after relaunch
+        self._emit("  [Launch] Waiting for QB main window to appear...", log_fn)
+        main_window = self._find_qb_main_window(self._qb2023_app, "2023", self.config.timeouts.launch_qb_seconds)
+        self._emit("  [Launch] ✓ Main window found.", log_fn)
 
         # ==================================================================
-        # STEP 2-4 – Wait for password dialog → enter password → click OK
+        # STEP 2-3 – Wait for password dialog → enter password → click OK
         # ==================================================================
-        self._emit("[STEP 2/6] Waiting for password/login dialog to appear...", log_fn)
-        self._emit("  (QB should now display a password prompt for this company file.)", log_fn)
+        self._emit("[STEP 2/5] Waiting for password/login dialog to appear...", log_fn)
+        self._emit("  (QB should auto-prompt for the password after opening the company file.)", log_fn)
         self._handle_password_prompt(password, timeout_s=timeout_s, log_fn=log_fn)
-        self._emit("[STEP 4/6] ✓ Password handling complete.", log_fn)
+        self._emit("[STEP 3/5] ✓ Password handling complete.", log_fn)
 
         # ==================================================================
-        # STEP 5 – Wait for the company to FULLY load
+        # STEP 4 – Wait for the company to FULLY load
         # ==================================================================
-        self._emit("[STEP 5/6] Waiting for company to fully load (title bar check)...", log_fn)
+        self._emit("[STEP 4/5] Waiting for company to fully load (title bar check)...", log_fn)
         self._emit("  (Looking for company name in title; 'No Company Open' must disappear.)", log_fn)
         self._wait_for_company_ready(main_window, timeout_s=timeout_s, log_fn=log_fn)
-        self._emit("[STEP 5/6] ✓ Company is fully loaded.", log_fn)
+        self._emit("[STEP 4/5] ✓ Company is fully loaded.", log_fn)
 
         # ==================================================================
-        # STEP 6 – NOW dismiss popup dialogs (Payroll, Accountant Center …)
+        # STEP 5 – Dismiss popup dialogs (Payroll, Accountant Center …)
         # ==================================================================
-        self._emit("[STEP 6/6] Company loaded – NOW dismissing post-login popup dialogs...", log_fn)
+        self._emit("[STEP 5/5] Company loaded – dismissing post-login popup dialogs...", log_fn)
         self._emit("  [Popups] Pausing 1s for popups to finish rendering...", log_fn)
         time.sleep(1)
 
@@ -972,8 +937,21 @@ class QuickBooksAutomationEngine:
 
     # -------- QB 2023 extraction --------
 
-    def _launch_qb(self, exe_path: str, log_fn: Optional[LogFn]) -> Optional[object]:
-        self._emit(f"Launching QuickBooks: {exe_path}", log_fn)
+    def _launch_qb(self, exe_path: str, log_fn: Optional[LogFn], qbw_path: Optional[Path] = None) -> Optional[object]:
+        """Launch QuickBooks, optionally with a company file as a command-line parameter.
+
+        If *qbw_path* is provided and QB is not already running, QB is started
+        with the .qbw file path as an argument.  This causes QB to open the
+        company file directly and auto-prompt for the password – no File → Open
+        menu navigation required.
+
+        If QB is already running we simply connect to the existing process
+        (the caller is responsible for opening the file via _open_company_file).
+        """
+        if qbw_path:
+            self._emit(f"Launching QuickBooks: {exe_path} WITH company file: {qbw_path}", log_fn)
+        else:
+            self._emit(f"Launching QuickBooks: {exe_path}", log_fn)
 
         if self.config.dry_run:
             time.sleep(1)
@@ -990,8 +968,13 @@ class QuickBooksAutomationEngine:
         except Exception:  # noqa: BLE001
             pass
 
-        # Not running, start it
-        app = Application(backend="uia").start(exe_path)
+        # Not running – start it, optionally with the .qbw path as argument
+        if qbw_path:
+            cmd_line = f'"{exe_path}" "{qbw_path}"'
+            self._emit(f"  Starting QB with command: {cmd_line}", log_fn)
+            app = Application(backend="uia").start(cmd_line)
+        else:
+            app = Application(backend="uia").start(exe_path)
         return app
 
     def _close_qb(self, app: Optional[object], log_fn: Optional[LogFn]) -> None:
@@ -1524,9 +1507,9 @@ class QuickBooksAutomationEngine:
             target_dir = job.output_dir / "target"
             validation_dir = job.output_dir / "validation"
 
-            # 1) Launch QB 2023
+            # 1) Launch QB 2023 with company file as parameter (auto-opens it)
             set_progress(0)
-            qb2023_app = self._launch_qb(self.config.install_paths.qb_2023_path, log_fn)
+            qb2023_app = self._launch_qb(self.config.install_paths.qb_2023_path, log_fn, qbw_path=job.qbw_path)
             self._qb2023_app = qb2023_app
 
             # 2) Export
