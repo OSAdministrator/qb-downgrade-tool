@@ -1224,25 +1224,102 @@ class QuickBooksAutomationEngine:
                     )
 
                 if success_dialog:
-                    log_fn(f"Found potential success dialog: {success_dialog.window_text()}")
-                    # Check for success message in child controls
+                    dlg_title = success_dialog.window_text()
+                    log_fn(f"Found potential success dialog: {dlg_title}")
+
+                    # ── Determine if this is the success dialog ──
+                    # Strategy 1: Check child Text controls for success keywords
+                    confirmed_via_text = False
                     static_controls = success_dialog.descendants(control_type="Text")
                     for static in static_controls:
                         text = static.window_text().lower()
                         if "success" in text or "export" in text or "complete" in text:
-                            log_fn(f"✅ SUCCESS CONFIRMED: {text}")
-                            # Try clicking OK
-                            try:
-                                ok_btn = success_dialog.child_window(title="OK", control_type="Button")
-                                ok_btn.click()
-                                log_fn("Clicked OK button")
-                            except Exception:
-                                # Fallback: ESC or Enter key
-                                log_fn("Button click failed, trying ESC key")
-                                success_dialog.type_keys("{ESC}")
-                            time.sleep(1)
-                            dialog_dismissed = True
+                            log_fn(f"✅ SUCCESS CONFIRMED via text control: {text}")
+                            confirmed_via_text = True
                             break
+
+                    # Strategy 2: If no Text controls found (QB doesn't expose them
+                    # via UIA for this dialog), confirm by title alone.
+                    # "QuickBooks Desktop Information" is the known title for the
+                    # export success dialog.  It only appears after a successful
+                    # export, so the title match is sufficient.
+                    if not confirmed_via_text and len(static_controls) == 0:
+                        if re.search(r"(?i)QuickBooks.*Information", dlg_title):
+                            log_fn(f"✅ SUCCESS CONFIRMED via dialog title (no UIA text controls exposed): {dlg_title}")
+                            confirmed_via_text = True
+
+                    if confirmed_via_text:
+                        # ── Dismiss the dialog ──
+                        # Try multiple approaches because QB's UIA tree is unreliable:
+                        #   1. Click OK child (may be Button or Pane control type)
+                        #   2. Send {ENTER} key (OK is default-focused)
+                        #   3. Send {ESC} key
+                        dismissed = False
+
+                        # Approach 1a: Try OK as Button
+                        try:
+                            ok_btn = success_dialog.child_window(title="OK", control_type="Button")
+                            ok_btn.click()
+                            log_fn("Clicked OK button (Button control)")
+                            dismissed = True
+                        except Exception:
+                            pass
+
+                        # Approach 1b: Try OK as Pane (QB exposes it as Pane, not Button)
+                        if not dismissed:
+                            try:
+                                ok_pane = success_dialog.child_window(title="OK", control_type="Pane")
+                                ok_pane.click_input()
+                                log_fn("Clicked OK button (Pane control via click_input)")
+                                dismissed = True
+                            except Exception:
+                                pass
+
+                        # Approach 1c: Try any descendant named OK regardless of type
+                        if not dismissed:
+                            try:
+                                all_desc = success_dialog.descendants()
+                                for desc in all_desc:
+                                    if desc.window_text() == "OK":
+                                        desc.click_input()
+                                        log_fn(f"Clicked OK descendant ({desc.element_info.control_type})")
+                                        dismissed = True
+                                        break
+                            except Exception:
+                                pass
+
+                        # Approach 2: Send ENTER key to the dialog
+                        if not dismissed:
+                            try:
+                                success_dialog.set_focus()
+                                if send_keys is not None:
+                                    send_keys("{ENTER}")
+                                    log_fn("Sent ENTER key to dismiss dialog")
+                                    dismissed = True
+                            except Exception:
+                                pass
+
+                        # Approach 3: Send ESC key
+                        if not dismissed:
+                            try:
+                                success_dialog.type_keys("{ESC}")
+                                log_fn("Sent ESC key to dismiss dialog")
+                                dismissed = True
+                            except Exception as esc_err:
+                                log_fn(f"ESC key also failed: {esc_err}")
+
+                        time.sleep(1)
+
+                        # Verify dialog is actually gone
+                        verify = self._find_active_dialog(
+                            parent_window=main_window,
+                            title_re="(QuickBooks|Information)"
+                        )
+                        if verify is None:
+                            dialog_dismissed = True
+                            log_fn("✅ Success dialog dismissed and verified gone")
+                        else:
+                            log_fn("⚠️ Dialog may still be present after dismiss attempt, retrying...")
 
                 if dialog_dismissed:
                     break
