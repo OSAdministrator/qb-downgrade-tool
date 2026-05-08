@@ -1221,11 +1221,17 @@ class QuickBooksAutomationEngine:
                     title = success_dialog.window_text()
                     log_fn(f"✅ Found success dialog: '{title}'")
 
-                    # Click OK button (don't search for text - dialog uses Panes)
+                    # Click OK button - UIAWrapper objects don't have child_window method,
+                    # so search descendants directly
                     try:
-                        ok_btn = success_dialog.child_window(title_re=r"(?i)ok", control_type="Button")
-                        ok_btn.click()
-                        log_fn("Clicked OK button")
+                        ok_buttons = [ctrl for ctrl in success_dialog.descendants()
+                                      if ctrl.element_info.control_type == "Button"
+                                      and re.search(r"(?i)ok", ctrl.window_text())]
+                        if ok_buttons:
+                            ok_buttons[0].click()
+                            log_fn("Clicked OK button")
+                        else:
+                            raise Exception("OK button not found in success dialog descendants")
                         dialog_dismissed = True
                         break
                     except Exception as e:
@@ -1233,10 +1239,18 @@ class QuickBooksAutomationEngine:
                         try:
                             success_dialog.type_keys("{ESC}")
                             log_fn("Sent ESC key")
+                            time.sleep(1)
+                            # Verify dialog actually closed
+                            verify = self._find_active_dialog(
+                                parent_window=main_window,
+                                title_re=r"(?i)QuickBooks.*Information"
+                            )
+                            if verify:
+                                raise RuntimeError("Success dialog still visible after ESC - not dismissed properly")
                             dialog_dismissed = True
                             break
-                        except:
-                            pass
+                        except Exception as esc_err:
+                            raise RuntimeError(f"Failed to dismiss success dialog: {esc_err}")
                 else:
                     if i % 5 == 0:  # Log every 5 attempts to reduce noise
                         log_fn(f"[Attempt {i+1}/30] Waiting for success dialog...")
