@@ -454,177 +454,290 @@ class QuickBooksAutomationEngine:
         self._dismiss_common_dialogs(log_fn)
 
     def _handle_password_prompt(self, password: str, timeout_s: int, log_fn: Optional[LogFn]) -> None:
+        """Wait for a password/login dialog and enter credentials.
+
+        This method is called AFTER a company file open has been triggered.
+        It waits for the password dialog to appear, enters credentials,
+        and clicks OK/Login. It does NOT dismiss any other dialogs.
+        """
+        self._emit("  [Password] Checking if password was provided...", log_fn)
         if not password:
+            self._emit("  [Password] No password provided – skipping password entry.", log_fn)
             return
 
+        self._emit(f"  [Password] Password provided (length={len(password)}). "
+                   f"Scanning for dialog up to {min(timeout_s, 20)}s...", log_fn)
+
         dialog_box: Dict[str, object] = {}
+        poll_count = 0
 
         def _cond() -> bool:
+            nonlocal poll_count
+            poll_count += 1
             dlg = self._find_active_dialog(title_re=r"(?i)(password|login)")
             if dlg is not None:
+                try:
+                    dlg_title = dlg.window_text()
+                except Exception:  # noqa: BLE001
+                    dlg_title = "<unknown>"
+                self._emit(f"  [Password] Dialog FOUND on poll #{poll_count}: '{dlg_title}'", log_fn)
                 dialog_box["dlg"] = dlg
                 return True
             return False
 
         if not self._wait_until(_cond, min(timeout_s, 20), 0.5):
-            self._emit("No password prompt detected; continuing", log_fn)
+            self._emit(f"  [Password] No password/login dialog detected after {poll_count} polls; continuing.", log_fn)
             return
 
         dialog = dialog_box["dlg"]
+        self._emit("  [Password] Focusing password dialog...", log_fn)
         self._focus_window(dialog)
+        time.sleep(0.3)
 
-        # Check if this is a username+password dialog (2+ edit fields)
+        # Enumerate edit fields to determine dialog type
         try:
             edits = dialog.descendants(control_type="Edit")
-        except Exception:  # noqa: BLE001
+            self._emit(f"  [Password] Found {len(edits)} edit field(s) in dialog.", log_fn)
+        except Exception as e:  # noqa: BLE001
+            self._emit(f"  [Password] WARNING: Could not enumerate edit fields: {e}", log_fn)
             edits = []
 
         if len(edits) >= 2:
-            # Username + Password dialog
-            self._emit(f"Detected username+password login dialog ({len(edits)} edit fields)", log_fn)
-            # Clear username field first, then set
+            # ----- Username + Password dialog -----
+            self._emit(f"  [Password] Dialog type: USERNAME + PASSWORD ({len(edits)} fields)", log_fn)
+
+            # Clear and set username (field 0)
+            self._emit("  [Password] Step A: Setting username field to 'Admin'...", log_fn)
             if send_keys is not None:
                 try:
                     edits[0].set_focus()
                     time.sleep(0.1)
                     send_keys("^a{DELETE}")
                     time.sleep(0.1)
-                except Exception:  # noqa: BLE001
-                    pass
+                    self._emit("  [Password] Username field cleared via Ctrl+A, Delete.", log_fn)
+                except Exception as e:  # noqa: BLE001
+                    self._emit(f"  [Password] WARNING: Could not clear username field: {e}", log_fn)
             if not self._set_edit_value(dialog, "Admin", edit_index=0):
-                self._emit("Warning: could not set username field", log_fn)
-            # Clear password field first, then set
+                self._emit("  [Password] WARNING: _set_edit_value failed for username field.", log_fn)
+            else:
+                self._emit("  [Password] Username field set to 'Admin'.", log_fn)
+
+            # Clear and set password (field 1)
+            self._emit("  [Password] Step B: Setting password field...", log_fn)
             if send_keys is not None:
                 try:
                     edits[1].set_focus()
                     time.sleep(0.1)
                     send_keys("^a{DELETE}")
                     time.sleep(0.1)
-                except Exception:  # noqa: BLE001
-                    pass
+                    self._emit("  [Password] Password field cleared via Ctrl+A, Delete.", log_fn)
+                except Exception as e:  # noqa: BLE001
+                    self._emit(f"  [Password] WARNING: Could not clear password field: {e}", log_fn)
             if not self._set_edit_value(dialog, password, edit_index=1):
-                raise RuntimeError("Password dialog detected but failed to set password")
+                raise RuntimeError("Password dialog detected but failed to set password in edit field 1")
+            self._emit("  [Password] Password field set successfully.", log_fn)
+
         else:
-            # Password-only dialog
+            # ----- Password-only dialog -----
+            self._emit("  [Password] Dialog type: PASSWORD ONLY (single field)", log_fn)
+            self._emit("  [Password] Setting password in the single edit field...", log_fn)
             if not self._set_edit_value(dialog, password):
                 raise RuntimeError("Password dialog detected but failed to set password")
+            self._emit("  [Password] Password field set successfully.", log_fn)
 
-        if not self._click_first_button(dialog, ["OK", "Continue", "Login", "Open"]):
+        # Click OK / Login button
+        self._emit("  [Password] Step C: Clicking OK/Login button...", log_fn)
+        btn_clicked = self._click_first_button(dialog, ["OK", "Continue", "Login", "Open"])
+        if btn_clicked:
+            self._emit("  [Password] Button click succeeded.", log_fn)
+        else:
             if send_keys is not None:
-                self._emit("Button click failed in password prompt, trying Enter", log_fn)
+                self._emit("  [Password] Button click failed – sending Enter key as fallback.", log_fn)
                 send_keys("{ENTER}")
+            else:
+                self._emit("  [Password] WARNING: Button click failed and send_keys unavailable.", log_fn)
 
-        self._emit("Password entered", log_fn)
+        self._emit("  [Password] Password entry sequence complete.", log_fn)
 
     def _wait_for_company_ready(self, main_window, timeout_s: int, log_fn: Optional[LogFn]) -> None:
         """Wait for the company to finish loading by checking the window title.
+
+        The company is considered loaded when the main QB window title no
+        longer contains "No Company Open".  A positive company name in the
+        title is the definitive signal.
 
         NOTE: This method does NOT dismiss dialogs during the wait loop.
         Popup/dialog dismissal should happen AFTER this method returns,
         ensuring the company is fully loaded first.
         """
-        self._emit("[STEP 5] Waiting for company to finish loading...", log_fn)
+        self._emit(f"[STEP 5] Waiting for company to finish loading (timeout={timeout_s}s)...", log_fn)
+        self._emit("  [Load] Polling window title every 1s for company name...", log_fn)
+
+        poll_count = 0
+        last_title = ""
 
         def _cond() -> bool:
+            nonlocal poll_count, last_title
+            poll_count += 1
             try:
                 title = main_window.window_text() or ""
-                has_company = "No Company Open" not in title
-                if has_company:
-                    self._emit(f"  Company loaded – window title: {title}", log_fn)
-                return has_company
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                self._emit(f"  [Load] Poll #{poll_count}: ERROR reading title: {e}", log_fn)
                 return False
 
+            # Log title changes (avoid spamming identical titles)
+            if title != last_title:
+                self._emit(f"  [Load] Poll #{poll_count}: Title changed -> '{title}'", log_fn)
+                last_title = title
+            elif poll_count % 10 == 0:
+                self._emit(f"  [Load] Poll #{poll_count}: Still waiting (title='{title}')...", log_fn)
+
+            has_company = "No Company Open" not in title
+            if has_company:
+                self._emit(f"  [Load] ✓ Company detected in title on poll #{poll_count}: '{title}'", log_fn)
+            return has_company
+
         if not self._wait_until(_cond, timeout_s, 1.0):
+            try:
+                final_title = main_window.window_text() or ""
+            except Exception:  # noqa: BLE001
+                final_title = "<could not read>"
+            self._emit(f"  [Load] TIMEOUT after {poll_count} polls. Final title: '{final_title}'", log_fn)
             raise RuntimeError("Company did not finish loading in QuickBooks")
 
-        self._emit("[STEP 5] Company is fully loaded.", log_fn)
+        self._emit(f"[STEP 5] Company is fully loaded after {poll_count} poll(s).", log_fn)
+        self._emit("  [Load] Pausing 2s for QB to stabilize after load...", log_fn)
         time.sleep(2)
 
     def _open_company_file(self, main_window, qbw_path: Path, password: str, timeout_s: int, log_fn: Optional[LogFn]) -> None:
         """Open a QuickBooks company file using a strict sequential approach.
 
-        Sequence:
-          1. Open the .qbw file via File menu (no password yet)
-          2. Wait for the password/login dialog to appear
-          3. Enter the password in the dialog
-          4. Click OK/Login
-          5. Wait for the company to finish loading (title check)
-          6. ONLY AFTER loading, dismiss popup dialogs
-        """
-        self._emit(f"========== OPENING COMPANY FILE ==========", log_fn)
-        self._emit(f"File: {qbw_path}", log_fn)
-        if not qbw_path.exists():
-            raise FileNotFoundError(f"Source QBW file not found: {qbw_path}")
+        IMPORTANT: The .qbw file is opened WITHOUT passing a password on the
+        command line.  Instead we follow this sequence:
 
-        # ------------------------------------------------------------------
-        # STEP 1: Trigger File -> Open via menu or keyboard
-        # ------------------------------------------------------------------
-        self._emit("[STEP 1] Opening company file via File menu (no password yet)...", log_fn)
+          1. Open the .qbw via File ▸ Open (no password in the command)
+          2. WAIT for the password/login dialog to appear
+          3. Enter the password into the dialog that QB presents
+          4. Click OK / Login
+          5. WAIT for the company to FULLY load (company name in title bar,
+             "No Company Open" is gone)
+          6. ONLY THEN call _dismiss_common_dialogs() and
+             _close_popup_windows() to clear post-login popups
+
+        Each step emits detailed log messages so the operator can trace
+        exactly where the process is at any moment.
+        """
+        self._emit("=" * 60, log_fn)
+        self._emit("  OPENING COMPANY FILE  –  Sequential Approach", log_fn)
+        self._emit("=" * 60, log_fn)
+        self._emit(f"  File path : {qbw_path}", log_fn)
+        self._emit(f"  Password  : {'(provided, length=%d)' % len(password) if password else '(none)'}", log_fn)
+        self._emit(f"  Timeout   : {timeout_s}s", log_fn)
+
+        if not qbw_path.exists():
+            self._emit(f"  ERROR: File does not exist on disk: {qbw_path}", log_fn)
+            raise FileNotFoundError(f"Source QBW file not found: {qbw_path}")
+        self._emit(f"  File confirmed on disk ({qbw_path.stat().st_size:,} bytes).", log_fn)
+
+        # ==================================================================
+        # STEP 1 – Trigger File ▸ Open (no password in the command)
+        # ==================================================================
+        self._emit("[STEP 1/6] Triggering File ▸ Open menu (password is NOT passed here)...", log_fn)
 
         opened = False
-        for menu_path, fallback in [
+        menu_attempts = [
             ("File->Open or Restore Company...", "^o"),
             ("File->Open Company...", "^o"),
-        ]:
+        ]
+        for idx, (menu_path, fallback) in enumerate(menu_attempts, 1):
             try:
+                self._emit(f"  [Open] Menu attempt {idx}/{len(menu_attempts)}: {menu_path}", log_fn)
                 self._invoke_menu(main_window, menu_path, fallback, log_fn)
                 opened = True
-                self._emit(f"  Menu action succeeded: {menu_path}", log_fn)
+                self._emit(f"  [Open] ✓ Menu action succeeded: {menu_path}", log_fn)
                 break
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                self._emit(f"  [Open] Menu attempt failed: {e}", log_fn)
                 continue
 
         if not opened:
             if send_keys is None:
+                self._emit("  [Open] ERROR: All menu attempts failed and send_keys unavailable.", log_fn)
                 raise RuntimeError("Unable to trigger company open action")
+            self._emit("  [Open] All menu attempts failed – using Ctrl+O keyboard fallback.", log_fn)
             self._focus_window(main_window)
             send_keys("^o")
-            self._emit("  Used Ctrl+O fallback to open file dialog", log_fn)
+            self._emit("  [Open] Ctrl+O sent.", log_fn)
 
+        self._emit("  [Open] Waiting 1s for file dialog to render...", log_fn)
         time.sleep(1)
 
         # Navigate the standard file-open dialog to select the .qbw file
-        self._emit("[STEP 1b] Selecting company file in file dialog...", log_fn)
+        self._emit("[STEP 1b] Selecting company file in file-open dialog...", log_fn)
+        self._emit(f"  [Open] Target file: {qbw_path}", log_fn)
         self._handle_standard_file_dialog(qbw_path, save_mode=False, timeout_s=timeout_s, log_fn=log_fn)
+        self._emit("  [Open] File selected in dialog.", log_fn)
 
         # Handle Open/Restore wizard if it appears
+        self._emit("  [Open] Checking for Open/Restore wizard overlay...", log_fn)
         dlg = self._find_active_dialog(title_re=r"(?i)(open|restore)")
         if dlg is not None:
-            self._emit("  Open/Restore wizard detected – clicking through...", log_fn)
+            try:
+                dlg_title = dlg.window_text()
+            except Exception:  # noqa: BLE001
+                dlg_title = "<unknown>"
+            self._emit(f"  [Open] Open/Restore wizard detected ('{dlg_title}') – clicking through...", log_fn)
             self._click_first_button(dlg, ["Open a company file", "Next", "Open"])
             time.sleep(0.5)
+        else:
+            self._emit("  [Open] No Open/Restore wizard detected.", log_fn)
 
-        self._emit("[STEP 1] File open command sent.", log_fn)
+        self._emit("[STEP 1/6] ✓ File open command sent – file path submitted to QB.", log_fn)
 
-        # ------------------------------------------------------------------
-        # STEP 2: Wait for the password/login dialog to appear
-        # ------------------------------------------------------------------
-        self._emit("[STEP 2] Waiting for password/login dialog...", log_fn)
+        # ==================================================================
+        # STEP 2-4 – Wait for password dialog → enter password → click OK
+        # ==================================================================
+        self._emit("[STEP 2/6] Waiting for password/login dialog to appear...", log_fn)
+        self._emit("  (QB should now display a password prompt for this company file.)", log_fn)
         self._handle_password_prompt(password, timeout_s=timeout_s, log_fn=log_fn)
-        self._emit("[STEP 3-4] Password entry complete.", log_fn)
+        self._emit("[STEP 4/6] ✓ Password handling complete.", log_fn)
 
-        # ------------------------------------------------------------------
-        # STEP 5: Wait for the company to fully load
-        # ------------------------------------------------------------------
+        # ==================================================================
+        # STEP 5 – Wait for the company to FULLY load
+        # ==================================================================
+        self._emit("[STEP 5/6] Waiting for company to fully load (title bar check)...", log_fn)
+        self._emit("  (Looking for company name in title; 'No Company Open' must disappear.)", log_fn)
         self._wait_for_company_ready(main_window, timeout_s=timeout_s, log_fn=log_fn)
+        self._emit("[STEP 5/6] ✓ Company is fully loaded.", log_fn)
 
-        # ------------------------------------------------------------------
-        # STEP 6: NOW dismiss popup dialogs (Payroll, Accountant Center, etc.)
-        # ------------------------------------------------------------------
-        self._emit("[STEP 6] Company loaded – now dismissing popup dialogs...", log_fn)
+        # ==================================================================
+        # STEP 6 – NOW dismiss popup dialogs (Payroll, Accountant Center …)
+        # ==================================================================
+        self._emit("[STEP 6/6] Company loaded – NOW dismissing post-login popup dialogs...", log_fn)
+        self._emit("  [Popups] Pausing 1s for popups to finish rendering...", log_fn)
         time.sleep(1)
-        self._dismiss_common_dialogs(log_fn)
-        self._emit("[STEP 6] Common dialogs dismissed.", log_fn)
 
+        self._emit("  [Popups] Running _dismiss_common_dialogs()...", log_fn)
+        self._dismiss_common_dialogs(log_fn)
+        self._emit("  [Popups] ✓ Common dialogs dismissed.", log_fn)
+
+        self._emit("  [Popups] Running _close_popup_windows()...", log_fn)
         self._close_popup_windows(main_window, log_fn)
-        self._emit("[STEP 6] Popup windows closed.", log_fn)
+        self._emit("  [Popups] ✓ Popup windows closed.", log_fn)
 
         # Re-focus the main window after clearing popups
+        self._emit("  [Focus] Re-focusing main QB window...", log_fn)
         self._focus_window(main_window)
         time.sleep(0.5)
+        try:
+            final_title = main_window.window_text() or ""
+        except Exception:  # noqa: BLE001
+            final_title = "<could not read>"
+        self._emit(f"  [Focus] Main window title: '{final_title}'", log_fn)
 
-        self._emit("========== COMPANY FILE OPEN COMPLETE ==========", log_fn)
+        self._emit("=" * 60, log_fn)
+        self._emit("  COMPANY FILE OPEN COMPLETE", log_fn)
+        self._emit("=" * 60, log_fn)
 
     def _export_single_list_iif(self, main_window, list_name: str, out_path: Path, log_fn: Optional[LogFn]) -> None:
         self._emit(f"Exporting list '{list_name}' -> {out_path}", log_fn)
