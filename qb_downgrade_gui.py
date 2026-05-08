@@ -131,7 +131,7 @@ class QuickBooksDowngradeGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("QuickBooks Downgrade Tool")
-        self.root.geometry("1100x760")
+        self.root.geometry("1100x650")
 
         self.config_manager = ConfigManager()
         self.config = self.config_manager.load()
@@ -168,7 +168,7 @@ class QuickBooksDowngradeGUI:
         self.btn_start.pack(side=RIGHT, padx=4)
 
         columns = ("file", "password", "status", "message")
-        self.tree = ttk.Treeview(self.root, columns=columns, show="headings", height=16)
+        self.tree = ttk.Treeview(self.root, columns=columns, show="headings", height=8)
         self.tree.pack(fill=BOTH, expand=False, padx=10, pady=8)
 
         self.tree.heading("file", text="QBW File")
@@ -196,7 +196,7 @@ class QuickBooksDowngradeGUI:
         log_frame = ttk.LabelFrame(self.root, text="Status Log", padding=8)
         log_frame.pack(fill=BOTH, expand=True, padx=10, pady=8)
 
-        self.log_text = tk.Text(log_frame, height=14, wrap="word")
+        self.log_text = tk.Text(log_frame, height=10, wrap="word")
         self.log_text.pack(side=LEFT, fill=BOTH, expand=True)
 
         scroll = ttk.Scrollbar(log_frame, orient=VERTICAL, command=self.log_text.yview)

@@ -888,8 +888,16 @@ class QuickBooksAutomationEngine:
         self._emit("  COMPANY FILE OPEN COMPLETE", log_fn)
         self._emit("=" * 60, log_fn)
 
-    def _export_single_list_iif(self, main_window, list_name: str, out_path: Path, log_fn: Optional[LogFn]) -> None:
-        self._emit(f"Exporting list '{list_name}' -> {out_path}", log_fn)
+    def _export_single_list_iif(
+        self,
+        main_window,
+        list_name: str,
+        out_path: Path,
+        log_fn: Optional[LogFn],
+        select_all: bool = False,
+    ) -> None:
+        mode = "all list panes" if select_all else f"list '{list_name}'"
+        self._emit(f"Exporting {mode} -> {out_path}", log_fn)
 
         # Dismiss any stale menus / popups before starting
         # Note: pywinauto uses {ESC} not {ESCAPE}
@@ -1031,20 +1039,31 @@ class QuickBooksAutomationEngine:
 
             if list_panes:
                 self._emit(f"  Found {len(list_panes)} Pane control(s) that look like list checkboxes", log_fn)
-                for pane, text in list_panes:
-                    self._emit(f"    Pane: '{text}'", log_fn)
-                    if list_name.lower() in text.lower():
-                        # This is the list we want — click to check it
-                        pane.click_input()
-                        selected = True
-                        self._emit(f"  ✓ Selected pane-checkbox: '{text}'", log_fn)
-                    else:
-                        # Uncheck other lists by clicking them off
+                if select_all:
+                    for pane, text in list_panes:
+                        self._emit(f"    Selecting pane: '{text}'", log_fn)
                         try:
                             pane.click_input()
-                            self._emit(f"    Toggled off pane: '{text}'", log_fn)
-                        except Exception:  # noqa: BLE001
-                            pass
+                            selected = True
+                        except Exception as exc:  # noqa: BLE001
+                            self._emit(f"    Could not click pane '{text}': {exc}", log_fn)
+                    if selected:
+                        self._emit("  ✓ Selected all detectable pane-checkboxes", log_fn)
+                else:
+                    for pane, text in list_panes:
+                        self._emit(f"    Pane: '{text}'", log_fn)
+                        if list_name.lower() in text.lower():
+                            # This is the list we want — click to check it
+                            pane.click_input()
+                            selected = True
+                            self._emit(f"  ✓ Selected pane-checkbox: '{text}'", log_fn)
+                        else:
+                            # Uncheck other lists by clicking them off
+                            try:
+                                pane.click_input()
+                                self._emit(f"    Toggled off pane: '{text}'", log_fn)
+                            except Exception:  # noqa: BLE001
+                                pass
         except Exception as exc:  # noqa: BLE001
             self._emit(f"  Pane search failed: {exc}", log_fn)
 
@@ -1057,8 +1076,8 @@ class QuickBooksAutomationEngine:
                     try:
                         cb_text = (cb.window_text() or "").strip()
                         self._emit(f"    CheckBox: '{cb_text}'", log_fn)
-                        if list_name.lower() in cb_text.lower():
-                            # This is the one we want — make sure it's checked
+                        if select_all or list_name.lower() in cb_text.lower():
+                            # Ensure selected for target list (or for all lists in select_all mode)
                             try:
                                 if not cb.get_toggle_state():
                                     cb.toggle()
@@ -1067,7 +1086,7 @@ class QuickBooksAutomationEngine:
                                 cb.click_input()
                             selected = True
                             self._emit(f"  ✓ Selected checkbox: '{cb_text}'", log_fn)
-                        else:
+                        elif not select_all:
                             # Uncheck any OTHER list so we only export the one we want
                             try:
                                 if cb.get_toggle_state():
@@ -1095,7 +1114,7 @@ class QuickBooksAutomationEngine:
                         if btn_text.lower() in ("ok", "cancel", "export", "save", "help"):
                             continue
                         self._emit(f"    Button: '{btn_text}'", log_fn)
-                        if list_name.lower() in btn_text.lower():
+                        if select_all or list_name.lower() in btn_text.lower():
                             btn.click_input()
                             selected = True
                             self._emit(f"  ✓ Clicked button-checkbox: '{btn_text}'", log_fn)
@@ -1166,8 +1185,9 @@ class QuickBooksAutomationEngine:
                         pass
             except Exception:  # noqa: BLE001
                 pass
+            mode_desc = "all list panes" if select_all else f"list '{list_name}'"
             raise RuntimeError(
-                f"Could not select list '{list_name}' in Export dialog. "
+                f"Could not select {mode_desc} in Export dialog. "
                 "No matching checkbox, list item, or focusable control was found. "
                 "See log above for dialog control details."
             )
@@ -1730,29 +1750,20 @@ class QuickBooksAutomationEngine:
         time.sleep(1)
         self._close_popup_windows(main_window, log_fn)
 
-        # Export required list IIF files one-by-one.
-        list_exports = {
-            "Chart of Accounts": export_dir / "accounts.iif",
-            "Customers": export_dir / "customers.iif",
-            "Vendors": export_dir / "vendors.iif",
-            "Items": export_dir / "items.iif",
-            "Employees": export_dir / "employees.iif",
-        }
-
-        for list_name, out_path in list_exports.items():
-            self._with_retries(
-                lambda list_name=list_name, out_path=out_path: self._export_single_list_iif(main_window, list_name, out_path, log_fn),
-                f"Export list {list_name}",
+        # Export all QuickBooks list panes in one shot to a single combined IIF.
+        # This avoids the prior N-pass isolate/toggle flow that could accidentally
+        # leave every checkbox selected while trying to isolate one list.
+        self._with_retries(
+            lambda: self._export_single_list_iif(
+                main_window,
+                "All Lists",
+                lists_iif,
                 log_fn,
-            )
-
-        # Build all_lists.IIF for backward compatibility with earlier pipeline expectations.
-        with lists_iif.open("w", encoding="utf-8", errors="ignore") as out_f:
-            for idx, src in enumerate(list_exports.values()):
-                if src.exists():
-                    if idx > 0:
-                        out_f.write("\n")
-                    out_f.write(src.read_text(encoding="utf-8", errors="ignore"))
+                select_all=True,
+            ),
+            "Export all lists IIF",
+            log_fn,
+        )
 
         self._with_retries(
             lambda: self._export_transaction_list_csv(main_window, tx_csv, log_fn),
@@ -1801,11 +1812,6 @@ class QuickBooksAutomationEngine:
 
         return {
             "lists_iif": lists_iif,
-            "accounts_iif": list_exports["Chart of Accounts"],
-            "customers_iif": list_exports["Customers"],
-            "vendors_iif": list_exports["Vendors"],
-            "items_iif": list_exports["Items"],
-            "employees_iif": list_exports["Employees"],
             "tx_csv": tx_csv,
             **generated_report_paths,
         }
@@ -1890,28 +1896,19 @@ class QuickBooksAutomationEngine:
 
         main_window = self._find_qb_main_window(self._qb2021_app, "2021", self.config.timeouts.launch_qb_seconds)
 
-        ordered = [
-            lists_iif.parent / "accounts.iif",
-            lists_iif.parent / "customers.iif",
-            lists_iif.parent / "vendors.iif",
-            lists_iif.parent / "items.iif",
-            lists_iif.parent / "employees.iif",
-        ]
+        if not lists_iif.exists():
+            raise FileNotFoundError(f"Combined list IIF does not exist: {lists_iif}")
 
-        if not any(p.exists() for p in ordered):
-            ordered = [lists_iif]
-
-        for iif_path in ordered:
-            self._with_retries(
-                lambda iif_path=iif_path: self._import_single_iif(
-                    main_window,
-                    iif_path,
-                    timeout_s=self.config.timeouts.import_seconds,
-                    log_fn=log_fn,
-                ),
-                f"Import list IIF ({iif_path.name})",
-                log_fn,
-            )
+        self._with_retries(
+            lambda: self._import_single_iif(
+                main_window,
+                lists_iif,
+                timeout_s=self.config.timeouts.import_seconds,
+                log_fn=log_fn,
+            ),
+            f"Import list IIF ({lists_iif.name})",
+            log_fn,
+        )
 
         self._emit("List IIF import completed", log_fn)
 
@@ -1997,6 +1994,11 @@ class QuickBooksAutomationEngine:
             exports_dir = job.output_dir / "exports"
             target_dir = job.output_dir / "target"
             validation_dir = job.output_dir / "validation"
+
+            if exports_dir.exists():
+                self._emit(f"Cleaning stale export directory: {exports_dir}", log_fn)
+                shutil.rmtree(exports_dir)
+            exports_dir.mkdir(parents=True, exist_ok=True)
 
             # 1) Launch QB 2023 with company file as parameter (auto-opens it)
             set_progress(0)
