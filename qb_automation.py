@@ -227,6 +227,9 @@ class QuickBooksAutomationEngine:
     def _find_active_dialog(self, title_re: Optional[str] = None, parent_window=None):
         """Find an active dialog window matching title_re.
 
+        Bug fix 2026-05-08: Filter for actual Window/Dialog/Pane containers,
+        not leaf Static/Text controls that happen to match the title.
+
         Args:
             title_re: Optional regex to match against window titles.
             parent_window: Optional parent window to search descendants of.
@@ -244,6 +247,10 @@ class QuickBooksAutomationEngine:
         # top-level windows. By searching parent_window.children() when a parent is
         # provided, we can detect these modal dialogs reliably and avoid the timeout loop.
         """
+        # Only return actual dialog/window containers, not leaf controls like
+        # Static, Text, or Button that happen to carry the dialog's title text.
+        valid_control_types = {"Window", "Dialog", "Pane"}
+
         if parent_window is not None:
             # Search descendant windows of the given parent (e.g., QB main window).
             # FIX: Use descendants() instead of children() to find nested modal dialogs.
@@ -255,6 +262,10 @@ class QuickBooksAutomationEngine:
                 children = []
             for w in children:
                 try:
+                    # Skip leaf controls – they match title but aren't the dialog
+                    ctrl_type = w.element_info.control_type
+                    if ctrl_type not in valid_control_types:
+                        continue
                     if not w.is_visible():
                         continue
                     title = w.window_text() or ""
@@ -272,6 +283,9 @@ class QuickBooksAutomationEngine:
         windows = desktop.windows()
         for w in windows:
             try:
+                ctrl_type = w.element_info.control_type
+                if ctrl_type not in valid_control_types:
+                    continue
                 if not w.is_visible():
                     continue
                 title = w.window_text() or ""
