@@ -1221,36 +1221,50 @@ class QuickBooksAutomationEngine:
                     title = success_dialog.window_text()
                     log_fn(f"✅ Found success dialog: '{title}'")
 
-                    # Click OK button - UIAWrapper objects don't have child_window method,
-                    # so search descendants directly
+                    # Click OK - in QB 2023, the "OK button" is actually a Pane control!
                     try:
-                        ok_buttons = [ctrl for ctrl in success_dialog.descendants()
-                                      if ctrl.element_info.control_type == "Button"
-                                      and re.search(r"(?i)ok", ctrl.window_text())]
-                        if ok_buttons:
-                            ok_buttons[0].click()
-                            log_fn("Clicked OK button")
+                        # Search for Pane controls (not Button) with "OK" text
+                        ok_panes = [ctrl for ctrl in success_dialog.descendants()
+                                    if ctrl.element_info.control_type == "Pane"
+                                    and re.search(r"(?i)^ok$", ctrl.window_text().strip())]
+
+                        if ok_panes:
+                            ok_panes[0].click()
+                            log_fn("✅ Clicked OK pane")
+                            time.sleep(1)
+                            dialog_dismissed = True
+                            break
                         else:
-                            raise Exception("OK button not found in success dialog descendants")
-                        dialog_dismissed = True
-                        break
+                            # Fallback: try Button type (for older QB versions)
+                            ok_buttons = [ctrl for ctrl in success_dialog.descendants()
+                                          if ctrl.element_info.control_type == "Button"
+                                          and re.search(r"(?i)ok", ctrl.window_text())]
+                            if ok_buttons:
+                                ok_buttons[0].click()
+                                log_fn("✅ Clicked OK button")
+                                time.sleep(1)
+                                dialog_dismissed = True
+                                break
+                            else:
+                                raise Exception("OK control not found (tried Pane and Button)")
+
                     except Exception as e:
-                        log_fn(f"OK button click failed: {e}, trying ESC key")
+                        log_fn(f"OK click failed: {e}, trying ESC key")
                         try:
                             success_dialog.type_keys("{ESC}")
                             log_fn("Sent ESC key")
                             time.sleep(1)
-                            # Verify dialog actually closed
+                            # Verify dialog closed
                             verify = self._find_active_dialog(
                                 parent_window=main_window,
                                 title_re=r"(?i)QuickBooks.*Information"
                             )
                             if verify:
-                                raise RuntimeError("Success dialog still visible after ESC - not dismissed properly")
+                                raise RuntimeError("Success dialog still visible after ESC")
                             dialog_dismissed = True
                             break
                         except Exception as esc_err:
-                            raise RuntimeError(f"Failed to dismiss success dialog: {esc_err}")
+                            log_fn(f"ESC failed: {esc_err}")
                 else:
                     if i % 5 == 0:  # Log every 5 attempts to reduce noise
                         log_fn(f"[Attempt {i+1}/30] Waiting for success dialog...")
