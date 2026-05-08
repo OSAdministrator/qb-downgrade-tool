@@ -569,30 +569,81 @@ class QuickBooksAutomationEngine:
     def _export_single_list_iif(self, main_window, list_name: str, out_path: Path, log_fn: Optional[LogFn]) -> None:
         self._emit(f"Exporting list '{list_name}' -> {out_path}", log_fn)
 
+        # Dismiss any stale menus / popups before starting
+        if send_keys is not None:
+            send_keys("{ESCAPE}")
+            time.sleep(0.3)
+            send_keys("{ESCAPE}")
+            time.sleep(0.3)
+
+        self._focus_window(main_window)
+        time.sleep(1)
+
+        # Close any popup windows that may have stolen focus
+        self._close_popup_windows(main_window, log_fn)
+        self._dismiss_common_dialogs(log_fn)
         self._focus_window(main_window)
         time.sleep(0.5)
 
         # Navigate: File -> Utilities -> Export -> Lists to IIF Files...
-        # Use keyboard shortcuts since menu_select often fails with QB
-        if send_keys is not None:
-            send_keys("%f")  # Alt+F for File menu
-            time.sleep(0.5)
-            send_keys("u")   # Utilities
-            time.sleep(0.5)
-            send_keys("e")   # Export
-            time.sleep(0.5)
-            send_keys("l")   # Lists to IIF Files
-            time.sleep(1)
-        else:
-            self._invoke_menu(
-                main_window,
-                "File->Utilities->Export->Lists to IIF Files...",
-                "%fuel",
-                log_fn,
-            )
-            time.sleep(1)
+        # Try multiple approaches for menu navigation
+        dlg = None
 
-        dlg = self._find_active_dialog(title_re=r"(?i)(export|iif|list)")
+        # Approach 1: keyboard shortcuts with longer waits
+        if send_keys is not None:
+            self._emit("Trying menu navigation via keyboard shortcuts", log_fn)
+            send_keys("%f")  # Alt+F for File menu
+            time.sleep(1.0)
+            send_keys("u")   # Utilities
+            time.sleep(1.0)
+            send_keys("e")   # Export
+            time.sleep(1.0)
+            send_keys("l")   # Lists to IIF Files
+            time.sleep(2)
+
+            dlg = self._find_active_dialog(title_re=r"(?i)(export|iif|list)")
+
+        # Approach 2: try menu_select via pywinauto
+        if dlg is None:
+            self._emit("Keyboard menu navigation failed, trying menu_select", log_fn)
+            if send_keys is not None:
+                send_keys("{ESCAPE}")
+                time.sleep(0.5)
+            self._focus_window(main_window)
+            time.sleep(0.5)
+            try:
+                self._invoke_menu(
+                    main_window,
+                    "File->Utilities->Export->Lists to IIF Files...",
+                    None,
+                    log_fn,
+                )
+                time.sleep(2)
+                dlg = self._find_active_dialog(title_re=r"(?i)(export|iif|list)")
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Approach 3: try alternative keyboard sequence
+        if dlg is None and send_keys is not None:
+            self._emit("Trying alternative keyboard sequence for export menu", log_fn)
+            send_keys("{ESCAPE}")
+            time.sleep(0.5)
+            self._focus_window(main_window)
+            time.sleep(0.5)
+            # Try Alt, then arrow keys through File menu
+            send_keys("{ESCAPE}")
+            time.sleep(0.3)
+            send_keys("%f")
+            time.sleep(1.5)
+            # Look for Utilities in the menu and use arrow keys
+            send_keys("u")
+            time.sleep(1.5)
+            send_keys("e")
+            time.sleep(1.5)
+            send_keys("l")
+            time.sleep(2)
+            dlg = self._find_active_dialog(title_re=r"(?i)(export|iif|list)")
+
         if dlg is None:
             raise RuntimeError("Export Lists to IIF dialog did not appear")
 
@@ -792,15 +843,58 @@ class QuickBooksAutomationEngine:
                 pass
 
     def _is_company_already_open(self, main_window, company_name_hint: str) -> bool:
-        """Check if the desired company is already open in QB."""
+        """Check if the desired company is already open in QB.
+
+        The window title alone is not reliable -- QB may show
+        'QuickBooks Accountant Desktop Plus 2023' even when the
+        'No Company Open' landing page is displayed.  We therefore
+        also inspect child elements for the 'No Company Open' text.
+        """
         try:
             title = main_window.window_text() or ""
-            # If the title contains the company name and doesn't say "No Company Open"
-            if "No Company Open" not in title and company_name_hint.lower() in title.lower():
+
+            # Explicit "No Company Open" in the title bar -> not open
+            if "No Company Open" in title:
+                return False
+
+            # Check child elements for "No Company Open" text which
+            # appears in the QB landing page content area
+            try:
+                children = main_window.descendants(control_type="Text")
+                for child in children:
+                    try:
+                        child_text = child.window_text() or ""
+                        if "No Company Open" in child_text:
+                            return False
+                    except Exception:  # noqa: BLE001
+                        continue
+            except Exception:  # noqa: BLE001
+                pass
+
+            # If the title contains the company name hint, it is open
+            if company_name_hint.lower() in title.lower():
                 return True
-            # Also check if any company is open (title doesn't say "No Company Open")
-            if "No Company Open" not in title and "QuickBooks" in title:
+
+            # QB typically puts the company file name in the title bar
+            # when a company is open.  A generic title like
+            # "QuickBooks Accountant Desktop Plus 2023" without any
+            # company-specific text means nothing is loaded yet.
+            # Only return True if the title has something beyond the
+            # standard QB product name.
+            generic_patterns = [
+                r"(?i)^QuickBooks.*Desktop.*\d{4}$",
+                r"(?i)^QuickBooks.*Premier.*\d{4}$",
+                r"(?i)^QuickBooks.*Enterprise.*\d{4}$",
+            ]
+            for pat in generic_patterns:
+                if re.match(pat, title.strip()):
+                    return False
+
+            # If we get here the title has extra text (likely a company
+            # name) and no "No Company Open" was found -> assume open
+            if "QuickBooks" in title:
                 return True
+
         except Exception:  # noqa: BLE001
             pass
         return False
@@ -969,6 +1063,7 @@ class QuickBooksAutomationEngine:
         if self._is_company_already_open(main_window, company_hint):
             self._emit("Company already open in QB 2023, skipping File->Open", log_fn)
         else:
+            self._emit("Company not open, opening company file...", log_fn)
             self._open_company_file(
                 main_window,
                 job.qbw_path,
@@ -976,6 +1071,12 @@ class QuickBooksAutomationEngine:
                 timeout_s=self.config.timeouts.open_company_seconds,
                 log_fn=log_fn,
             )
+            # Re-acquire main window reference after opening company
+            time.sleep(3)
+            main_window = self._find_qb_main_window(self._qb2023_app, "2023", self.config.timeouts.launch_qb_seconds)
+            # Verify the company actually opened
+            if not self._is_company_already_open(main_window, company_hint):
+                self._emit("WARNING: Company may not have opened successfully, proceeding anyway", log_fn)
 
         # Re-dismiss any dialogs that appeared after company loaded
         time.sleep(2)
