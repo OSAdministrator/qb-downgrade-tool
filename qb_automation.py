@@ -517,23 +517,50 @@ class QuickBooksAutomationEngine:
         self._emit("Password entered", log_fn)
 
     def _wait_for_company_ready(self, main_window, timeout_s: int, log_fn: Optional[LogFn]) -> None:
+        """Wait for the company to finish loading by checking the window title.
+
+        NOTE: This method does NOT dismiss dialogs during the wait loop.
+        Popup/dialog dismissal should happen AFTER this method returns,
+        ensuring the company is fully loaded first.
+        """
+        self._emit("[STEP 5] Waiting for company to finish loading...", log_fn)
+
         def _cond() -> bool:
-            self._dismiss_common_dialogs(log_fn)
             try:
                 title = main_window.window_text() or ""
-                return "No Company Open" not in title
+                has_company = "No Company Open" not in title
+                if has_company:
+                    self._emit(f"  Company loaded – window title: {title}", log_fn)
+                return has_company
             except Exception:  # noqa: BLE001
                 return False
 
         if not self._wait_until(_cond, timeout_s, 1.0):
             raise RuntimeError("Company did not finish loading in QuickBooks")
 
+        self._emit("[STEP 5] Company is fully loaded.", log_fn)
         time.sleep(2)
 
     def _open_company_file(self, main_window, qbw_path: Path, password: str, timeout_s: int, log_fn: Optional[LogFn]) -> None:
-        self._emit(f"Opening company file: {qbw_path}", log_fn)
+        """Open a QuickBooks company file using a strict sequential approach.
+
+        Sequence:
+          1. Open the .qbw file via File menu (no password yet)
+          2. Wait for the password/login dialog to appear
+          3. Enter the password in the dialog
+          4. Click OK/Login
+          5. Wait for the company to finish loading (title check)
+          6. ONLY AFTER loading, dismiss popup dialogs
+        """
+        self._emit(f"========== OPENING COMPANY FILE ==========", log_fn)
+        self._emit(f"File: {qbw_path}", log_fn)
         if not qbw_path.exists():
             raise FileNotFoundError(f"Source QBW file not found: {qbw_path}")
+
+        # ------------------------------------------------------------------
+        # STEP 1: Trigger File -> Open via menu or keyboard
+        # ------------------------------------------------------------------
+        self._emit("[STEP 1] Opening company file via File menu (no password yet)...", log_fn)
 
         opened = False
         for menu_path, fallback in [
@@ -543,28 +570,61 @@ class QuickBooksAutomationEngine:
             try:
                 self._invoke_menu(main_window, menu_path, fallback, log_fn)
                 opened = True
+                self._emit(f"  Menu action succeeded: {menu_path}", log_fn)
                 break
             except Exception:  # noqa: BLE001
                 continue
 
         if not opened:
-            # Ctrl+O fallback
             if send_keys is None:
                 raise RuntimeError("Unable to trigger company open action")
             self._focus_window(main_window)
             send_keys("^o")
+            self._emit("  Used Ctrl+O fallback to open file dialog", log_fn)
 
         time.sleep(1)
+
+        # Navigate the standard file-open dialog to select the .qbw file
+        self._emit("[STEP 1b] Selecting company file in file dialog...", log_fn)
         self._handle_standard_file_dialog(qbw_path, save_mode=False, timeout_s=timeout_s, log_fn=log_fn)
 
-        # Handle Open/Restore wizard if present.
+        # Handle Open/Restore wizard if it appears
         dlg = self._find_active_dialog(title_re=r"(?i)(open|restore)")
         if dlg is not None:
+            self._emit("  Open/Restore wizard detected – clicking through...", log_fn)
             self._click_first_button(dlg, ["Open a company file", "Next", "Open"])
             time.sleep(0.5)
 
+        self._emit("[STEP 1] File open command sent.", log_fn)
+
+        # ------------------------------------------------------------------
+        # STEP 2: Wait for the password/login dialog to appear
+        # ------------------------------------------------------------------
+        self._emit("[STEP 2] Waiting for password/login dialog...", log_fn)
         self._handle_password_prompt(password, timeout_s=timeout_s, log_fn=log_fn)
+        self._emit("[STEP 3-4] Password entry complete.", log_fn)
+
+        # ------------------------------------------------------------------
+        # STEP 5: Wait for the company to fully load
+        # ------------------------------------------------------------------
         self._wait_for_company_ready(main_window, timeout_s=timeout_s, log_fn=log_fn)
+
+        # ------------------------------------------------------------------
+        # STEP 6: NOW dismiss popup dialogs (Payroll, Accountant Center, etc.)
+        # ------------------------------------------------------------------
+        self._emit("[STEP 6] Company loaded – now dismissing popup dialogs...", log_fn)
+        time.sleep(1)
+        self._dismiss_common_dialogs(log_fn)
+        self._emit("[STEP 6] Common dialogs dismissed.", log_fn)
+
+        self._close_popup_windows(main_window, log_fn)
+        self._emit("[STEP 6] Popup windows closed.", log_fn)
+
+        # Re-focus the main window after clearing popups
+        self._focus_window(main_window)
+        time.sleep(0.5)
+
+        self._emit("========== COMPANY FILE OPEN COMPLETE ==========", log_fn)
 
     def _export_single_list_iif(self, main_window, list_name: str, out_path: Path, log_fn: Optional[LogFn]) -> None:
         self._emit(f"Exporting list '{list_name}' -> {out_path}", log_fn)
@@ -1078,12 +1138,9 @@ class QuickBooksAutomationEngine:
             if not self._is_company_already_open(main_window, company_hint):
                 self._emit("WARNING: Company may not have opened successfully, proceeding anyway", log_fn)
 
-        # Re-dismiss any dialogs that appeared after company loaded
-        time.sleep(2)
-        self._dismiss_common_dialogs(log_fn)
-
-        # Close popup/helper windows (Accountant Center, Getting Started, etc.)
-        # that steal focus and prevent menu navigation
+        # Note: _open_company_file() now handles dialog/popup dismissal internally
+        # (Step 6 of its sequential approach). Only do a final safety check here.
+        time.sleep(1)
         self._close_popup_windows(main_window, log_fn)
 
         # Export required list IIF files one-by-one.
