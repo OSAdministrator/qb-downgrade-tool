@@ -473,11 +473,45 @@ class QuickBooksAutomationEngine:
         dialog = dialog_box["dlg"]
         self._focus_window(dialog)
 
-        if not self._set_edit_value(dialog, password):
-            raise RuntimeError("Password dialog detected but failed to set password")
+        # Check if this is a username+password dialog (2+ edit fields)
+        try:
+            edits = dialog.descendants(control_type="Edit")
+        except Exception:  # noqa: BLE001
+            edits = []
+
+        if len(edits) >= 2:
+            # Username + Password dialog
+            self._emit(f"Detected username+password login dialog ({len(edits)} edit fields)", log_fn)
+            # Clear username field first, then set
+            if send_keys is not None:
+                try:
+                    edits[0].set_focus()
+                    time.sleep(0.1)
+                    send_keys("^a{DELETE}")
+                    time.sleep(0.1)
+                except Exception:  # noqa: BLE001
+                    pass
+            if not self._set_edit_value(dialog, "Admin", edit_index=0):
+                self._emit("Warning: could not set username field", log_fn)
+            # Clear password field first, then set
+            if send_keys is not None:
+                try:
+                    edits[1].set_focus()
+                    time.sleep(0.1)
+                    send_keys("^a{DELETE}")
+                    time.sleep(0.1)
+                except Exception:  # noqa: BLE001
+                    pass
+            if not self._set_edit_value(dialog, password, edit_index=1):
+                raise RuntimeError("Password dialog detected but failed to set password")
+        else:
+            # Password-only dialog
+            if not self._set_edit_value(dialog, password):
+                raise RuntimeError("Password dialog detected but failed to set password")
 
         if not self._click_first_button(dialog, ["OK", "Continue", "Login", "Open"]):
             if send_keys is not None:
+                self._emit("Button click failed in password prompt, trying Enter", log_fn)
                 send_keys("{ENTER}")
 
         self._emit("Password entered", log_fn)
@@ -783,26 +817,64 @@ class QuickBooksAutomationEngine:
                 self._focus_window(login_dlg)
                 time.sleep(0.5)
 
-                # Clear and enter password using keyboard
+                # Clear and enter credentials using keyboard
                 if send_keys is not None:
                     edits = login_dlg.descendants(control_type="Edit")
                     if edits:
-                        edit = edits[0]
-                        edit.set_focus()
-                        time.sleep(0.2)
-                        # Use set_edit_text to directly set the value
-                        try:
-                            edit.set_edit_text(password)
-                        except Exception:  # noqa: BLE001
-                            # Fallback: select all, delete, then type
-                            send_keys("^a{DELETE}")
+                        if len(edits) >= 2:
+                            # Username + Password login dialog
+                            self._emit(f"Detected username+password login ({len(edits)} edit fields)", log_fn)
+                            # First edit = username field - clear and set
+                            username_edit = edits[0]
+                            username_edit.set_focus()
+                            time.sleep(0.2)
+                            send_keys("^a")
+                            time.sleep(0.05)
+                            send_keys("{DELETE}")
                             time.sleep(0.1)
-                            edit.type_keys(password, with_spaces=True, pause=0.03)
-                        time.sleep(0.3)
+                            try:
+                                username_edit.set_edit_text("Admin")
+                            except Exception:  # noqa: BLE001
+                                username_edit.type_keys("Admin", with_spaces=True, pause=0.03)
+                            time.sleep(0.3)
+                            # Second edit = password field - clear and set
+                            password_edit = edits[1]
+                            password_edit.set_focus()
+                            time.sleep(0.2)
+                            send_keys("^a")
+                            time.sleep(0.05)
+                            send_keys("{DELETE}")
+                            time.sleep(0.1)
+                            try:
+                                password_edit.set_edit_text(password)
+                            except Exception:  # noqa: BLE001
+                                password_edit.type_keys(password, with_spaces=True, pause=0.03)
+                            time.sleep(0.3)
+                        else:
+                            # Password-only login dialog (single edit field)
+                            self._emit("Detected password-only login (1 edit field)", log_fn)
+                            edit = edits[0]
+                            edit.set_focus()
+                            time.sleep(0.2)
+                            send_keys("^a")
+                            time.sleep(0.05)
+                            send_keys("{DELETE}")
+                            time.sleep(0.1)
+                            try:
+                                edit.set_edit_text(password)
+                            except Exception:  # noqa: BLE001
+                                edit.type_keys(password, with_spaces=True, pause=0.03)
+                            time.sleep(0.3)
 
-                    # Click OK button
+                    # Click OK button - try multiple approaches
                     if not self._click_first_button(login_dlg, ["OK", "Continue", "Login", "Open"]):
+                        self._emit("Button click failed, trying Enter key", log_fn)
+                        # Focus the OK button area and press Enter
                         send_keys("{ENTER}")
+                        time.sleep(0.5)
+                        # If dialog still exists, try Tab+Enter
+                        if self._find_active_dialog(title_re=r"(?i)(password|login)") is not None:
+                            send_keys("{TAB}{ENTER}")
 
                     password_entered = True
                     self._emit("Password entered at startup", log_fn)

@@ -1,5 +1,36 @@
 # Installation Guide (Windows 11)
 
+## 0) Clone the Repository (First Time)
+
+Open **PowerShell** or **Command Prompt** and run:
+
+```powershell
+cd C:\
+git clone https://github.com/OSAdministrator/qb-downgrade-tool.git QBDowngrade
+cd QBDowngrade
+```
+
+> **Don't have Git?** Download it from https://git-scm.com/download/win and install with default options.
+
+### Pulling Updates
+
+Whenever you need the latest version:
+
+```powershell
+cd C:\QBDowngrade
+git pull origin main
+```
+
+If you have local changes that conflict:
+
+```powershell
+git stash
+git pull origin main
+git stash pop
+```
+
+---
+
 ## 1) Prerequisites
 
 - Windows 11 Pro
