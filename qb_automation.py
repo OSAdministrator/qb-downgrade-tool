@@ -220,7 +220,49 @@ class QuickBooksAutomationEngine:
         except Exception:  # noqa: BLE001
             return False
 
-    def _find_active_dialog(self, title_re: Optional[str] = None):
+    def _find_active_dialog(self, title_re: Optional[str] = None, parent_window=None):
+        """Find an active dialog window matching title_re.
+
+        Args:
+            title_re: Optional regex to match against window titles.
+            parent_window: Optional parent window to search children of.
+                If provided, searches parent_window.children(visible_only=True)
+                instead of Desktop().windows().
+
+        # FIX: Search child dialogs of QB main window instead of desktop-level windows.
+        # QB Export dialogs are modal children, not top-level, so Desktop().windows()
+        # can't see them. This was causing the tool to loop ~20 times then timeout
+        # (found in user testing 2026-05-08).
+        #
+        # WHY we search child windows: QuickBooks creates its export/save/import dialogs
+        # as modal children of the main application window. These child dialogs do not
+        # appear in the list returned by Desktop().windows(), which only enumerates
+        # top-level windows. By searching parent_window.children() when a parent is
+        # provided, we can detect these modal dialogs reliably and avoid the timeout loop.
+        """
+        if parent_window is not None:
+            # Search child windows of the given parent (e.g., QB main window).
+            # This is the correct approach for modal dialogs like Export/Save As
+            # which are children of the main QB window, not top-level desktop windows.
+            try:
+                children = parent_window.children()
+            except Exception:  # noqa: BLE001
+                children = []
+            for w in children:
+                try:
+                    if not w.is_visible():
+                        continue
+                    title = w.window_text() or ""
+                    if not title:
+                        continue
+                    if title_re and not re.search(title_re, title):
+                        continue
+                    return w
+                except Exception:  # noqa: BLE001
+                    continue
+            return None
+
+        # Fallback: search top-level desktop windows (for dialogs not tied to a parent)
         desktop = self._get_desktop()
         windows = desktop.windows()
         for w in windows:
@@ -704,7 +746,11 @@ class QuickBooksAutomationEngine:
             send_keys("l")   # Lists to IIF Files
             time.sleep(2)
 
-            dlg = self._find_active_dialog(title_re=r"(?i)(export|iif|list)")
+            # FIX: Search child dialogs of QB main window instead of desktop-level windows.
+            # QB Export dialogs are modal children, not top-level, so Desktop().windows()
+            # can't see them. This was causing the tool to loop ~20 times then timeout
+            # (found in user testing 2026-05-08).
+            dlg = self._find_active_dialog(title_re=r"(?i)(export|iif|list)", parent_window=main_window)
 
         # Approach 2: try menu_select via pywinauto
         if dlg is None:
@@ -722,7 +768,8 @@ class QuickBooksAutomationEngine:
                     log_fn,
                 )
                 time.sleep(2)
-                dlg = self._find_active_dialog(title_re=r"(?i)(export|iif|list)")
+                # Search child windows of main_window — export dialog is a modal child
+                dlg = self._find_active_dialog(title_re=r"(?i)(export|iif|list)", parent_window=main_window)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -745,7 +792,8 @@ class QuickBooksAutomationEngine:
             time.sleep(1.5)
             send_keys("l")
             time.sleep(2)
-            dlg = self._find_active_dialog(title_re=r"(?i)(export|iif|list)")
+            # Search child windows of main_window — export dialog is a modal child
+            dlg = self._find_active_dialog(title_re=r"(?i)(export|iif|list)", parent_window=main_window)
 
         if dlg is None:
             raise RuntimeError("Export Lists to IIF dialog did not appear")
