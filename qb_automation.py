@@ -1183,84 +1183,58 @@ class QuickBooksAutomationEngine:
 
         # ── Wait for and dismiss the export success confirmation dialog ──
         # After a successful IIF export, QuickBooks shows a modal dialog titled
-        # "QuickBooks Desktop Information" (or a variant such as "QuickBooks
-        # Information" / "Information") containing the message:
+        # "QuickBooks Desktop Information" with the message:
         #     "Your data has been exported successfully."
-        # Bug found 2026-05-08: The tool exported the file correctly but never
-        # dismissed this dialog, which blocked all subsequent menu interactions
-        # because QB keeps the modal in front of the main window.
         #
-        # Bug fixed 2026-05-08: Was passing arguments in wrong order (main_window
-        # as title_re, list as parent_window) and passing a list instead of regex
-        # string, plus an extra log_fn arg that caused a silent TypeError.
-        # Also need to check child Static/Text controls for the actual message
-        # text since window_text() on the dialog itself only returns the title.
-        #
-        # Strategy:
-        #   1. Poll for up to 30 seconds (1 s intervals) for a dialog whose
-        #      title matches one of the known success-dialog titles.
-        #   2. Inspect the dialog's child Static/Text controls for the keywords
-        #      "successfully" or "exported" to confirm it is indeed the success
-        #      message (and not an unrelated error dialog with a similar title).
-        #   3. Click the "OK" button to dismiss.  If the button click fails for
-        #      any reason, fall back to sending {ENTER} which achieves the same
-        #      result because OK is the default-focused button.
-        # Wait for and dismiss success confirmation dialog
-        # FIX: Use case-insensitive regex, search all descendants for text,
-        # and add diagnostic logging for each attempt.
+        # Bug fix 2026-05-08: Success dialog uses Pane controls, NOT Text/Static
+        # controls. Searching descendants for text like "successfully" returns
+        # nothing because the message is rendered inside Pane wrappers (similar
+        # to the Export Lists checkbox dialog). The correct approach is to match
+        # the dialog by its title alone ("QuickBooks Desktop Information") and
+        # click OK without inspecting text content.
         log_fn("Waiting for export success confirmation dialog...")
         dialog_dismissed = False
 
         for i in range(30):
             try:
-                # Use case-insensitive regex and search descendants
+                # Search for dialog by title - it's a Pane, no text controls to check
                 success_dialog = self._find_active_dialog(
                     parent_window=main_window,
-                    title_re=r"(?i)(QuickBooks.*Information|Information|QuickBooks)"
+                    title_re=r"(?i)QuickBooks.*Information"
                 )
 
                 if success_dialog:
                     title = success_dialog.window_text()
-                    log_fn(f"[Attempt {i+1}] Found dialog: '{title}'")
+                    log_fn(f"✅ Found success dialog: '{title}'")
 
-                    # Check all descendant text controls for success message
+                    # Click OK button (don't search for text - dialog uses Panes)
                     try:
-                        all_text = []
-                        for ctrl in success_dialog.descendants():
-                            text = ctrl.window_text()
-                            if text:
-                                all_text.append(text.lower())
-
-                        combined_text = " ".join(all_text)
-                        log_fn(f"[Attempt {i+1}] Dialog text: {combined_text[:200]}")
-
-                        if any(keyword in combined_text for keyword in ["success", "export", "complete"]):
-                            log_fn(f"✅ SUCCESS CONFIRMED in dialog '{title}'")
-                            # Dismiss dialog
-                            try:
-                                ok_btn = success_dialog.child_window(title_re=r"(?i)ok", control_type="Button")
-                                ok_btn.click()
-                                log_fn("Clicked OK button")
-                            except Exception:
-                                log_fn("Button click failed, trying ESC")
-                                success_dialog.type_keys("{ESC}")
-                            time.sleep(1)
+                        ok_btn = success_dialog.child_window(title_re=r"(?i)ok", control_type="Button")
+                        ok_btn.click()
+                        log_fn("Clicked OK button")
+                        dialog_dismissed = True
+                        break
+                    except Exception as e:
+                        log_fn(f"OK button click failed: {e}, trying ESC key")
+                        try:
+                            success_dialog.type_keys("{ESC}")
+                            log_fn("Sent ESC key")
                             dialog_dismissed = True
                             break
-                    except Exception as e:
-                        log_fn(f"[Attempt {i+1}] Error checking dialog text: {e}")
+                        except:
+                            pass
                 else:
-                    log_fn(f"[Attempt {i+1}] No dialog found")
+                    if i % 5 == 0:  # Log every 5 attempts to reduce noise
+                        log_fn(f"[Attempt {i+1}/30] Waiting for success dialog...")
 
             except Exception as e:
-                log_fn(f"[Attempt {i+1}] Exception: {e}")
+                if i % 5 == 0:
+                    log_fn(f"[Attempt {i+1}/30] Exception: {e}")
 
-            if dialog_dismissed:
-                break
             time.sleep(1)
 
         if not dialog_dismissed:
-            raise RuntimeError("Export success dialog was not dismissed after 30 attempts")
+            raise RuntimeError("Export success dialog 'QuickBooks Desktop Information' was not found/dismissed after 30 seconds")
 
         log_fn("✅ Export completed and success dialog dismissed")
 
