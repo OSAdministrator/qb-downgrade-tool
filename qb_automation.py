@@ -1179,6 +1179,50 @@ class QuickBooksAutomationEngine:
 
         time.sleep(1)
         self._handle_standard_file_dialog(out_path, save_mode=True, timeout_s=self.config.timeouts.export_seconds, log_fn=log_fn, parent_window=main_window)
+
+        # ── Wait for and dismiss the export success confirmation dialog ──
+        # After a successful IIF export, QuickBooks shows a modal dialog titled
+        # "QuickBooks Desktop Information" (or a variant such as "QuickBooks
+        # Information" / "Information") containing the message:
+        #     "Your data has been exported successfully."
+        # Bug found 2026-05-08: The tool exported the file correctly but never
+        # dismissed this dialog, which blocked all subsequent menu interactions
+        # because QB keeps the modal in front of the main window.
+        #
+        # Strategy:
+        #   1. Poll for up to 30 seconds (1 s intervals) for a dialog whose
+        #      title matches one of the known success-dialog titles.
+        #   2. Inspect the dialog's window text for the keywords "successfully"
+        #      or "exported" to confirm it is indeed the success message (and
+        #      not an unrelated error dialog with a similar title).
+        #   3. Click the "OK" button to dismiss.  If the button click fails for
+        #      any reason, fall back to sending {ENTER} which achieves the same
+        #      result because OK is the default-focused button.
+        for i in range(30):  # Wait up to 30 seconds
+            success_dialog = self._find_active_dialog(
+                main_window,
+                ["QuickBooks Desktop Information", "QuickBooks Information", "Information"],
+                log_fn
+            )
+            if success_dialog:
+                # Verify that the dialog is actually the success confirmation
+                text = success_dialog.window_text()
+                if "successfully" in text.lower() or "exported" in text.lower():
+                    log_fn(f"Success dialog detected: {text}")
+                    # Attempt to click the OK button to dismiss
+                    try:
+                        ok_btn = success_dialog.child_window(title="OK", control_type="Button")
+                        ok_btn.click()
+                        log_fn("Clicked OK on success dialog")
+                        time.sleep(0.5)
+                        break
+                    except Exception:
+                        # Fallback: press Enter (OK is the default button)
+                        success_dialog.type_keys("{ENTER}")
+                        log_fn("Pressed ENTER to dismiss success dialog (fallback)")
+                        break
+            time.sleep(1)
+
         self._dismiss_common_dialogs(log_fn)
 
     def _open_report(self, main_window, menu_path: str, fallback_keys: str, log_fn: Optional[LogFn]) -> None:
