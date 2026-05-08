@@ -454,90 +454,40 @@ class QuickBooksAutomationEngine:
         self._dismiss_common_dialogs(log_fn)
 
     def _handle_password_prompt(self, password: str, timeout_s: int, log_fn: Optional[LogFn]) -> None:
-        """Wait for a password/login dialog and enter credentials.
+        """Wait for password dialog, pause for manual entry, then resume automation.
 
-        =====================================================================
-        WHY THIS IS SIMPLIFIED (2026-05-08 debugging session):
-        =====================================================================
-        The previous implementation tried to:
-          - Detect dialog type (username+password vs password-only)
-          - Enumerate Edit controls via pywinauto descendants()
-          - Focus specific edit fields by index
-          - Use set_edit_text() or type_keys() with fallbacks
-          - Click specific OK/Login buttons by label
-
-        This was UNRELIABLE because:
-          1. QuickBooks password dialogs use non-standard Win32 controls
-             that pywinauto often can't enumerate or interact with properly.
-          2. Edit field detection via descendants(control_type="Edit") would
-             sometimes return 0 fields even when the dialog was visible.
-          3. set_edit_text() would silently fail on password fields.
-          4. Button clicking via child_window() was fragile with QB's UI.
-
-        The SIMPLE approach that actually works:
-          1. Wait 3-5 seconds for the password dialog to appear
-          2. Just type the password using send_keys (it goes to the
-             focused field, which QB sets to the password field by default)
-          3. Press Enter (equivalent to clicking OK)
-
-        This works because when QB opens a company file via command-line
-        parameter, the password dialog appears with the cursor already in
-        the password field. We don't need to find or focus anything — just
-        type and press Enter.
-        =====================================================================
+        Manual password entry approach - automation pauses to allow user to
+        enter credentials, then resumes once company opens.
         """
-        self._emit("  [Password] Checking if password was provided...", log_fn)
-        if not password:
-            self._emit("  [Password] No password provided – skipping password entry.", log_fn)
+        _ = password  # Intentionally unused: password entry is now fully manual.
+
+        wait_for_appear_s = min(timeout_s, 20)
+        self._emit(
+            f"  [Password] Waiting up to {wait_for_appear_s}s for password/login dialog to appear...",
+            log_fn,
+        )
+
+        def _dialog_present() -> bool:
+            return self._find_active_dialog(title_re=r"(?i)(password|login)") is not None
+
+        if not self._wait_until(_dialog_present, wait_for_appear_s, 0.5):
+            self._emit("  [Password] No password/login dialog detected; continuing.", log_fn)
             return
 
-        if send_keys is None:
-            self._emit("  [Password] WARNING: send_keys unavailable, cannot enter password.", log_fn)
-            return
+        self._emit(
+            "PASSWORD DIALOG DETECTED - Waiting for user to enter password manually...",
+            log_fn,
+        )
 
-        self._emit(f"  [Password] Password provided (length={len(password)}). "
-                   f"Waiting up to {min(timeout_s, 20)}s for password dialog...", log_fn)
+        def _dialog_gone() -> bool:
+            return self._find_active_dialog(title_re=r"(?i)(password|login)") is None
 
-        # --- Step 1: Wait for the password dialog to appear ---
-        # We use a simple poll loop looking for any dialog with "password"
-        # or "login" in the title. We don't need to interact with the dialog
-        # object itself — we just need to know it's on screen.
-        dialog_found = False
-        poll_count = 0
+        if not self._wait_until(_dialog_gone, timeout_s, 0.5):
+            raise RuntimeError(
+                "Timed out waiting for manual password entry: password dialog is still open"
+            )
 
-        def _cond() -> bool:
-            nonlocal poll_count, dialog_found
-            poll_count += 1
-            dlg = self._find_active_dialog(title_re=r"(?i)(password|login)")
-            if dlg is not None:
-                try:
-                    dlg_title = dlg.window_text()
-                except Exception:  # noqa: BLE001
-                    dlg_title = "<unknown>"
-                self._emit(f"  [Password] Dialog FOUND on poll #{poll_count}: '{dlg_title}'", log_fn)
-                dialog_found = True
-                return True
-            return False
-
-        if not self._wait_until(_cond, min(timeout_s, 20), 0.5):
-            self._emit(f"  [Password] No password/login dialog detected after {poll_count} polls; continuing.", log_fn)
-            return
-
-        # --- Step 2: Brief pause to let the dialog fully render ---
-        # QB sometimes needs a moment after the dialog appears before it
-        # accepts keyboard input reliably.
-        time.sleep(1)
-
-        # --- Step 3: Just type the password and press Enter ---
-        # The password dialog has focus and the cursor is in the password
-        # field by default. No need to find edit controls or click buttons.
-        # send_keys types the password, then {ENTER} submits the dialog.
-        self._emit("  [Password] Typing password and pressing Enter...", log_fn)
-        send_keys(password, pause=0.02)
-        time.sleep(0.3)
-        send_keys("{ENTER}")
-
-        self._emit("  [Password] Password entry complete (type + Enter).", log_fn)
+        self._emit("  [Password] Password dialog closed. Resuming automation.", log_fn)
 
     def _wait_for_company_ready(self, main_window, timeout_s: int, log_fn: Optional[LogFn]) -> None:
         """Wait for the company to finish loading by checking the window title.
@@ -674,12 +624,12 @@ class QuickBooksAutomationEngine:
         self._emit("  [Launch] ✓ Main window found.", log_fn)
 
         # ==================================================================
-        # STEP 2-3 – Wait for password dialog → enter password → click OK
+        # STEP 2-3 – Wait for password dialog → user enters password manually
         # ==================================================================
         self._emit("[STEP 2/5] Waiting for password/login dialog to appear...", log_fn)
         self._emit("  (QB should auto-prompt for the password after opening the company file.)", log_fn)
         self._handle_password_prompt(password, timeout_s=timeout_s, log_fn=log_fn)
-        self._emit("[STEP 3/5] ✓ Password handling complete.", log_fn)
+        self._emit("[STEP 3/5] ✓ Manual password step complete.", log_fn)
 
         # ==================================================================
         # STEP 4 – Wait for the company to FULLY load
