@@ -421,6 +421,173 @@ class QuickBooksAutomationEngine:
         except Exception:  # noqa: BLE001
             pass
 
+    def _close_extra_windows(self, main_window, log_fn: Optional[LogFn]) -> None:
+        """Close extra QB windows (reports, centers, forms) before export navigation.
+
+        # FIX: Close extra QB windows before export navigation
+        # Issue found 2026-05-08: Employee Center, reports, etc. intercept keyboard shortcuts
+        # causing File→Utilities→Export to fail. Close all extra windows first.
+        #
+        # QuickBooks opens various child/tool windows within its MDI interface:
+        #   - Employee Center, Customer Center, Vendor Center
+        #   - Account Listing, Transaction Detail reports
+        #   - Write Checks, Enter Bills, Pay Bills
+        #   - Chart of Accounts, Item List, etc.
+        # These windows receive keyboard focus and intercept Alt+F, Ctrl+key, and
+        # other shortcuts meant for the main company window's menu bar.
+        # By closing them first, we guarantee that menu navigation targets the
+        # correct window.
+
+        Strategy:
+          1. Find all child windows of the main QB window
+          2. Close any that match known report/center/form title patterns
+          3. Keep only the main company window open
+          4. Use safe close methods: click X button, send ESC, or close()
+        """
+        # Substrings (lower-cased) of child window titles that should be closed.
+        # These are internal QB MDI child windows that steal keyboard focus.
+        extra_window_hints = [
+            "employee center",
+            "customer center",
+            "vendor center",
+            "account listing",
+            "transaction detail",
+            "transaction list",
+            "write checks",
+            "enter bills",
+            "pay bills",
+            "chart of accounts",
+            "item list",
+            "sales tax",
+            "payroll center",
+            "report",
+            "balance sheet",
+            "profit & loss",
+            "profit and loss",
+            "trial balance",
+            "a/r aging",
+            "a/p aging",
+            "general ledger",
+            "journal",
+            "register",
+            "reconcile",
+            "make deposits",
+            "receive payments",
+            "create invoices",
+            "enter sales receipts",
+            "credit memo",
+            "purchase order",
+            "sales order",
+            "estimate",
+            "statement",
+            "home page",
+            "quickbooks home",
+        ]
+
+        closed_count = 0
+
+        # --- Approach 1: Close child windows of the main QB window ---
+        try:
+            children = main_window.children()
+        except Exception:  # noqa: BLE001
+            children = []
+
+        for child in children:
+            try:
+                if not child.is_visible():
+                    continue
+                title = child.window_text() or ""
+                if not title:
+                    continue
+
+                title_l = title.lower()
+
+                # Skip the main company window itself (should not appear as child,
+                # but guard against it)
+                if child.handle == getattr(main_window, "handle", None):
+                    continue
+
+                if any(hint in title_l for hint in extra_window_hints):
+                    self._emit(f"  [CloseExtra] Closing child window: '{title}'", log_fn)
+                    # Try clicking Close/X button first
+                    clicked = self._click_first_button(child, ["Close", "X", "Cancel"])
+                    if not clicked:
+                        # Try sending ESC to close
+                        try:
+                            child.set_focus()
+                            time.sleep(0.1)
+                            if send_keys is not None:
+                                send_keys("{ESC}")
+                                time.sleep(0.3)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        # Last resort: try .close() on the window
+                        try:
+                            child.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    closed_count += 1
+                    time.sleep(0.3)
+            except Exception:  # noqa: BLE001
+                continue
+
+        # --- Approach 2: Also check top-level desktop windows ---
+        # Some QB windows (e.g., Employee Center) may appear as separate
+        # top-level windows rather than MDI children.
+        try:
+            desktop = self._get_desktop()
+            for win in desktop.windows():
+                try:
+                    if not win.is_visible():
+                        continue
+                    title = win.window_text() or ""
+                    if not title:
+                        continue
+
+                    # Never close the main QB window
+                    if win.handle == getattr(main_window, "handle", None):
+                        continue
+                    # Skip non-QB windows
+                    if not re.search(self.QB_WINDOW_RE, title):
+                        continue
+
+                    title_l = title.lower()
+                    if any(hint in title_l for hint in extra_window_hints):
+                        self._emit(f"  [CloseExtra] Closing top-level QB window: '{title}'", log_fn)
+                        clicked = self._click_first_button(win, ["Close", "X", "Cancel"])
+                        if not clicked:
+                            try:
+                                win.set_focus()
+                                time.sleep(0.1)
+                                if send_keys is not None:
+                                    send_keys("{ESC}")
+                                    time.sleep(0.3)
+                            except Exception:  # noqa: BLE001
+                                pass
+                            try:
+                                win.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                        closed_count += 1
+                        time.sleep(0.3)
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+
+        if closed_count > 0:
+            self._emit(f"  [CloseExtra] Closed {closed_count} extra window(s).", log_fn)
+            time.sleep(1)
+        else:
+            self._emit("  [CloseExtra] No extra windows found to close.", log_fn)
+
+        # Restore focus to the main company window
+        try:
+            self._focus_window(main_window)
+            time.sleep(0.5)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _invoke_menu(self, window, menu_path: str, fallback_keys: Optional[str], log_fn: Optional[LogFn]) -> None:
         self._focus_window(window)
         try:
@@ -721,12 +888,17 @@ class QuickBooksAutomationEngine:
             send_keys("{ESC}")
             time.sleep(0.3)
 
-        self._focus_window(main_window)
-        time.sleep(1)
+        # FIX: Close extra QB windows before export navigation
+        # Issue found 2026-05-08: Employee Center, reports, etc. intercept keyboard shortcuts
+        # causing File→Utilities→Export to fail. Close all extra windows first.
+        self._close_extra_windows(main_window, log_fn)
 
         # Close any popup windows that may have stolen focus
         self._close_popup_windows(main_window, log_fn)
         self._dismiss_common_dialogs(log_fn)
+
+        # Set focus back to main_window AFTER closing everything,
+        # THEN attempt the export navigation
         self._focus_window(main_window)
         time.sleep(0.5)
 
