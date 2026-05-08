@@ -672,10 +672,11 @@ class QuickBooksAutomationEngine:
         self._emit(f"Exporting list '{list_name}' -> {out_path}", log_fn)
 
         # Dismiss any stale menus / popups before starting
+        # Note: pywinauto uses {ESC} not {ESCAPE}
         if send_keys is not None:
-            send_keys("{ESCAPE}")
+            send_keys("{ESC}")
             time.sleep(0.3)
-            send_keys("{ESCAPE}")
+            send_keys("{ESC}")
             time.sleep(0.3)
 
         self._focus_window(main_window)
@@ -709,7 +710,7 @@ class QuickBooksAutomationEngine:
         if dlg is None:
             self._emit("Keyboard menu navigation failed, trying menu_select", log_fn)
             if send_keys is not None:
-                send_keys("{ESCAPE}")
+                send_keys("{ESC}")
                 time.sleep(0.5)
             self._focus_window(main_window)
             time.sleep(0.5)
@@ -728,12 +729,12 @@ class QuickBooksAutomationEngine:
         # Approach 3: try alternative keyboard sequence
         if dlg is None and send_keys is not None:
             self._emit("Trying alternative keyboard sequence for export menu", log_fn)
-            send_keys("{ESCAPE}")
+            send_keys("{ESC}")
             time.sleep(0.5)
             self._focus_window(main_window)
             time.sleep(0.5)
             # Try Alt, then arrow keys through File menu
-            send_keys("{ESCAPE}")
+            send_keys("{ESC}")
             time.sleep(0.3)
             send_keys("%f")
             time.sleep(1.5)
