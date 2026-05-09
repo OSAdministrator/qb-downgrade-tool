@@ -84,11 +84,13 @@ def _get_disk_number_for_path(file_path: Path) -> Optional[int]:
 def _get_partitions_on_disk(disk_number: int) -> List[Dict]:
     """Get all partitions on a specific physical disk.
 
-    Returns list of dicts with: PartitionNumber, DriveLetter, Size, Type
+    Returns list of dicts with: PartitionNumber, DriveLetter, Size, Type,
+    IsActive, GptType, MbrType — enough to filter out system partitions.
     """
     cmd = (
         f"Get-Partition -DiskNumber {disk_number} "
-        f"| Select-Object PartitionNumber, DriveLetter, Size, Type "
+        f"| Select-Object PartitionNumber, DriveLetter, Size, Type, "
+        f"IsActive, GptType, MbrType "
         f"| ConvertTo-Json"
     )
     data = _powershell_json(cmd)
@@ -99,14 +101,78 @@ def _get_partitions_on_disk(disk_number: int) -> List[Dict]:
     return data
 
 
-def _find_partition_drive_letter(disk_number: int, partition_number: int) -> Optional[str]:
-    """Find the drive letter for a specific partition on a specific disk."""
+# GPT partition type GUIDs that are NEVER a valid workspace
+_SYSTEM_GPT_TYPES = {
+    # EFI System Partition
+    "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+    # Microsoft Reserved (MSR)
+    "e3c9e316-0b5c-4db8-817d-f92df00215ae",
+    # Windows Recovery Environment
+    "de94bba4-06d1-4d40-a16a-bfd50179d6ac",
+    # BIOS Boot Partition
+    "21686148-6449-6e6f-744e-656564454649",
+}
+
+# MBR type IDs that are NEVER a valid workspace
+_SYSTEM_MBR_TYPES = {
+    0x27,   # Windows Recovery / hidden NTFS
+    0xDE,   # Dell utility partition
+    0xEF,   # EFI System Partition (MBR)
+    0xFE,   # IBM IML / old diagnostic partitions
+}
+
+
+def _is_system_partition(part: Dict) -> bool:
+    """Return True if this partition looks like a system/recovery/hidden partition.
+
+    Checks:
+      1. Type field: "System", "Reserved", "Recovery", "Unknown" → system
+      2. IsActive: False on MBR disks usually means hidden/recovery
+         (but on GPT disks IsActive is meaningless, so we combine checks)
+      3. GptType GUID: matches known system GUIDs
+      4. MbrType ID: matches known system type IDs
+      5. No drive letter AND type isn't "Basic" → hidden
+    """
+    ptype = str(part.get("Type", "")).lower()
+    if ptype in ("system", "reserved", "recovery", "unknown"):
+        return True
+
+    # Check GPT type GUID
+    gpt_type = str(part.get("GptType", "")).lower().strip("{}")
+    if gpt_type in _SYSTEM_GPT_TYPES:
+        return True
+
+    # Check MBR type ID
+    mbr_type = part.get("MbrType")
+    if mbr_type is not None:
+        try:
+            if int(mbr_type) in _SYSTEM_MBR_TYPES:
+                return True
+        except (ValueError, TypeError):
+            pass
+
+    # No drive letter + not a Basic data partition = hidden/system
+    if not part.get("DriveLetter") and ptype != "basic":
+        return True
+
+    return False
+
+
+def _find_partition_drive_letter(disk_number: int, partition_number: int) -> Optional[Tuple[str, bool]]:
+    """Find the drive letter for a specific partition on a specific disk.
+
+    Returns (drive_letter, is_safe) tuple:
+      - drive_letter: the assigned letter (e.g. "F")
+      - is_safe: True if the partition is NOT a system/recovery partition
+    Returns None if partition not found or has no drive letter.
+    """
     partitions = _get_partitions_on_disk(disk_number)
     for p in partitions:
         if p.get("PartitionNumber") == partition_number:
             letter = p.get("DriveLetter")
             if letter:
-                return str(letter)
+                safe = not _is_system_partition(p)
+                return (str(letter), safe)
     return None
 
 
@@ -166,19 +232,33 @@ def get_drive_layout() -> Dict[str, Optional[str]]:
         return result
 
     # Step 3: Look up workspace partition by number
-    ws_letter = _find_partition_drive_letter(disk_num, WORKSPACE_PARTITION_NUMBER)
-    if not ws_letter:
-        # Fallback: try by volume label
-        ws_letter = _find_partition_by_label(WORKSPACE_VOLUME_LABEL)
-
-    if ws_letter:
-        result["workspace_drive"] = ws_letter
-        result["is_flash_drive"] = True
+    ws_result = _find_partition_drive_letter(disk_num, WORKSPACE_PARTITION_NUMBER)
+    if ws_result:
+        ws_letter, ws_safe = ws_result
+        if ws_safe:
+            result["workspace_drive"] = ws_letter
+            result["is_flash_drive"] = True
+        else:
+            # Partition exists but it's a system/recovery type — DO NOT USE.
+            # This protects against writing to a customer's Recovery partition
+            # that happens to be P3 on their disk.
+            result["workspace_blocked_reason"] = (
+                f"Partition {WORKSPACE_PARTITION_NUMBER} on Disk {disk_num} "
+                f"({ws_letter}:) is a system/recovery partition — skipping"
+            )
+    else:
+        # No partition at that number — try by volume label as fallback
+        ws_label_letter = _find_partition_by_label(WORKSPACE_VOLUME_LABEL)
+        if ws_label_letter:
+            result["workspace_drive"] = ws_label_letter
+            result["is_flash_drive"] = True
 
     # Step 4: Optional backup partition
-    bk_letter = _find_partition_drive_letter(disk_num, BACKUP_PARTITION_NUMBER)
-    if bk_letter:
-        result["backup_drive"] = bk_letter
+    bk_result = _find_partition_drive_letter(disk_num, BACKUP_PARTITION_NUMBER)
+    if bk_result:
+        bk_letter, bk_safe = bk_result
+        if bk_safe:
+            result["backup_drive"] = bk_letter
 
     return result
 
@@ -251,7 +331,16 @@ def print_layout() -> None:
     print("  QuickBooks TimeWarp® — Drive Layout")
     print("=" * 50)
 
-    if layout["is_flash_drive"]:
+    blocked = layout.get("workspace_blocked_reason")
+
+    if blocked:
+        # Found partition but it's a system type — warn the tech
+        print(f"  Mode           : Desktop / Folder  (partition blocked)")
+        print(f"  Physical Disk  : Disk {layout['disk_number']}")
+        print(f"  Code Partition : {layout['code_drive']}:\\")
+        print(f"  ⚠ BLOCKED      : {blocked}")
+        print(f"  Program Dir    : {Path(__file__).resolve().parent}")
+    elif layout["is_flash_drive"]:
         ws_path = Path(f"{layout['workspace_drive']}:/")
         marker = ws_path / ".timewarp_workspace"
         has_marker = marker.exists()
