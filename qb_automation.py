@@ -629,7 +629,7 @@ class QuickBooksAutomationEngine:
 
         def _cond() -> bool:
             dlg = self._find_active_dialog(
-                title_re=r"(?i)(open|save as|import|export|create company)",
+                title_re=r"(?i)(open|save\s+as|save document|import|export|create company)",
                 parent_window=parent_window,
             )
             if dlg is not None:
