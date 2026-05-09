@@ -36,6 +36,8 @@ except Exception:  # noqa: BLE001
     send_keys = None
 
 
+logger = logging.getLogger(__name__)
+
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[float], None]
 
