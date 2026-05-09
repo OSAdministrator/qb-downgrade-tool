@@ -893,6 +893,360 @@ def export_validation_reports(
 
 
 # ---------------------------------------------------------------------------
+# Structured snapshot for QBFC import (JSON)
+# ---------------------------------------------------------------------------
+
+def _address_dict(addr_obj: Any) -> Dict[str, str]:
+    """Extract address fields from a QBFC address object into a dict."""
+    if addr_obj is None:
+        return {}
+    d: Dict[str, str] = {}
+    for field in ("Addr1", "Addr2", "Addr3", "Addr4", "Addr5",
+                  "City", "State", "PostalCode", "Country"):
+        v = _safe_get(addr_obj, field)
+        if v:
+            d[field.lower()] = v
+    return d
+
+
+def export_snapshot(
+    session: "QBFCSession",
+    snapshot_path: Path,
+    include_transactions: bool = True,
+    log_fn: Optional[LogFn] = None,
+) -> Path:
+    """Export all QB data to a structured JSON snapshot for QBFC import.
+
+    This is the bridge between export (QB 2023) and import (QB 2021).
+    The IIF/CSV/PDF files are for human reference; the JSON drives the import.
+
+    Snapshot structure:
+    {
+        "meta": { "exported_at": "...", "company_path": "..." },
+        "payment_methods": [ {"name": "..."}, ... ],
+        "terms": [ {"name": "...", "due_days": ..., ...}, ... ],
+        "classes": [ {"name": "...", "is_active": true}, ... ],
+        "accounts": [ {"name": "...", "type": "...", ...}, ... ],
+        "customers": [ {"name": "...", "phone": "...", ...}, ... ],
+        "vendors": [ {"name": "...", ...}, ... ],
+        "employees": [ {"name": "...", ...}, ... ],
+        "other_names": [ {"name": "...", ...}, ... ],
+        "items": [ {"name": "...", "item_type": "...", ...}, ... ],
+        "transactions": [ {"type": "...", "date": "...", ...}, ... ],
+    }
+    """
+    import json as _json
+
+    _emit("QBFC: Building structured snapshot for import...", log_fn)
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+
+    snapshot: Dict[str, Any] = {
+        "meta": {
+            "exported_at": datetime.now().isoformat(),
+            "company_path": session.company_path or "",
+        },
+    }
+
+    # --- Query each list type individually (same pattern as export_lists_to_iif) ---
+    query_appenders = [
+        ("AppendAccountQueryRq",       "accounts"),
+        ("AppendCustomerQueryRq",      "customers"),
+        ("AppendVendorQueryRq",        "vendors"),
+        ("AppendEmployeeQueryRq",      "employees"),
+        ("AppendOtherNameQueryRq",     "other_names"),
+        ("AppendClassQueryRq",         "classes"),
+        ("AppendItemQueryRq",          "items"),
+        ("AppendTermsQueryRq",         "terms"),
+        ("AppendPaymentMethodQueryRq", "payment_methods"),
+    ]
+
+    raw_responses: Dict[str, Any] = {}
+    for appender_name, key in query_appenders:
+        try:
+            req = _create_request_set(session)
+            appender = getattr(req, appender_name, None)
+            if appender is None:
+                _emit(f"  Snapshot: {appender_name} not available, skipping", log_fn)
+                raw_responses[key] = None
+                continue
+            appender()
+            resp_set = session.session_manager.DoRequests(req)
+            r = resp_set.ResponseList.GetAt(0)
+            if r is None or r.StatusCode != 0:
+                _emit(f"  Snapshot: {appender_name} status={r.StatusCode if r else 'None'}", log_fn)
+                raw_responses[key] = None
+            else:
+                raw_responses[key] = r.Detail
+        except Exception as exc:  # noqa: BLE001
+            _emit(f"  Snapshot: {appender_name} failed: {exc}", log_fn)
+            raw_responses[key] = None
+
+    # --- Payment Methods ---
+    methods = []
+    detail = raw_responses.get("payment_methods")
+    if detail:
+        for i in range(detail.Count):
+            p = detail.GetAt(i)
+            methods.append({
+                "name": _safe_get(p, "Name") or "",
+                "is_active": (_safe_get(p, "IsActive") or "true").lower() in ("true", "1", "yes"),
+            })
+    snapshot["payment_methods"] = methods
+    _emit(f"  Snapshot: {len(methods)} payment methods", log_fn)
+
+    # --- Terms ---
+    terms_list = []
+    detail = raw_responses.get("terms")
+    if detail:
+        for i in range(detail.Count):
+            t = detail.GetAt(i)
+            inner = getattr(t, "StandardTermsRet", None) or getattr(t, "DateDrivenTermsRet", None) or t
+            terms_list.append({
+                "name": _safe_get(inner, "Name") or "",
+                "due_days": _safe_get(inner, "StdDueDays") or _safe_get(inner, "DayOfMonthDue") or "",
+                "discount_days": _safe_get(inner, "StdDiscountDays") or _safe_get(inner, "DiscountDayOfMonth") or "",
+                "discount_pct": _safe_get_amount(inner, "DiscountPct"),
+                "is_active": (_safe_get(inner, "IsActive") or "true").lower() in ("true", "1", "yes"),
+            })
+    snapshot["terms"] = terms_list
+    _emit(f"  Snapshot: {len(terms_list)} terms", log_fn)
+
+    # --- Classes ---
+    classes = []
+    detail = raw_responses.get("classes")
+    if detail:
+        for i in range(detail.Count):
+            c = detail.GetAt(i)
+            classes.append({
+                "name": _safe_get(c, "FullName") or _safe_get(c, "Name") or "",
+                "is_active": (_safe_get(c, "IsActive") or "true").lower() in ("true", "1", "yes"),
+            })
+    snapshot["classes"] = classes
+    _emit(f"  Snapshot: {len(classes)} classes", log_fn)
+
+    # --- Accounts ---
+    accounts = []
+    detail = raw_responses.get("accounts")
+    if detail:
+        for i in range(detail.Count):
+            a = detail.GetAt(i)
+            accounts.append({
+                "name": _safe_get(a, "FullName") or _safe_get(a, "Name") or "",
+                "type": _safe_get(a, "AccountType") or "",
+                "description": _safe_get(a, "Desc") or "",
+                "account_number": _safe_get(a, "AccountNumber") or "",
+                "is_active": (_safe_get(a, "IsActive") or "true").lower() in ("true", "1", "yes"),
+                "balance": _safe_get_amount(a, "Balance"),
+            })
+    snapshot["accounts"] = accounts
+    _emit(f"  Snapshot: {len(accounts)} accounts", log_fn)
+
+    # --- Customers ---
+    customers = []
+    detail = raw_responses.get("customers")
+    if detail:
+        for i in range(detail.Count):
+            c = detail.GetAt(i)
+            customers.append({
+                "name": _safe_get(c, "FullName") or _safe_get(c, "Name") or "",
+                "company_name": _safe_get(c, "CompanyName") or "",
+                "salutation": _safe_get(c, "Salutation") or "",
+                "first_name": _safe_get(c, "FirstName") or "",
+                "middle_name": _safe_get(c, "MiddleName") or "",
+                "last_name": _safe_get(c, "LastName") or "",
+                "contact": _safe_get(c, "Contact") or "",
+                "alt_contact": _safe_get(c, "AltContact") or "",
+                "phone": _safe_get(c, "Phone") or "",
+                "alt_phone": _safe_get(c, "AltPhone") or "",
+                "fax": _safe_get(c, "Fax") or "",
+                "email": _safe_get(c, "Email") or "",
+                "notes": _safe_get(c, "Notes") or "",
+                "bill_address": _address_dict(getattr(c, "BillAddress", None)),
+                "ship_address": _address_dict(getattr(c, "ShipAddress", None)),
+                "customer_type": _safe_get(c, "CustomerTypeRef.FullName") or "",
+                "terms": _safe_get(c, "TermsRef.FullName") or "",
+                "sales_rep": _safe_get(c, "SalesRepRef.FullName") or "",
+                "sales_tax_code": _safe_get(c, "SalesTaxCodeRef.FullName") or "",
+                "price_level": _safe_get(c, "PriceLevelRef.FullName") or "",
+                "credit_limit": _safe_get_amount(c, "CreditLimit"),
+                "resale_number": _safe_get(c, "ResaleNumber") or "",
+                "is_taxable": (_safe_get(c, "IsTaxable") or "").lower() in ("true", "1", "yes"),
+                "is_active": (_safe_get(c, "IsActive") or "true").lower() in ("true", "1", "yes"),
+                "job_desc": _safe_get(c, "JobDesc") or "",
+                "job_type": _safe_get(c, "JobTypeRef.FullName") or "",
+                "job_status": _safe_get(c, "JobStatus") or "",
+                "balance": _safe_get_amount(c, "Balance"),
+            })
+    snapshot["customers"] = customers
+    _emit(f"  Snapshot: {len(customers)} customers", log_fn)
+
+    # --- Vendors ---
+    vendors = []
+    detail = raw_responses.get("vendors")
+    if detail:
+        for i in range(detail.Count):
+            v = detail.GetAt(i)
+            vendors.append({
+                "name": _safe_get(v, "Name") or "",
+                "print_as": _safe_get(v, "PrintAs") or "",
+                "company_name": _safe_get(v, "CompanyName") or "",
+                "salutation": _safe_get(v, "Salutation") or "",
+                "first_name": _safe_get(v, "FirstName") or "",
+                "middle_name": _safe_get(v, "MiddleName") or "",
+                "last_name": _safe_get(v, "LastName") or "",
+                "contact": _safe_get(v, "Contact") or "",
+                "alt_contact": _safe_get(v, "AltContact") or "",
+                "phone": _safe_get(v, "Phone") or "",
+                "alt_phone": _safe_get(v, "AltPhone") or "",
+                "fax": _safe_get(v, "Fax") or "",
+                "email": _safe_get(v, "Email") or "",
+                "notes": _safe_get(v, "Notes") or "",
+                "address": _address_dict(getattr(v, "VendorAddress", None)),
+                "vendor_type": _safe_get(v, "VendorTypeRef.FullName") or "",
+                "terms": _safe_get(v, "TermsRef.FullName") or "",
+                "credit_limit": _safe_get_amount(v, "CreditLimit"),
+                "tax_ident": _safe_get(v, "VendorTaxIdent") or "",
+                "is_1099": (_safe_get(v, "IsVendorEligibleFor1099") or "").lower() in ("true", "1", "yes"),
+                "is_active": (_safe_get(v, "IsActive") or "true").lower() in ("true", "1", "yes"),
+                "balance": _safe_get_amount(v, "Balance"),
+            })
+    snapshot["vendors"] = vendors
+    _emit(f"  Snapshot: {len(vendors)} vendors", log_fn)
+
+    # --- Employees ---
+    employees = []
+    detail = raw_responses.get("employees")
+    if detail:
+        for i in range(detail.Count):
+            e = detail.GetAt(i)
+            employees.append({
+                "name": _safe_get(e, "Name") or "",
+                "first_name": _safe_get(e, "FirstName") or "",
+                "middle_name": _safe_get(e, "MiddleName") or "",
+                "last_name": _safe_get(e, "LastName") or "",
+                "salutation": _safe_get(e, "Salutation") or "",
+                "initials": _safe_get(e, "Initials") or "",
+                "phone": _safe_get(e, "Phone") or "",
+                "email": _safe_get(e, "Email") or "",
+                "ssn": _safe_get(e, "SSN") or "",
+                "notes": _safe_get(e, "Notes") or "",
+                "address": _address_dict(getattr(e, "EmployeeAddress", None)),
+                "is_active": (_safe_get(e, "IsActive") or "true").lower() in ("true", "1", "yes"),
+            })
+    snapshot["employees"] = employees
+    _emit(f"  Snapshot: {len(employees)} employees", log_fn)
+
+    # --- Other Names ---
+    others = []
+    detail = raw_responses.get("other_names")
+    if detail:
+        for i in range(detail.Count):
+            o = detail.GetAt(i)
+            others.append({
+                "name": _safe_get(o, "Name") or "",
+                "phone": _safe_get(o, "Phone") or "",
+                "alt_phone": _safe_get(o, "AltPhone") or "",
+                "fax": _safe_get(o, "Fax") or "",
+                "email": _safe_get(o, "Email") or "",
+                "contact": _safe_get(o, "Contact") or "",
+                "notes": _safe_get(o, "Notes") or "",
+                "address": _address_dict(getattr(o, "OtherNameAddress", None)),
+                "is_active": (_safe_get(o, "IsActive") or "true").lower() in ("true", "1", "yes"),
+            })
+    snapshot["other_names"] = others
+    _emit(f"  Snapshot: {len(others)} other names", log_fn)
+
+    # --- Items ---
+    items = []
+    detail = raw_responses.get("items")
+    if detail:
+        for i in range(detail.Count):
+            it = detail.GetAt(i)
+            # Polymorphic: find the inner *Ret object
+            inner = it
+            inner_type = "Service"
+            for prop, itype in [
+                ("ItemServiceRet", "Service"),
+                ("ItemNonInventoryRet", "NonInventory"),
+                ("ItemInventoryRet", "Inventory"),
+                ("ItemInventoryAssemblyRet", "InventoryAssembly"),
+                ("ItemDiscountRet", "Discount"),
+                ("ItemPaymentRet", "Payment"),
+                ("ItemSalesTaxRet", "SalesTax"),
+                ("ItemSalesTaxGroupRet", "SalesTaxGroup"),
+                ("ItemGroupRet", "Group"),
+                ("ItemFixedAssetRet", "FixedAsset"),
+                ("ItemSubtotalRet", "Subtotal"),
+                ("ItemOtherChargeRet", "OtherCharge"),
+            ]:
+                v = getattr(it, prop, None)
+                if v is not None:
+                    inner = v
+                    inner_type = itype
+                    break
+            items.append({
+                "name": _safe_get(inner, "FullName") or _safe_get(inner, "Name") or "",
+                "item_type": inner_type,
+                "description": _safe_get(inner, "SalesDesc") or "",
+                "purchase_desc": _safe_get(inner, "PurchaseDesc") or "",
+                "income_account": _safe_get(inner, "IncomeAccountRef.FullName") or _safe_get(inner, "AccountRef.FullName") or "",
+                "asset_account": _safe_get(inner, "AssetAccountRef.FullName") or "",
+                "cogs_account": _safe_get(inner, "COGSAccountRef.FullName") or "",
+                "sales_price": _safe_get_amount(inner, "SalesPrice") or _safe_get_amount(inner, "SalesOrPurchase.Price"),
+                "purchase_cost": _safe_get_amount(inner, "PurchaseCost"),
+                "tax_vendor": _safe_get(inner, "TaxVendorRef.FullName") or "",
+                "sales_tax_code": _safe_get(inner, "SalesTaxCodeRef.FullName") or "",
+                "pref_vendor": _safe_get(inner, "PrefVendorRef.FullName") or "",
+                "reorder_point": _safe_get_amount(inner, "ReorderPoint"),
+                "is_active": (_safe_get(inner, "IsActive") or "true").lower() in ("true", "1", "yes"),
+            })
+    snapshot["items"] = items
+    _emit(f"  Snapshot: {len(items)} items", log_fn)
+
+    # --- Transactions (reuse existing CSV query logic) ---
+    if include_transactions:
+        try:
+            req = _create_request_set(session)
+            tq = req.AppendTransactionQueryRq()
+            try:
+                tq.IncludeLineItems.SetValue(True)
+            except Exception:
+                pass
+            resp_set = session.session_manager.DoRequests(req)
+            resp = resp_set.ResponseList.GetAt(0)
+            txns = []
+            if resp and resp.StatusCode == 0 and resp.Detail:
+                detail = resp.Detail
+                for i in range(detail.Count):
+                    t = detail.GetAt(i)
+                    txns.append({
+                        "type": _safe_get(t, "TxnType") or "",
+                        "date": _safe_get(t, "TxnDate") or "",
+                        "num": _safe_get(t, "RefNumber") or "",
+                        "name": _safe_get(t, "EntityRef.FullName") or "",
+                        "memo": _safe_get(t, "Memo") or "",
+                        "account": _safe_get(t, "AccountRef.FullName") or "",
+                        "amount": _safe_get_amount(t, "Amount"),
+                        "txn_id": _safe_get(t, "TxnID") or "",
+                    })
+            snapshot["transactions"] = txns
+            _emit(f"  Snapshot: {len(txns)} transactions", log_fn)
+        except Exception as exc:  # noqa: BLE001
+            _emit(f"  Snapshot: Transactions FAILED: {exc}", log_fn)
+            snapshot["transactions"] = []
+    else:
+        snapshot["transactions"] = []
+
+    # Write the snapshot
+    with snapshot_path.open("w", encoding="utf-8") as fh:
+        _json.dump(snapshot, fh, indent=2, ensure_ascii=False, default=str)
+
+    total = sum(len(v) for v in snapshot.values() if isinstance(v, list))
+    _emit(f"QBFC: Snapshot written to {snapshot_path} ({total} total records)", log_fn)
+    return snapshot_path
+
+
+# ---------------------------------------------------------------------------
 # High-level orchestrator
 # ---------------------------------------------------------------------------
 
@@ -904,11 +1258,12 @@ def export_company_via_qbfc(
     """Run the full QBFC-based export and return the dict of artifact paths.
 
     Returns the same shape as the legacy UI-automation _export_from_qb2023:
-    {'lists_iif': Path, 'tx_csv': Path, '<ReportName>.pdf': Path, ...}
+    {'lists_iif': Path, 'tx_csv': Path, 'snapshot': Path, '<ReportName>.pdf': Path, ...}
     """
     export_dir.mkdir(parents=True, exist_ok=True)
     lists_iif = export_dir / "all_lists.IIF"
     tx_csv = export_dir / "TransactionList_QB2023.CSV"
+    snapshot_json = export_dir / "company_snapshot.json"
 
     session = open_qbfc_session(qbw_path=qbw_path, log_fn=log_fn)
     report_paths: Dict[str, Path] = {}
@@ -929,6 +1284,17 @@ def export_company_via_qbfc(
             _emit(f"QBFC: Transactions CSV FAILED: {exc} (continuing)", log_fn)
             _emit(_tb.format_exc(), log_fn)
 
+        # Build structured snapshot for QBFC import into QB 2021.
+        # Transactions are already queried above for CSV — but the snapshot
+        # needs its own copy in dict form. The query is fast for lists,
+        # only transactions take time (and we do them in both passes).
+        try:
+            export_snapshot(session, snapshot_json, include_transactions=True, log_fn=log_fn)
+        except Exception as exc:  # noqa: BLE001
+            import traceback as _tb
+            _emit(f"QBFC: Snapshot FAILED: {exc} (continuing)", log_fn)
+            _emit(_tb.format_exc(), log_fn)
+
         try:
             report_paths = export_validation_reports(session, export_dir, log_fn=log_fn)
         except Exception as exc:  # noqa: BLE001
@@ -941,4 +1307,7 @@ def export_company_via_qbfc(
     if not lists_ok:
         raise RuntimeError("QBFC could not export lists — falling back to UI")
 
-    return {"lists_iif": lists_iif, "tx_csv": tx_csv, **report_paths}
+    result = {"lists_iif": lists_iif, "tx_csv": tx_csv, **report_paths}
+    if snapshot_json.exists():
+        result["snapshot"] = snapshot_json
+    return result
