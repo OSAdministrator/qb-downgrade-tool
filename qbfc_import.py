@@ -1,4 +1,4 @@
-"""QBFC-based import module for QuickBooks TimeWarp®.
+"""QBFC-based import module for QuickBooks TimeWarp® by Our System Administrator.
 
 Mirror of qbfc_export.py — uses QBFC Add requests to write lists and
 transactions into a QB 2021 company file.

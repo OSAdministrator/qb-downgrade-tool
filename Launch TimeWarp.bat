@@ -1,6 +1,6 @@
 @echo off
 rem ================================================================
-rem  QuickBooks TimeWarp(R)  —  Launcher
+rem  QuickBooks TimeWarp(R) by Our System Administrator  —  Launcher
 rem
 rem  USAGE:
  rem   1. Double-click this file to open the GUI.
@@ -49,7 +49,7 @@ pause
 exit /b 1
 
 :launch
-echo  Starting QuickBooks TimeWarp...
+echo  Starting QuickBooks TimeWarp by Our System Administrator...
 %PYTHON_CMD% "%~dp0qb_downgrade_gui.py" %*
 
 if %errorlevel% neq 0 (

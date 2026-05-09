@@ -82,7 +82,7 @@ class QBFCSession:
 
 def open_qbfc_session(
     qbw_path: Optional[Path] = None,
-    app_name: str = "QuickBooks TimeWarp",
+    app_name: str = "QuickBooks TimeWarp by OSA",
     log_fn: Optional[LogFn] = None,
     preferred_versions: Tuple[int, ...] = (16, 17, 15, 13),
 ) -> QBFCSession:

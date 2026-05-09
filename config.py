@@ -1,4 +1,4 @@
-"""Configuration management for QuickBooks TimeWarp\u00ae."""
+"""Configuration management for QuickBooks TimeWarp\u00ae by Our System Administrator."""
 
 from __future__ import annotations
 

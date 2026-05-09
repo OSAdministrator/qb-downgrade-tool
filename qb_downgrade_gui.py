@@ -1,4 +1,4 @@
-"""Main tkinter GUI for QuickBooks TimeWarp\u00ae."""
+"""Main tkinter GUI for QuickBooks TimeWarp\u00ae by Our System Administrator."""
 
 from __future__ import annotations
 
@@ -131,7 +131,7 @@ class SettingsDialog(tk.Toplevel):
 class QuickBooksDowngradeGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("QuickBooks TimeWarp\u00ae")
+        self.root.title("QuickBooks TimeWarp\u00ae by Our System Administrator")
         self.root.geometry("1100x650")
 
         self.config_manager = ConfigManager()
@@ -177,7 +177,7 @@ class QuickBooksDowngradeGUI:
         self.drop_frame.pack(fill=tk.X, padx=10, pady=(4, 2))
         self.drop_label = tk.Label(
             self.drop_frame,
-            text="📂  Drag .QBW files onto the Launch TimeWarp icon  —  or click Add QBW Files above",
+            text="📂  Drag .QBW files onto Launch TimeWarp  —  or click Add QBW Files above",
             bg="#2a3a4a", fg="#8ab4d8", font=("Segoe UI", 10),
             padx=20, pady=10, cursor="hand2",
         )
@@ -231,6 +231,22 @@ class QuickBooksDowngradeGUI:
         scroll = ttk.Scrollbar(log_frame, orient=VERTICAL, command=self.log_text.yview)
         scroll.pack(side=RIGHT, fill=tk.Y)
         self.log_text.configure(yscrollcommand=scroll.set)
+
+        # Branded footer — every window is a billboard
+        footer = tk.Frame(self.root, bg="#1e293b")
+        footer.pack(fill=tk.X, side=tk.BOTTOM)
+        tk.Label(
+            footer,
+            text="oursystemadmin.com  •  liveremotesupport.com",
+            bg="#1e293b", fg="#64748b", font=("Segoe UI", 8),
+            padx=10, pady=4, cursor="hand2",
+        ).pack(side=LEFT)
+        tk.Label(
+            footer,
+            text="© 2026 Our System Administrator, LLC",
+            bg="#1e293b", fg="#64748b", font=("Segoe UI", 8),
+            padx=10, pady=4,
+        ).pack(side=RIGHT)
 
     def _setup_dnd(self) -> None:
         """Enable native Windows drag-and-drop INTO the GUI if windnd is available.
