@@ -1792,36 +1792,25 @@ class QuickBooksAutomationEngine:
         # ------------------------------------------------------------------
         # QBFC SDK path (preferred)
         # ------------------------------------------------------------------
+        # By the time _export_from_qb2023 is called, the orchestrator has
+        # already launched QB, waited for the user to enter the password
+        # manually, and confirmed the company is fully loaded. We just
+        # connect QBFC to the already-open company file — no UI at all.
+        # ------------------------------------------------------------------
         if not self.config.dry_run:
             try:
                 from qbfc_export import export_company_via_qbfc  # local import to avoid mandatory dep
 
-                # Make sure QB is up and the company is open before binding QBFC.
-                # The legacy launch/handoff path ensures QB has been started with
-                # the .qbw file as a CLI argument, so by the time we get here QB
-                # should have the company loaded (or be prompting for password).
-                self._handle_startup_dialogs(job.password, timeout_s=30, log_fn=log_fn)
-                main_window = self._find_qb_main_window(self._qb2023_app, "2023", self.config.timeouts.launch_qb_seconds)
-                self._dismiss_common_dialogs(log_fn)
-                company_hint = job.qbw_path.stem.split(" ")[0]
-                if not (self._startup_password_handled or self._is_company_already_open(main_window, company_hint)):
-                    self._emit("QBFC: Company not yet open, opening via UI first...", log_fn)
-                    self._open_company_file(
-                        main_window,
-                        job.qbw_path,
-                        job.password,
-                        timeout_s=self.config.timeouts.open_company_seconds,
-                        log_fn=log_fn,
-                    )
-                    time.sleep(3)
-
                 self._emit("=== Attempting QBFC SDK export ===", log_fn)
+                self._emit("  (Company should already be open — user entered password manually)", log_fn)
                 # qbw_path=None tells QBFC to bind to whatever file is currently open.
                 results = export_company_via_qbfc(qbw_path=None, export_dir=export_dir, log_fn=log_fn)
                 self._emit("=== QBFC SDK export succeeded ===", log_fn)
                 return results
             except Exception as exc:  # noqa: BLE001
+                import traceback as _tb
                 self._emit(f"QBFC export failed: {exc}", log_fn)
+                self._emit(_tb.format_exc(), log_fn)
                 self._emit("Falling back to legacy UI automation export path", log_fn)
 
         if self.config.dry_run:
