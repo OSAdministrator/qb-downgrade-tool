@@ -1,4 +1,4 @@
-"""Main tkinter GUI for QuickBooks Downgrade Tool."""
+"""Main tkinter GUI for QuickBooks TimeWarp\u00ae."""
 
 from __future__ import annotations
 
@@ -131,7 +131,7 @@ class SettingsDialog(tk.Toplevel):
 class QuickBooksDowngradeGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("QuickBooks Downgrade Tool")
+        self.root.title("QuickBooks TimeWarp\u00ae")
         self.root.geometry("1100x650")
 
         self.config_manager = ConfigManager()
@@ -192,7 +192,16 @@ class QuickBooksDowngradeGUI:
         progress_frame = ttk.Frame(self.root, padding=(10, 4))
         progress_frame.pack(fill=tk.X)
         self.progress = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate")
-        self.progress.pack(fill=tk.X)
+        self.progress.pack(fill=tk.X, side=LEFT, expand=True)
+
+        # Heartbeat / elapsed timer — shows user the process is alive
+        self.elapsed_var = tk.StringVar(value="")
+        self.elapsed_label = ttk.Label(progress_frame, textvariable=self.elapsed_var,
+                                        font=("Segoe UI", 9), width=22, anchor="e")
+        self.elapsed_label.pack(side=RIGHT, padx=(8, 0))
+        self._heartbeat_start: float | None = None
+        self._heartbeat_phase: str = ""
+        self._heartbeat_after_id: str | None = None
 
         log_frame = ttk.LabelFrame(self.root, text="Status Log", padding=8)
         log_frame.pack(fill=BOTH, expand=True, padx=10, pady=8)
@@ -304,6 +313,7 @@ class QuickBooksDowngradeGUI:
 
         self.btn_start.configure(state=tk.DISABLED)
         self.progress["value"] = 0
+        self._start_heartbeat("Starting")
 
         self.worker_thread = threading.Thread(target=self._process_batch, args=(queue_items,), daemon=True)
         self.worker_thread.start()
@@ -340,6 +350,7 @@ class QuickBooksDowngradeGUI:
             self.progress["value"] = (idx / total) * 100
 
         self.btn_start.configure(state=tk.NORMAL)
+        self._stop_heartbeat()
         self._log("Batch processing finished.")
 
     def _set_batch_progress(self, item_index: int, total_items: int, item_percent: float) -> None:
@@ -353,8 +364,60 @@ class QuickBooksDowngradeGUI:
         vals[3] = message
         self.tree.item(row_id, values=vals)
 
+    def _start_heartbeat(self, phase: str = "Processing") -> None:
+        """Start the elapsed-time heartbeat ticker."""
+        import time as _time
+        self._heartbeat_start = _time.time()
+        self._heartbeat_phase = phase
+        self._tick_heartbeat()
+
+    def _tick_heartbeat(self) -> None:
+        """Update elapsed time display every second while processing."""
+        import time as _time
+        if self._heartbeat_start is None:
+            return
+        elapsed = int(_time.time() - self._heartbeat_start)
+        m, s = divmod(elapsed, 60)
+        h, m = divmod(m, 60)
+        if h:
+            elapsed_str = f"{h}:{m:02d}:{s:02d}"
+        else:
+            elapsed_str = f"{m}:{s:02d}"
+
+        # Spinning indicator so user sees it's alive
+        spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        spin_char = spinner[elapsed % len(spinner)]
+
+        self.elapsed_var.set(f"{spin_char} {self._heartbeat_phase} {elapsed_str}")
+        self._heartbeat_after_id = self.root.after(1000, self._tick_heartbeat)
+
+    def _stop_heartbeat(self) -> None:
+        """Stop the heartbeat ticker."""
+        self._heartbeat_start = None
+        if self._heartbeat_after_id:
+            self.root.after_cancel(self._heartbeat_after_id)
+            self._heartbeat_after_id = None
+        self.elapsed_var.set("")
+
+    def _update_heartbeat_phase(self, message: str) -> None:
+        """Auto-detect the current phase from log messages."""
+        lower = message.lower()
+        if "exporting lists" in lower:
+            self._heartbeat_phase = "Exporting Lists"
+        elif "exporting transactions" in lower:
+            self._heartbeat_phase = "Exporting Txns"
+        elif "rendered pdf" in lower or "report" in lower:
+            self._heartbeat_phase = "Generating PDFs"
+        elif "launching" in lower:
+            self._heartbeat_phase = "Launching QB"
+        elif "beginsession" in lower:
+            self._heartbeat_phase = "QBFC Connected"
+        elif "succeeded" in lower or "success" in lower:
+            self._heartbeat_phase = "Complete"
+
     def _log(self, message: str) -> None:
         self.log_queue.put(message)
+        self._update_heartbeat_phase(message)
 
     def _poll_log_queue(self) -> None:
         while True:

@@ -1,4 +1,4 @@
-"""Configuration management for QuickBooks Downgrade Tool."""
+"""Configuration management for QuickBooks TimeWarp\u00ae."""
 
 from __future__ import annotations
 
