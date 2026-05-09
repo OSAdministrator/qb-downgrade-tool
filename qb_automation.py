@@ -2124,9 +2124,15 @@ class QuickBooksAutomationEngine:
             target_dir = job.output_dir / "target"
             validation_dir = job.output_dir / "validation"
 
-            if exports_dir.exists():
-                self._emit(f"Cleaning stale export directory: {exports_dir}", log_fn)
-                shutil.rmtree(exports_dir)
+            # Wipe ALL stale subdirs (exports, target, validation, logs) before run
+            # so a previous failed run never pollutes a fresh attempt.
+            for stale_dir in (exports_dir, target_dir, validation_dir, job.output_dir / "logs"):
+                if stale_dir.exists():
+                    self._emit(f"Cleaning stale directory: {stale_dir}", log_fn)
+                    try:
+                        shutil.rmtree(stale_dir)
+                    except Exception as exc:  # noqa: BLE001
+                        self._emit(f"  WARN: could not remove {stale_dir}: {exc}", log_fn)
             exports_dir.mkdir(parents=True, exist_ok=True)
 
             # 1) Launch QB 2023 with company file as parameter (auto-opens it)
