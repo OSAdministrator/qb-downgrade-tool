@@ -1545,18 +1545,29 @@ class QuickBooksAutomationEngine:
         if send_keys is None:
             raise RuntimeError("Keyboard automation unavailable for PDF report export")
 
-        # Ctrl+P from report. Cannot rely on Windows default printer because
-        # QuickBooks remembers its OWN per-dialog printer preference; we must
-        # explicitly select Microsoft Print to PDF on every invocation.
-        send_keys("^p")
-        time.sleep(1)
+        # ---------------------------------------------------------------
+        # Use QuickBooks' built-in "File -> Save As PDF..." — this skips
+        # the printer dialog ENTIRELY (no AnyDesk/printer-selection
+        # nonsense) and goes straight to a standard Save As dialog,
+        # silent and deterministic.
+        # ---------------------------------------------------------------
+        saved_via_menu = False
+        try:
+            self._invoke_menu(main_window, "File->Save As PDF", "%fa", log_fn)
+            saved_via_menu = True
+        except Exception as exc:  # noqa: BLE001
+            self._emit(f"  File->Save As PDF menu failed ({exc}); falling back to Ctrl+P flow", log_fn)
 
-        print_dlg = self._find_active_dialog(title_re=r"(?i)(print|form name|reports)")
-        if print_dlg is not None:
-            self._focus_window(print_dlg)
-            self._select_pdf_printer_in_print_dialog(print_dlg, log_fn)
-            time.sleep(0.5)
-            self._click_first_button(print_dlg, ["Print", "OK"])
+        if not saved_via_menu:
+            # Fallback: Ctrl+P -> explicit printer selection -> Print
+            send_keys("^p")
+            time.sleep(1)
+            print_dlg = self._find_active_dialog(title_re=r"(?i)(print|form name|reports)")
+            if print_dlg is not None:
+                self._focus_window(print_dlg)
+                self._select_pdf_printer_in_print_dialog(print_dlg, log_fn)
+                time.sleep(0.5)
+                self._click_first_button(print_dlg, ["Print", "OK"])
 
         self._handle_standard_file_dialog(out_pdf, save_mode=True, timeout_s=self.config.timeouts.report_seconds, log_fn=log_fn, parent_window=main_window)
         self._dismiss_common_dialogs(log_fn)
