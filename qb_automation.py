@@ -1802,9 +1802,10 @@ class QuickBooksAutomationEngine:
                 from qbfc_export import export_company_via_qbfc  # local import to avoid mandatory dep
 
                 self._emit("=== Attempting QBFC SDK export ===", log_fn)
-                self._emit("  (Company should already be open — user entered password manually)", log_fn)
-                # qbw_path=None tells QBFC to bind to whatever file is currently open.
-                results = export_company_via_qbfc(qbw_path=None, export_dir=export_dir, log_fn=log_fn)
+                self._emit(f"  Target company file: {qbw_path}", log_fn)
+                # Pass the actual qbw_path so QBFC connects to the correct company
+                # (avoids binding to a previously-open file when QB has multiple windows)
+                results = export_company_via_qbfc(qbw_path=qbw_path, export_dir=export_dir, log_fn=log_fn)
                 self._emit("=== QBFC SDK export succeeded ===", log_fn)
                 return results
             except Exception as exc:  # noqa: BLE001
