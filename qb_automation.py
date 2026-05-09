@@ -1383,8 +1383,36 @@ class QuickBooksAutomationEngine:
                 log_fn,
             )
 
-        # Wait for report window to appear
-        time.sleep(3)
+        # Wait for report window to appear and poll for "Building Report" dialog
+        time.sleep(2)
+        logger.info("Checking for 'Building Report' dialog...")
+        building_dlg = None
+        for _ in range(10):  # Give it 10 seconds to appear
+            try:
+                building_dlg = main_window.child_window(title_re=r"(?i)building.*report", control_type="Window")
+                if building_dlg.exists(timeout=0.5):
+                    logger.info("'Building Report' dialog found - waiting for report to complete...")
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(1)
+
+        # If building dialog appeared, wait for it to finish (with timeout)
+        if building_dlg and building_dlg.exists(timeout=0.5):
+            max_wait = 600  # 10 minutes for large files
+            start_time = time.time()
+            while building_dlg.exists(timeout=1):
+                elapsed = time.time() - start_time
+                if elapsed > max_wait:
+                    raise RuntimeError(f"Report generation exceeded {max_wait}s timeout")
+                logger.info(f"Still building report... ({int(elapsed)}s elapsed)")
+                time.sleep(3)
+            logger.info("Report generation complete")
+            time.sleep(2)  # Let the report window settle
+        else:
+            logger.info("No 'Building Report' dialog detected - report may have loaded instantly")
+            time.sleep(3)
+
         self._dismiss_common_dialogs(log_fn)
 
         # Try to set date range to All
@@ -1404,6 +1432,20 @@ class QuickBooksAutomationEngine:
         # Try Ctrl+E first (Excel export shortcut)
         send_keys("^e")
         time.sleep(2)
+
+        # Verify the export dialog appeared
+        export_dlg = self._find_active_dialog(title_re=r"(?i)(send report|excel|export|save)")
+        if not export_dlg:
+            # Try alternative: File -> Save As
+            logger.warning("Ctrl+E did not open export dialog, trying File menu...")
+            send_keys("%f")  # Alt+F
+            time.sleep(1)
+            send_keys("a")  # Save As
+            time.sleep(1)
+            export_dlg = self._find_active_dialog(title_re=r"(?i)(export|save)")
+            if not export_dlg:
+                raise RuntimeError("Export/Save As dialog did not appear after multiple attempts")
+        logger.info("Export dialog found")
 
         export_dlg = self._find_active_dialog(title_re=r"(?i)(send report|excel|export|save)")
         if export_dlg is not None:
