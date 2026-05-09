@@ -15,4 +15,6 @@ validation/
 *.qbb
 *.qbm
 config.json
+settings.json
 passwords.json
+Output/

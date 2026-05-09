@@ -145,8 +145,11 @@ class QuickBooksDowngradeGUI:
         self.root.after(200, self._poll_log_queue)
 
     def _setup_logging(self) -> None:
-        Path("logs").mkdir(exist_ok=True)
-        log_path = Path("logs") / "qb_downgrade_tool.log"
+        # Logs always go in the program folder, not wherever CWD happens to be
+        program_dir = Path(__file__).resolve().parent
+        log_dir = program_dir / "logs"
+        log_dir.mkdir(exist_ok=True)
+        log_path = log_dir / "qb_downgrade_tool.log"
 
         self.logger = logging.getLogger("qb_downgrade")
         self.logger.setLevel(logging.INFO)
@@ -167,6 +170,22 @@ class QuickBooksDowngradeGUI:
 
         self.btn_start = ttk.Button(top, text="Start Processing", command=self._start_processing)
         self.btn_start.pack(side=RIGHT, padx=4)
+
+        # Drop-zone: visual area that doubles as a click-to-add target.
+        # If tkinterdnd2 is available, actual drag-and-drop works here too.
+        self.drop_frame = tk.Frame(self.root, bg="#2a3a4a", relief="groove", bd=2)
+        self.drop_frame.pack(fill=tk.X, padx=10, pady=(4, 2))
+        self.drop_label = tk.Label(
+            self.drop_frame,
+            text="📂  Drag .QBW files onto the Launch TimeWarp icon  —  or click Add QBW Files above",
+            bg="#2a3a4a", fg="#8ab4d8", font=("Segoe UI", 10),
+            padx=20, pady=10, cursor="hand2",
+        )
+        self.drop_label.pack(fill=tk.X)
+        self.drop_label.bind("<Button-1>", lambda e: self._add_files())
+
+        # Try to enable native drag-and-drop via tkinterdnd2 (optional dependency)
+        self._setup_dnd()
 
         columns = ("file", "password", "status", "message")
         self.tree = ttk.Treeview(self.root, columns=columns, show="headings", height=8)
@@ -212,6 +231,36 @@ class QuickBooksDowngradeGUI:
         scroll = ttk.Scrollbar(log_frame, orient=VERTICAL, command=self.log_text.yview)
         scroll.pack(side=RIGHT, fill=tk.Y)
         self.log_text.configure(yscrollcommand=scroll.set)
+
+    def _setup_dnd(self) -> None:
+        """Enable native Windows drag-and-drop INTO the GUI if windnd is available.
+
+        windnd is a lightweight (<50 KB) package that hooks Windows OLE drag-and-drop.
+        Install with:  pip install windnd
+        If not installed, the GUI still works — just use the bat file or Add button.
+        """
+        try:
+            import windnd  # type: ignore[import-untyped]
+
+            def _on_drop(file_list: list) -> None:
+                added = 0
+                for raw in file_list:
+                    # windnd gives bytes on some versions, str on others
+                    fp = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                    fp = fp.strip().strip('"').strip("'")
+                    if fp.lower().endswith(".qbw"):
+                        self.tree.insert("", END, values=(fp, "", "Queued", ""))
+                        added += 1
+                if added:
+                    self.drop_label.config(text=f"✅  {added} file(s) added — set passwords and click Start")
+                    self._log(f"Drag-and-drop: added {added} .QBW file(s)")
+
+            windnd.hook_dropfiles(self.root, func=_on_drop)
+            self.drop_label.config(
+                text="📂  Drop .QBW files here  —  or click Add QBW Files above"
+            )
+        except ImportError:
+            pass  # windnd not installed — bat file + Add button still work
 
     def _add_files(self) -> None:
         try:
@@ -496,9 +545,14 @@ def main() -> None:
         style.theme_use("vista")
     app = QuickBooksDowngradeGUI(root)
     # Accept command-line file paths to pre-populate the queue
+    # (This is how drag-and-drop onto the .bat launcher works)
+    cli_count = 0
     for arg in sys.argv[1:]:
         if arg.lower().endswith('.qbw'):
             app.tree.insert("", END, values=(arg, "", "Queued", ""))
+            cli_count += 1
+    if cli_count:
+        app.drop_label.config(text=f"✅  {cli_count} file(s) loaded — set passwords and click Start")
     root.mainloop()
 
 

@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any, Dict
 
 
-DEFAULT_CONFIG_PATH = Path.home() / ".qb_downgrade_tool_config.json"
+# Config lives INSIDE the program folder — portable, no hidden files in ~
+_PROGRAM_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATH = _PROGRAM_DIR / "settings.json"
 
 
 @dataclass
@@ -31,7 +33,8 @@ class QBInstallPaths:
 class AppConfig:
     install_paths: QBInstallPaths = field(default_factory=QBInstallPaths)
     timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
-    default_output_dir: str = str(Path.home() / "QBDowngrade_Results")
+    # Output goes to "Output" subfolder inside the program folder — keeps everything together
+    default_output_dir: str = str(_PROGRAM_DIR / "Output")
     retry_attempts: int = 2
     retry_delay_seconds: int = 5
     continue_on_error: bool = True
