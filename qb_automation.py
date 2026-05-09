@@ -629,7 +629,7 @@ class QuickBooksAutomationEngine:
 
         def _cond() -> bool:
             dlg = self._find_active_dialog(
-                title_re=r"(?i)(open|save\s+as|save document|import|export|create company)",
+                title_re=r"(?i)(open|save\s+as|save\s+print|save document|save print output|import|export|create company)",
                 parent_window=parent_window,
             )
             if dlg is not None:
@@ -1551,52 +1551,28 @@ class QuickBooksAutomationEngine:
         # nonsense) and goes straight to a standard Save As dialog,
         # silent and deterministic.
         # ---------------------------------------------------------------
-        saved_via_menu = False
-        # Skip menu_select() and descendants() - both unreliable/slow in QB.
-        # Use direct keyboard navigation: Alt+F opens File menu with "New Company..."
-        # highlighted; press Down 12 times to land on "Save as PDF...", then Enter.
-        # QB File menu order (visible items only, separators auto-skipped by arrows):
-        #   1) New Company...
-        #   2) New Company from Existing Company File...
-        #   3) Open or Restore Company...
-        #   4) Open Previous Company
-        #   5) Open Second Company
-        #   6) Back Up Company
-        #   7) Create Copy...
-        #   8) Close Company
-        #   9) Switch to Multi-user Mode
-        #  10) Utilities
-        #  11) Send Company File
-        #  12) Print Report...
-        #  13) Save as PDF...   <-- target (12 Down presses from item 1)
-        try:
-            self._focus_window(main_window)
-            send_keys("%f")
+        # Strategy: Use Ctrl+P with Microsoft Print to PDF as the system default
+        # printer. This is the most reliable approach because:
+        #   - Ctrl+P is a universal QB shortcut, works regardless of menu state
+        #   - The File menu order shifts when reports are open (Down*N is brittle)
+        #   - menu_select() and descendants() both fail/hang on QB's UIA tree
+        # The MS Print to PDF printer prompts a "Save Print Output As" dialog
+        # which our _handle_standard_file_dialog handles.
+        self._focus_window(main_window)
+        time.sleep(0.5)
+        send_keys("^p")
+        time.sleep(1.5)
+        print_dlg = self._find_active_dialog(title_re=r"(?i)(print|form name|reports)")
+        if print_dlg is not None:
+            self._focus_window(print_dlg)
+            self._select_pdf_printer_in_print_dialog(print_dlg, log_fn)
             time.sleep(0.5)
-            # Press Down 12 times to navigate to "Save as PDF..."
-            send_keys("{DOWN 12}", pause=0.05)
-            time.sleep(0.3)
-            send_keys("{ENTER}")
-            self._emit("  Invoked 'Save as PDF...' via keyboard navigation (Alt+F, Down*12, Enter)", log_fn)
-            saved_via_menu = True
-            time.sleep(1)
-        except Exception as exc:  # noqa: BLE001
-            self._emit(f"  Keyboard navigation to Save as PDF failed: {exc}", log_fn)
-            try:
-                send_keys("{ESC}")
-            except Exception:  # noqa: BLE001
-                pass
-
-        if not saved_via_menu:
-            # Fallback: Ctrl+P -> explicit printer selection -> Print
-            send_keys("^p")
-            time.sleep(1)
-            print_dlg = self._find_active_dialog(title_re=r"(?i)(print|form name|reports)")
-            if print_dlg is not None:
-                self._focus_window(print_dlg)
-                self._select_pdf_printer_in_print_dialog(print_dlg, log_fn)
-                time.sleep(0.5)
-                self._click_first_button(print_dlg, ["Print", "OK"])
+            if not self._click_first_button(print_dlg, ["Print", "OK"]):
+                send_keys("{ENTER}")
+            self._emit("  Invoked Print -> Microsoft Print to PDF", log_fn)
+        else:
+            self._emit("  WARNING: Print dialog not detected after Ctrl+P", log_fn)
+            send_keys("{ENTER}")  # Try anyway
 
         self._handle_standard_file_dialog(out_pdf, save_mode=True, timeout_s=self.config.timeouts.report_seconds, log_fn=log_fn, parent_window=main_window)
         self._dismiss_common_dialogs(log_fn)
