@@ -1552,11 +1552,55 @@ class QuickBooksAutomationEngine:
         # silent and deterministic.
         # ---------------------------------------------------------------
         saved_via_menu = False
-        try:
-            self._invoke_menu(main_window, "File->Save As PDF", "%fa", log_fn)
-            saved_via_menu = True
-        except Exception as exc:  # noqa: BLE001
-            self._emit(f"  File->Save As PDF menu failed ({exc}); falling back to Ctrl+P flow", log_fn)
+        # Try the exact menu names QuickBooks uses (with ellipsis, lowercase 'as')
+        menu_attempts = [
+            "File->Save as PDF...",
+            "&File->Save as &PDF...",
+            "File->Save As PDF...",
+            "File->Save as PDF",
+        ]
+        for menu_path in menu_attempts:
+            try:
+                self._focus_window(main_window)
+                main_window.menu_select(menu_path)
+                self._emit(f"  Invoked menu: {menu_path}", log_fn)
+                saved_via_menu = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                self._emit(f"  menu_select '{menu_path}' failed: {exc}", log_fn)
+
+        if not saved_via_menu:
+            # Try opening File menu and clicking 'Save as PDF...' by UIA descendant search
+            try:
+                self._focus_window(main_window)
+                send_keys("%f")
+                time.sleep(0.5)
+                # Look for the menu item by name across descendants
+                for ctrl in main_window.descendants(control_type="MenuItem"):
+                    try:
+                        name = ctrl.window_text() or ""
+                    except Exception:  # noqa: BLE001
+                        name = ""
+                    if "save as pdf" in name.lower():
+                        try:
+                            ctrl.invoke()
+                        except Exception:  # noqa: BLE001
+                            try:
+                                ctrl.click_input()
+                            except Exception:  # noqa: BLE001
+                                continue
+                        self._emit(f"  Clicked menu item: {name}", log_fn)
+                        saved_via_menu = True
+                        break
+                if not saved_via_menu:
+                    # close the open File menu
+                    send_keys("{ESC}")
+            except Exception as exc:  # noqa: BLE001
+                self._emit(f"  Descendant menu-item click failed: {exc}", log_fn)
+                try:
+                    send_keys("{ESC}")
+                except Exception:  # noqa: BLE001
+                    pass
 
         if not saved_via_menu:
             # Fallback: Ctrl+P -> explicit printer selection -> Print
