@@ -189,20 +189,32 @@ def get_workspace_root() -> Path:
     - Flash drive mode: returns the workspace partition root (e.g. F:/)
     - Normal mode: returns the program directory (dev/desktop deployment)
 
+    SAFETY: Only uses a partition as workspace if it contains a
+    `.timewarp_workspace` marker file. This prevents accidentally writing
+    to a customer's Recovery partition or other random partition that
+    happens to be P3 on their disk. When you stamp a flash drive, you
+    drop this marker on the workspace partition. No marker = normal mode.
+
     This is THE function everything else should call.
     """
     try:
         layout = get_drive_layout()
         if layout["is_flash_drive"] and layout["workspace_drive"]:
             ws = Path(f"{layout['workspace_drive']}:/")
-            # Verify it's actually writable
-            test_file = ws / ".tw_write_test"
-            try:
-                test_file.write_text("ok", encoding="utf-8")
-                test_file.unlink()
-                return ws
-            except OSError:
-                pass  # Partition exists but not writable — fall through
+            marker = ws / ".timewarp_workspace"
+            if not marker.exists():
+                # No marker = not our stamped drive, could be a customer's
+                # Recovery partition or anything. Fall through to folder mode.
+                pass
+            else:
+                # Marker found — verify it's actually writable
+                test_file = ws / ".tw_write_test"
+                try:
+                    test_file.write_text("ok", encoding="utf-8")
+                    test_file.unlink()
+                    return ws
+                except OSError:
+                    pass  # Partition exists but not writable — fall through
     except Exception:
         pass  # PowerShell not available, Linux dev, etc.
 
@@ -240,10 +252,18 @@ def print_layout() -> None:
     print("=" * 50)
 
     if layout["is_flash_drive"]:
+        ws_path = Path(f"{layout['workspace_drive']}:/")
+        marker = ws_path / ".timewarp_workspace"
+        has_marker = marker.exists()
         print(f"  Mode           : Flash Drive")
         print(f"  Physical Disk  : Disk {layout['disk_number']}")
         print(f"  Code Partition : {layout['code_drive']}:\\  (read-only)")
         print(f"  Workspace      : {layout['workspace_drive']}:\\  (writable)")
+        print(f"  Marker File    : {'FOUND' if has_marker else 'MISSING — using folder mode'}")
+        if not has_marker:
+            print(f"")
+            print(f"  NOTE: To enable flash drive mode, create an empty file:")
+            print(f"         {marker}")
         if layout["backup_drive"]:
             print(f"  Backup         : {layout['backup_drive']}:\\")
     else:
