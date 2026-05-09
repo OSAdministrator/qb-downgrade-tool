@@ -1807,12 +1807,10 @@ class QuickBooksAutomationEngine:
             log_fn,
         )
 
-        self._with_retries(
-            lambda: self._export_transaction_list_csv(main_window, tx_csv, log_fn),
-            "Export transaction report CSV",
-            log_fn,
-        )
-
+        # Export report PDFs BEFORE the transaction CSV, because the CSV
+        # export can take a very long time (Building Report dialog) and is the
+        # most failure-prone step.  Getting reports first ensures we have them
+        # even if the CSV step times out.
         report_exports = {
             "TrialBalance_QB2023.pdf": (
                 "Reports->Accountant & Taxes->Trial Balance",
@@ -1851,6 +1849,15 @@ class QuickBooksAutomationEngine:
                 log_fn,
             )
             generated_report_paths[report_file] = out_path
+
+        # Transaction CSV export is last — it's the slowest step and may
+        # trigger a long "Building Report" dialog.  The timeout/polling
+        # improvements in _export_transaction_list_csv handle this gracefully.
+        self._with_retries(
+            lambda: self._export_transaction_list_csv(main_window, tx_csv, log_fn),
+            "Export transaction report CSV",
+            log_fn,
+        )
 
         return {
             "lists_iif": lists_iif,
