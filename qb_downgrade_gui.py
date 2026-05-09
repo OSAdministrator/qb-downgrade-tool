@@ -204,9 +204,31 @@ class QuickBooksDowngradeGUI:
         self.log_text.configure(yscrollcommand=scroll.set)
 
     def _add_files(self) -> None:
-        files = filedialog.askopenfilenames(filetypes=[("QuickBooks Company", "*.qbw")])
-        for f in files:
-            self.tree.insert("", END, values=(f, "", "Queued", ""))
+        try:
+            files = filedialog.askopenfilenames(filetypes=[("QuickBooks Company", "*.qbw")])
+            for f in files:
+                self.tree.insert("", END, values=(f, "", "Queued", ""))
+        except Exception:
+            pass
+        # If no files were added (e.g. file-in-use error), offer manual path entry
+        if not self.tree.get_children():
+            self._add_file_manually()
+
+    def _add_file_manually(self) -> None:
+        """Allow typing a file path directly — bypasses file-in-use locks."""
+        from tkinter import simpledialog
+        path = simpledialog.askstring(
+            "Add QBW File",
+            "Enter the full path to the .qbw file:\n\n"
+            "(Use this when the file is already open in QuickBooks)",
+            parent=self.root
+        )
+        if path and path.strip():
+            path = path.strip().strip('"').strip("'")
+            if os.path.exists(path) or path.lower().endswith('.qbw'):
+                self.tree.insert("", END, values=(path, "", "Queued", ""))
+            else:
+                messagebox.showwarning("Invalid Path", f"File not found: {path}")
 
     def _remove_selected(self) -> None:
         for row in self.tree.selection():
