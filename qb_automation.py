@@ -266,7 +266,9 @@ class QuickBooksAutomationEngine:
                     return w
                 except Exception:  # noqa: BLE001
                     continue
-            return None
+            # Fall through to desktop-level search: Windows common dialogs
+            # (Save Print Output As, Open, etc.) are top-level windows, NOT
+            # children of QB main_window, so we must also check Desktop().windows().
 
         # Fallback: search top-level desktop windows (for dialogs not tied to a parent)
         desktop = self._get_desktop()
