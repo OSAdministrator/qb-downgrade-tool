@@ -764,14 +764,34 @@ def export_company_via_qbfc(
     tx_csv = export_dir / "TransactionList_QB2023.CSV"
 
     session = open_qbfc_session(qbw_path=qbw_path, log_fn=log_fn)
+    report_paths: Dict[str, Path] = {}
+    lists_ok = False
     try:
-        export_lists_to_iif(session, lists_iif, log_fn=log_fn)
+        try:
+            export_lists_to_iif(session, lists_iif, log_fn=log_fn)
+            lists_ok = True
+        except Exception as exc:  # noqa: BLE001
+            import traceback as _tb
+            _emit(f"QBFC: Lists IIF FAILED: {exc}", log_fn)
+            _emit(_tb.format_exc(), log_fn)
+
         try:
             export_transactions_to_csv(session, tx_csv, log_fn=log_fn)
         except Exception as exc:  # noqa: BLE001
-            _emit(f"QBFC: Transactions CSV failed: {exc} (continuing)", log_fn)
-        report_paths = export_validation_reports(session, export_dir, log_fn=log_fn)
+            import traceback as _tb
+            _emit(f"QBFC: Transactions CSV FAILED: {exc} (continuing)", log_fn)
+            _emit(_tb.format_exc(), log_fn)
+
+        try:
+            report_paths = export_validation_reports(session, export_dir, log_fn=log_fn)
+        except Exception as exc:  # noqa: BLE001
+            import traceback as _tb
+            _emit(f"QBFC: Reports FAILED: {exc} (continuing)", log_fn)
+            _emit(_tb.format_exc(), log_fn)
     finally:
         session.end()
+
+    if not lists_ok:
+        raise RuntimeError("QBFC could not export lists — falling back to UI")
 
     return {"lists_iif": lists_iif, "tx_csv": tx_csv, **report_paths}
