@@ -367,8 +367,66 @@ class QuickBooksDowngradeGUI:
         self.root.after(200, self._poll_log_queue)
 
 
+def _auto_update() -> None:
+    """Check for updates on GitHub and pull if behind. Runs before GUI launches."""
+    import subprocess
+    import sys
+
+    script_dir = Path(__file__).resolve().parent
+
+    # Make sure we're in a git repo
+    if not (script_dir / ".git").exists():
+        return
+
+    try:
+        # Fetch latest from remote (silent)
+        subprocess.run(
+            ["git", "fetch", "--quiet"],
+            cwd=str(script_dir), capture_output=True, timeout=15
+        )
+
+        # Compare local HEAD vs remote tracking branch
+        local = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(script_dir), capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+
+        remote = subprocess.run(
+            ["git", "rev-parse", "@{u}"],
+            cwd=str(script_dir), capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+
+        if local == remote:
+            print("[Auto-Update] Already up to date.")
+            return
+
+        print(f"[Auto-Update] Update available: {local[:8]} -> {remote[:8]}")
+        print("[Auto-Update] Pulling latest changes...")
+
+        result = subprocess.run(
+            ["git", "pull", "--ff-only"],
+            cwd=str(script_dir), capture_output=True, text=True, timeout=30
+        )
+        print(result.stdout)
+
+        if result.returncode == 0:
+            print("[Auto-Update] Updated successfully. Restarting...")
+            # Re-launch ourselves with the same arguments
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+            # execv replaces the process — code below never runs
+        else:
+            print(f"[Auto-Update] Pull failed (non-fatal): {result.stderr}")
+
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Auto-Update] Check failed (non-fatal): {exc}")
+
+
 def main() -> None:
     import sys
+
+    # Auto-update from git before launching GUI
+    _auto_update()
+
     root = tk.Tk()
     style = ttk.Style(root)
     if "vista" in style.theme_names():
