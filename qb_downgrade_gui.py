@@ -367,11 +367,16 @@ class QuickBooksDowngradeGUI:
 
 
 def main() -> None:
+    import sys
     root = tk.Tk()
     style = ttk.Style(root)
     if "vista" in style.theme_names():
         style.theme_use("vista")
     app = QuickBooksDowngradeGUI(root)
+    # Accept command-line file paths to pre-populate the queue
+    for arg in sys.argv[1:]:
+        if arg.lower().endswith('.qbw'):
+            app.tree.insert("", END, values=(arg, "", "Queued", ""))
     root.mainloop()
 
 
