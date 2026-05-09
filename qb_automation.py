@@ -1552,55 +1552,40 @@ class QuickBooksAutomationEngine:
         # silent and deterministic.
         # ---------------------------------------------------------------
         saved_via_menu = False
-        # Try the exact menu names QuickBooks uses (with ellipsis, lowercase 'as')
-        menu_attempts = [
-            "File->Save as PDF...",
-            "&File->Save as &PDF...",
-            "File->Save As PDF...",
-            "File->Save as PDF",
-        ]
-        for menu_path in menu_attempts:
+        # Skip menu_select() and descendants() - both unreliable/slow in QB.
+        # Use direct keyboard navigation: Alt+F opens File menu with "New Company..."
+        # highlighted; press Down 12 times to land on "Save as PDF...", then Enter.
+        # QB File menu order (visible items only, separators auto-skipped by arrows):
+        #   1) New Company...
+        #   2) New Company from Existing Company File...
+        #   3) Open or Restore Company...
+        #   4) Open Previous Company
+        #   5) Open Second Company
+        #   6) Back Up Company
+        #   7) Create Copy...
+        #   8) Close Company
+        #   9) Switch to Multi-user Mode
+        #  10) Utilities
+        #  11) Send Company File
+        #  12) Print Report...
+        #  13) Save as PDF...   <-- target (12 Down presses from item 1)
+        try:
+            self._focus_window(main_window)
+            send_keys("%f")
+            time.sleep(0.5)
+            # Press Down 12 times to navigate to "Save as PDF..."
+            send_keys("{DOWN 12}", pause=0.05)
+            time.sleep(0.3)
+            send_keys("{ENTER}")
+            self._emit("  Invoked 'Save as PDF...' via keyboard navigation (Alt+F, Down*12, Enter)", log_fn)
+            saved_via_menu = True
+            time.sleep(1)
+        except Exception as exc:  # noqa: BLE001
+            self._emit(f"  Keyboard navigation to Save as PDF failed: {exc}", log_fn)
             try:
-                self._focus_window(main_window)
-                main_window.menu_select(menu_path)
-                self._emit(f"  Invoked menu: {menu_path}", log_fn)
-                saved_via_menu = True
-                break
-            except Exception as exc:  # noqa: BLE001
-                self._emit(f"  menu_select '{menu_path}' failed: {exc}", log_fn)
-
-        if not saved_via_menu:
-            # Try opening File menu and clicking 'Save as PDF...' by UIA descendant search
-            try:
-                self._focus_window(main_window)
-                send_keys("%f")
-                time.sleep(0.5)
-                # Look for the menu item by name across descendants
-                for ctrl in main_window.descendants(control_type="MenuItem"):
-                    try:
-                        name = ctrl.window_text() or ""
-                    except Exception:  # noqa: BLE001
-                        name = ""
-                    if "save as pdf" in name.lower():
-                        try:
-                            ctrl.invoke()
-                        except Exception:  # noqa: BLE001
-                            try:
-                                ctrl.click_input()
-                            except Exception:  # noqa: BLE001
-                                continue
-                        self._emit(f"  Clicked menu item: {name}", log_fn)
-                        saved_via_menu = True
-                        break
-                if not saved_via_menu:
-                    # close the open File menu
-                    send_keys("{ESC}")
-            except Exception as exc:  # noqa: BLE001
-                self._emit(f"  Descendant menu-item click failed: {exc}", log_fn)
-                try:
-                    send_keys("{ESC}")
-                except Exception:  # noqa: BLE001
-                    pass
+                send_keys("{ESC}")
+            except Exception:  # noqa: BLE001
+                pass
 
         if not saved_via_menu:
             # Fallback: Ctrl+P -> explicit printer selection -> Print
