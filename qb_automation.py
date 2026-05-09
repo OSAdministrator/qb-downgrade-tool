@@ -1603,8 +1603,35 @@ class QuickBooksAutomationEngine:
 
         self._ensure_automation_ready()
 
-        # Check if QB is already running by looking for its window
         exe_name = Path(exe_path).name
+
+        # When launching with a specific company file, KILL any existing QB
+        # instance first. This prevents the "Secondary" window problem where
+        # QB opens the new file as a secondary window while the old file
+        # remains the primary — QBFC then connects to the wrong company.
+        if qbw_path:
+            try:
+                existing = Application(backend="uia").connect(path=exe_path)
+                self._emit(f"  Killing existing QB instance before clean launch...", log_fn)
+                self._close_qb(existing, log_fn)
+                time.sleep(5)  # give QB time to fully exit
+            except Exception:  # noqa: BLE001
+                pass  # not running — good
+
+            # Also force-kill any lingering QB processes
+            import subprocess
+            subprocess.run(
+                ["taskkill", "/F", "/IM", exe_name],
+                capture_output=True, timeout=10
+            )
+            time.sleep(3)
+
+            cmd_line = f'"{exe_path}" "{qbw_path}"'
+            self._emit(f"  Starting QB with command: {cmd_line}", log_fn)
+            app = Application(backend="uia").start(cmd_line)
+            return app
+
+        # No qbw_path — connect to existing or launch fresh
         try:
             app = Application(backend="uia").connect(path=exe_path)
             self._emit(f"Connected to already-running QuickBooks: {exe_name}", log_fn)
@@ -1612,13 +1639,7 @@ class QuickBooksAutomationEngine:
         except Exception:  # noqa: BLE001
             pass
 
-        # Not running – start it, optionally with the .qbw path as argument
-        if qbw_path:
-            cmd_line = f'"{exe_path}" "{qbw_path}"'
-            self._emit(f"  Starting QB with command: {cmd_line}", log_fn)
-            app = Application(backend="uia").start(cmd_line)
-        else:
-            app = Application(backend="uia").start(exe_path)
+        app = Application(backend="uia").start(exe_path)
         return app
 
     def _close_qb(self, app: Optional[object], log_fn: Optional[LogFn]) -> None:
