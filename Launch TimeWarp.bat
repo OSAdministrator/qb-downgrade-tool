@@ -50,6 +50,10 @@ exit /b 1
 
 :launch
 echo  Starting QuickBooks TimeWarp by Our System Administrator...
+echo.
+echo  Detecting drive layout...
+%PYTHON_CMD% "%~dp0drive_layout.py"
+echo.
 %PYTHON_CMD% "%~dp0qb_downgrade_gui.py" %*
 
 if %errorlevel% neq 0 (

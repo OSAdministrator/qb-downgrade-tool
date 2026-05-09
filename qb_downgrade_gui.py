@@ -145,10 +145,13 @@ class QuickBooksDowngradeGUI:
         self.root.after(200, self._poll_log_queue)
 
     def _setup_logging(self) -> None:
-        # Logs always go in the program folder, not wherever CWD happens to be
-        program_dir = Path(__file__).resolve().parent
-        log_dir = program_dir / "logs"
-        log_dir.mkdir(exist_ok=True)
+        # Logs go to workspace (flash drive partition or program folder — auto-detected)
+        try:
+            from drive_layout import get_workspace_paths
+            log_dir = get_workspace_paths()["log_dir"]
+        except Exception:
+            log_dir = Path(__file__).resolve().parent / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / "qb_downgrade_tool.log"
 
         self.logger = logging.getLogger("qb_downgrade")

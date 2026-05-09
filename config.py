@@ -8,9 +8,18 @@ from pathlib import Path
 from typing import Any, Dict
 
 
-# Config lives INSIDE the program folder — portable, no hidden files in ~
+# Discover workspace: flash drive partition or program folder (auto-detected)
 _PROGRAM_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = _PROGRAM_DIR / "settings.json"
+try:
+    from drive_layout import get_workspace_paths as _get_ws
+    _WORKSPACE = _get_ws()
+except Exception:
+    _WORKSPACE = {
+        "settings_file": _PROGRAM_DIR / "settings.json",
+        "output_dir": _PROGRAM_DIR / "Output",
+        "log_dir": _PROGRAM_DIR / "logs",
+    }
+DEFAULT_CONFIG_PATH = _WORKSPACE["settings_file"]
 
 
 @dataclass
@@ -33,8 +42,8 @@ class QBInstallPaths:
 class AppConfig:
     install_paths: QBInstallPaths = field(default_factory=QBInstallPaths)
     timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
-    # Output goes to "Output" subfolder inside the program folder — keeps everything together
-    default_output_dir: str = str(_PROGRAM_DIR / "Output")
+    # Output goes to workspace (flash drive partition or program folder — auto-detected)
+    default_output_dir: str = str(_WORKSPACE["output_dir"])
     retry_attempts: int = 2
     retry_delay_seconds: int = 5
     continue_on_error: bool = True
