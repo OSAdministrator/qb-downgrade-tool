@@ -1482,6 +1482,62 @@ class QuickBooksAutomationEngine:
             time.sleep(1)
             self._dismiss_common_dialogs(log_fn)
 
+    def _select_pdf_printer_in_print_dialog(self, print_dlg, log_fn: Optional[LogFn]) -> bool:
+        """Explicitly select 'Microsoft Print to PDF' in the QB Print dialog.
+
+        QB stores its OWN per-dialog printer preference independent of the
+        Windows default, so we must select the PDF printer on every print
+        action.  Tries the ComboBox UIA control first, then falls back to
+        keyboard navigation (Alt+P focuses Printer combo in QB Print Reports).
+
+        Returns True if the printer was selected, False otherwise.
+        """
+        target_substring = "microsoft print to pdf"
+
+        # Attempt 1: find ComboBox(es) and try .select() with several patterns
+        try:
+            for combo in print_dlg.descendants(control_type="ComboBox"):
+                try:
+                    items = combo.texts() if hasattr(combo, "texts") else []
+                except Exception:  # noqa: BLE001
+                    items = []
+                # Try every dropdown option that contains our substring
+                candidates = [t for t in items if t and target_substring in t.lower()]
+                for candidate in candidates:
+                    try:
+                        combo.select(candidate)
+                        self._emit(f"  Selected printer: {candidate}", log_fn)
+                        return True
+                    except Exception:  # noqa: BLE001
+                        continue
+                # Try generic select call as last resort on this combo
+                try:
+                    combo.select("Microsoft Print to PDF")
+                    self._emit("  Selected printer: Microsoft Print to PDF (combo.select)", log_fn)
+                    return True
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            self._emit(f"  ComboBox enumeration failed: {exc}", log_fn)
+
+        # Attempt 2: keyboard fallback — Alt+P focuses Printer combo in
+        # QB's Print Reports dialog.  Type the printer name; Windows
+        # combo boxes will auto-complete to the first match.
+        if send_keys is not None:
+            try:
+                self._focus_window(print_dlg)
+                send_keys("%p")  # Alt+P -> Printer combo
+                time.sleep(0.3)
+                # Clear by pressing Home and selecting all (combo auto-selects)
+                send_keys("Microsoft Print to PDF")
+                time.sleep(0.3)
+                self._emit("  Selected printer via keyboard fallback", log_fn)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                self._emit(f"  Keyboard printer-select fallback failed: {exc}", log_fn)
+
+        return False
+
     def _export_report_pdf(self, main_window, report_menu_path: str, fallback_keys: str, out_pdf: Path, log_fn: Optional[LogFn]) -> None:
         self._emit(f"Generating validation report: {out_pdf.name}", log_fn)
         self._open_report(main_window, report_menu_path, fallback_keys, log_fn)
@@ -1489,13 +1545,17 @@ class QuickBooksAutomationEngine:
         if send_keys is None:
             raise RuntimeError("Keyboard automation unavailable for PDF report export")
 
-        # Ctrl+P from report and rely on Microsoft Print to PDF as default printer.
+        # Ctrl+P from report. Cannot rely on Windows default printer because
+        # QuickBooks remembers its OWN per-dialog printer preference; we must
+        # explicitly select Microsoft Print to PDF on every invocation.
         send_keys("^p")
         time.sleep(1)
 
         print_dlg = self._find_active_dialog(title_re=r"(?i)(print|form name|reports)")
         if print_dlg is not None:
             self._focus_window(print_dlg)
+            self._select_pdf_printer_in_print_dialog(print_dlg, log_fn)
+            time.sleep(0.5)
             self._click_first_button(print_dlg, ["Print", "OK"])
 
         self._handle_standard_file_dialog(out_pdf, save_mode=True, timeout_s=self.config.timeouts.report_seconds, log_fn=log_fn, parent_window=main_window)
