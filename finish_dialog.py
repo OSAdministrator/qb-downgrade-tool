@@ -69,7 +69,7 @@ class FinishDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, result: Any, original_name: str) -> None:
         super().__init__(parent)
         self.title(f"Conversion Complete — {original_name}")
-        self.geometry("640x500")
+        self.geometry("640x580")
         self.configure(bg="#0f172a")
         self.resizable(False, False)
 
@@ -140,6 +140,20 @@ class FinishDialog(tk.Toplevel):
                   font=("Segoe UI", 11, "bold"),
                   relief="flat", padx=14, pady=8, cursor="hand2",
                   ).pack(fill=X, pady=(10, 4))
+
+        # Password reminder
+        pw_note = tk.Frame(body, bg="#1e293b", padx=10, pady=8)
+        pw_note.pack(fill=X, pady=(8, 4))
+        tk.Label(pw_note, text="🔑  Password Note:",
+                 bg="#1e293b", fg="#fbbf24",
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        tk.Label(pw_note,
+                 text="The converted file uses the template password. To change it:\n"
+                      "Open the file in QuickBooks 2021 → Company → "
+                      "Set Up Users and Passwords → Change Your Password",
+                 bg="#1e293b", fg="#94a3b8",
+                 font=("Segoe UI", 8), justify="left",
+                 wraplength=560).pack(anchor="w", pady=(2, 0))
 
         # Review prompt
         review_frame = tk.Frame(body, bg="#0f172a")
