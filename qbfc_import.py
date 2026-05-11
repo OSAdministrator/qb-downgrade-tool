@@ -661,33 +661,49 @@ def _guess_account_type(name: str) -> int:
 
 def _list_existing_accounts(session: Any, log_fn: Optional[LogFn] = None) -> set:
     """Query QB for all existing account FullNames (lowercase set)."""
+    names, _ = _list_accounts_with_types(session, log_fn)
+    return names
+
+
+# Module-level cache populated during pre-flight
+_ACCOUNT_TYPE_CACHE: Dict[str, int] = {}
+
+
+def _list_accounts_with_types(session: Any, log_fn: Optional[LogFn] = None):
+    """Query QB for accounts and return (name_set, name->type_int dict)."""
     names = set()
+    types: Dict[str, int] = {}
     try:
         req = _create_request_set(session)
-        # Plain query — do NOT use IncludeRetElementList (COM issues)
         req.AppendAccountQueryRq()
         resp_set = session.session_manager.DoRequests(req)
         resp = resp_set.ResponseList.GetAt(0)
         if resp.StatusCode != 0:
             _emit(f"  WARN: AccountQuery failed: {resp.StatusCode} {resp.StatusMessage}", log_fn)
-            return names
+            return names, types
         if resp.Detail is None:
             _emit(f"  WARN: AccountQuery returned no Detail", log_fn)
-            return names
+            return names, types
         lst = resp.Detail
-        count = lst.Count
-        for i in range(count):
+        for i in range(lst.Count):
             acct = lst.GetAt(i)
             try:
                 fn = acct.FullName.GetValue()
-                if fn:
-                    names.add(fn.strip().lower())
+                if not fn:
+                    continue
+                key = fn.strip().lower()
+                names.add(key)
+                try:
+                    t = acct.AccountType.GetValue()
+                    types[key] = int(t)
+                except Exception:
+                    pass
             except Exception as exc:
-                _emit(f"  WARN: Could not read account #{i} FullName: {exc}", log_fn)
+                _emit(f"  WARN: Could not read account #{i}: {exc}", log_fn)
         _emit(f"  AccountQuery: found {len(names)} existing accounts in QB", log_fn)
     except Exception as exc:
         _emit(f"  ERROR: AccountQuery exception: {exc}", log_fn)
-    return names
+    return names, types
 
 
 def _create_account_stub(session: Any, name: str, existing: set,
@@ -757,7 +773,9 @@ def _ensure_referenced_accounts(session: Any, transactions: List[Dict], log_fn: 
         return 0
 
     _emit(f"QBFC Import: Pre-flight — checking {len(refs)} unique account references...", log_fn)
-    existing = _list_existing_accounts(session, log_fn)
+    existing, types = _list_accounts_with_types(session, log_fn)
+    _ACCOUNT_TYPE_CACHE.clear()
+    _ACCOUNT_TYPE_CACHE.update(types)
     missing = [a for a in refs if a.strip().lower() not in existing]
     if not missing:
         _emit(f"QBFC Import: All {len(refs)} referenced accounts exist.", log_fn)
@@ -774,6 +792,8 @@ def _ensure_referenced_accounts(session: Any, transactions: List[Dict], log_fn: 
     for name in missing:
         if _create_account_stub(session, name, existing, log_fn):
             created += 1
+            # Also record the type we created it as
+            _ACCOUNT_TYPE_CACHE[name.strip().lower()] = _guess_account_type(name)
 
     _emit(f"QBFC Import: Auto-created {created}/{len(missing)} stub accounts.", log_fn)
     return created
@@ -875,13 +895,20 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
 
             try:
                 for acct, debit, credit in valid_lines:
-                    # QB requires entity on A/P and A/R lines
-                    acct_lower = acct.lower()
-                    is_ap = 'accounts payable' in acct_lower or acct_lower.startswith('a/p')
-                    is_ar = 'accounts receivable' in acct_lower or acct_lower.startswith('a/r')
+                    # QB requires entity on A/P (type=5) and A/R (type=1) lines.
+                    # Use the cached account type, falling back to name heuristic.
+                    acct_key = acct.strip().lower()
+                    acct_type = _ACCOUNT_TYPE_CACHE.get(acct_key)
+                    if acct_type is None:
+                        acct_lower = acct.lower()
+                        if 'accounts payable' in acct_lower or acct_lower.startswith('a/p'):
+                            acct_type = 5
+                        elif 'accounts receivable' in acct_lower or acct_lower.startswith('a/r'):
+                            acct_type = 1
+                    needs_entity = acct_type in (1, 5)
                     line_entity = entity
-                    if (is_ap or is_ar) and not line_entity:
-                        line_entity = 'TimeWarp Migration' if is_ap else 'TimeWarp Migration'
+                    if needs_entity and not line_entity:
+                        line_entity = 'TimeWarp Migration'
 
                     if debit > 0:
                         ol = je.ORJournalLineList.Append()
