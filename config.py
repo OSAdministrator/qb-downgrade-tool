@@ -81,7 +81,8 @@ class ConfigManager:
             self.save(config)
             return config
 
-        with self.path.open("r", encoding="utf-8") as f:
+        # Use utf-8-sig to tolerate accidental BOM in saved config
+        with self.path.open("r", encoding="utf-8-sig") as f:
             payload = json.load(f)
         return AppConfig.from_dict(payload)
 
