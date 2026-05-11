@@ -2348,21 +2348,18 @@ class QuickBooksAutomationEngine:
             set_progress(9)
 
             generated_files = {
-                "lists_iif": str(exported["lists_iif"]),
-                "tx_csv": str(exported["tx_csv"]),
-                "tx_iif": str(tx_iif),
                 "target_qbw": str(target_qbw),
-                "validation_excel": validation_files["excel"],
-                "validation_html": validation_files["html"],
             }
-            if snapshot_path:
-                generated_files["snapshot"] = str(snapshot_path)
+            # Include whatever the export phase produced
+            for key, val in exported.items():
+                generated_files[key] = str(val)
+            # Validation reports (may not exist on dry-run)
+            if validation_files.get("excel"):
+                generated_files["validation_excel"] = validation_files["excel"]
+            if validation_files.get("html"):
+                generated_files["validation_html"] = validation_files["html"]
             if import_results:
                 generated_files["import_summary"] = str(import_results)
-
-            for key in ["accounts_iif", "customers_iif", "vendors_iif", "items_iif", "employees_iif"]:
-                if key in exported:
-                    generated_files[key] = str(exported[key])
 
             return CompanyJobResult(
                 qbw_path=str(job.qbw_path),
