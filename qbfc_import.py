@@ -1437,6 +1437,47 @@ def import_memorized_transactions(memorized: List[Dict], log_fn: Optional[LogFn]
     return 0
 
 
+def import_accounting_preferences(session: Any, prefs: Dict[str, Any], log_fn: Optional[LogFn] = None) -> int:
+    """Restore Accounting preferences (account numbers, class tracking, etc.).
+
+    MUST be called BEFORE importing accounts — otherwise account numbers
+    are silently accepted but never displayed in the Chart of Accounts.
+    """
+    acct_prefs = (prefs or {}).get("accounting") or {}
+    if not acct_prefs:
+        _emit("  Preferences: no accounting preferences in snapshot", log_fn)
+        return 0
+    try:
+        req = _create_request_set(session)
+        mod = req.AppendPreferencesModRq()
+        ap = getattr(mod, "AccountingPreferences", None)
+        if ap is None:
+            _emit("  Preferences: AccountingPreferences block not exposed by SDK", log_fn)
+            return 0
+
+        _set_if(ap, "IsUsingAccountNumbers",         acct_prefs.get("is_using_account_numbers"))
+        _set_if(ap, "IsRequiringAccounts",            acct_prefs.get("is_requiring_accounts"))
+        _set_if(ap, "IsUsingClassTracking",           acct_prefs.get("is_using_class_tracking"))
+        _set_if(ap, "IsUsingAuditTrail",              acct_prefs.get("is_using_audit_trail"))
+        _set_if(ap, "IsAssigningJournalEntryNumbers", acct_prefs.get("is_assigning_journal_no"))
+        # ClosingDate is read-only via PreferencesMod in most QB versions — skip
+
+        resp_set = session.session_manager.DoRequests(req)
+        resp = resp_set.ResponseList.GetAt(0)
+        if resp is None:
+            _emit("  Preferences: no response for accounting prefs", log_fn)
+            return 0
+        if resp.StatusCode == 0:
+            _emit("  Preferences: Accounting preferences restored (account numbers ON)", log_fn)
+            return 1
+        else:
+            _emit(f"  Preferences: accounting status={resp.StatusCode} msg={resp.StatusMessage}", log_fn)
+            return 0
+    except Exception as exc:  # noqa: BLE001
+        _emit(f"  Preferences: accounting failed: {exc}", log_fn)
+        return 0
+
+
 def import_preferences(session: Any, prefs: Dict[str, Any], log_fn: Optional[LogFn] = None) -> int:
     """Restore Reminders preferences via AppendPreferencesModRq."""
     rem = (prefs or {}).get("reminders") or {}
@@ -1520,6 +1561,10 @@ def import_company_via_qbfc(
 
         results['classes'] = import_classes(
             session, snapshot.get('classes', []), log_fn)
+
+        _emit("=== QBFC Import: Phase 1.5 — Accounting Preferences ===", log_fn)
+        results['accounting_prefs'] = import_accounting_preferences(
+            session, snapshot.get('preferences', {}), log_fn)
 
         _emit("=== QBFC Import: Phase 2 — Accounts ===", log_fn)
         results['accounts'] = import_accounts(

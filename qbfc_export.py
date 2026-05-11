@@ -1680,6 +1680,18 @@ def export_snapshot(
     prefs: Dict[str, Any] = {}
     detail = raw_responses.get("preferences")
     if detail:
+        # Accounting preferences (account numbers, class tracking, etc.)
+        ap = getattr(detail, "AccountingPreferences", None)
+        if ap is not None:
+            prefs["accounting"] = {
+                "is_using_account_numbers":  _safe_get(ap, "IsUsingAccountNumbers") or "",
+                "is_requiring_accounts":     _safe_get(ap, "IsRequiringAccounts") or "",
+                "is_using_class_tracking":   _safe_get(ap, "IsUsingClassTracking") or "",
+                "is_using_audit_trail":      _safe_get(ap, "IsUsingAuditTrail") or "",
+                "is_assigning_journal_no":   _safe_get(ap, "IsAssigningJournalEntryNumbers") or "",
+                "closing_date":              _safe_get(ap, "ClosingDate") or "",
+            }
+
         rp = getattr(detail, "RemindersPreferences", None) or getattr(detail, "Reminders", None)
         if rp is not None:
             prefs["reminders"] = {
