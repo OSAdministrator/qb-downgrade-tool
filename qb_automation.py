@@ -2445,20 +2445,38 @@ class QuickBooksAutomationEngine:
             # (done AFTER closing QB so no file locks)
             target_qbw = final_target_qbw
             if not self.config.dry_run and working_qbw != final_target_qbw:
-                # Wait for QB to release file locks (up to 30s)
-                self._emit("Waiting for QB to release file locks...", log_fn)
-                for attempt in range(15):
-                    try:
-                        with open(working_qbw, 'r+b'):
-                            pass
-                        break
-                    except (PermissionError, OSError):
-                        time.sleep(2)
                 import shutil
+                import subprocess as _sp
+                # Force-kill any lingering QBW32 / qbupdate processes that may
+                # still hold a file handle on the working copy.
+                self._emit("Killing any lingering QuickBooks processes before rename...", log_fn)
+                try:
+                    _sp.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         "Get-Process | Where-Object {$_.Name -like 'QBW32*' -or $_.Name -like 'qbupdate*' -or $_.Name -like 'QBDBMgr*' -or $_.Name -like 'QBCFMonitor*'} | Stop-Process -Force -ErrorAction SilentlyContinue"],
+                        timeout=15, capture_output=True,
+                    )
+                except Exception:
+                    pass
+                time.sleep(5)
+
                 self._emit(f"Renaming {working_qbw.name} -> {final_target_qbw.name}", log_fn)
-                if final_target_qbw.exists():
-                    final_target_qbw.unlink()
-                shutil.move(str(working_qbw), str(final_target_qbw))
+                # Retry the actual move with backoff (file lock can linger on Windows)
+                last_err: Optional[Exception] = None
+                for attempt in range(30):
+                    try:
+                        if final_target_qbw.exists():
+                            final_target_qbw.unlink()
+                        shutil.move(str(working_qbw), str(final_target_qbw))
+                        last_err = None
+                        break
+                    except (PermissionError, OSError) as e:
+                        last_err = e
+                        if attempt == 0:
+                            self._emit(f"  File still locked, retrying... ({e})", log_fn)
+                        time.sleep(3)
+                if last_err is not None:
+                    raise last_err
                 # Rename companion files too
                 for ext_suffix in (".qbw.ND", ".qbw.DSN", ".tlg"):
                     old_f = target_dir / f"{working_qbw.stem}{ext_suffix}"
