@@ -108,10 +108,22 @@ def main():
         traceback.print_exc()
         sys.exit(1)
 
-    # Step 5: Close QB and rename
+    # Step 5: Close QB and rename — wait for file locks to release
     log("Closing QB...")
     kill_qb()
-    time.sleep(3)
+
+    # Poll for lock release (up to 30s)
+    log("Waiting for file locks to release...")
+    for attempt in range(15):
+        try:
+            with open(WORKING_QBW, 'r+b'):
+                pass
+            log(f"  File unlocked after {attempt * 2}s")
+            break
+        except (PermissionError, OSError):
+            time.sleep(2)
+    else:
+        log("  WARN: file still locked after 30s, attempting rename anyway")
 
     log(f"Renaming {WORKING_QBW.name} -> {FINAL_QBW.name}")
     try:
@@ -120,7 +132,10 @@ def main():
             src = TARGET_DIR / f"Blank Template{ext}"
             dst = TARGET_DIR / f"joshs gold coast ii 21{ext}"
             if src.exists():
-                src.rename(dst)
+                try:
+                    src.rename(dst)
+                except Exception:
+                    pass
         log("Rename complete.")
     except Exception as exc:
         log(f"WARN: Rename failed: {exc} — file is still 'Blank Template.qbw'")

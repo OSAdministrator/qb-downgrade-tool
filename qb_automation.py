@@ -2364,6 +2364,15 @@ class QuickBooksAutomationEngine:
             # (done AFTER closing QB so no file locks)
             target_qbw = final_target_qbw
             if not self.config.dry_run and working_qbw != final_target_qbw:
+                # Wait for QB to release file locks (up to 30s)
+                self._emit("Waiting for QB to release file locks...", log_fn)
+                for attempt in range(15):
+                    try:
+                        with open(working_qbw, 'r+b'):
+                            pass
+                        break
+                    except (PermissionError, OSError):
+                        time.sleep(2)
                 self._emit(f"Renaming {working_qbw.name} -> {final_target_qbw.name}", log_fn)
                 working_qbw.rename(final_target_qbw)
                 # Rename companion files too
