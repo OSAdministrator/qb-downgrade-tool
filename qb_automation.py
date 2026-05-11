@@ -1677,49 +1677,100 @@ class QuickBooksAutomationEngine:
         return app
 
     def _close_qb(self, app: Optional[object], log_fn: Optional[LogFn]) -> None:
-        self._emit("Closing QuickBooks", log_fn)
+        """Close QuickBooks using menu navigation (File → Close Company, then
+        File → Exit) so QB flushes all in-memory data to the .qbw file.
+
+        Previous approach (taskkill, even without /F) did NOT trigger QB's
+        internal save routine, resulting in empty/template-only files.
+        """
+        self._emit("Closing QuickBooks via menu navigation...", log_fn)
         if self.config.dry_run:
             return
 
-        # PHASE 1: graceful shutdown via taskkill (no /F).  This sends WM_CLOSE
-        # to QB, giving it a chance to flush its in-memory cache (QBFC writes)
-        # to the .qbw file.  /F (force) would terminate before flush completes,
-        # losing all imported data.
         import subprocess
         images = ("QBW32.EXE", "QBW.EXE", "qbw32.exe", "qbw.exe")
 
+        # -----------------------------------------------------------
+        # PHASE 1 — Use keyboard shortcuts to close company + exit
+        # This triggers QB's internal save/flush for the company file.
+        # Alt+F4 sometimes works, but File → Close Company is the
+        # safest path because it explicitly flushes the company data
+        # before proceeding to close the app.
+        # -----------------------------------------------------------
+        menu_close_done = False
+
+        # Try to find the QB window and use it
         try:
-            for image in images:
+            main_window = self._find_qb_main_window(app, None, timeout_s=10)
+            if main_window is not None:
                 try:
-                    subprocess.run(
-                        ["taskkill", "/IM", image, "/T"],
-                        capture_output=True, timeout=15, check=False,
-                    )
+                    main_window.set_focus()
+                    time.sleep(0.5)
                 except Exception:  # noqa: BLE001
                     pass
-            self._emit("  Graceful close signal sent to QuickBooks.", log_fn)
+
+                # --- Step 1: File → Close Company ---
+                self._emit("  Sending Ctrl+W (Close Company)...", log_fn)
+                try:
+                    if send_keys is not None:
+                        send_keys("^w")          # Ctrl+W = Close Company
+                        time.sleep(3)             # give QB time to flush
+                        self._emit("  Ctrl+W sent. Waiting for flush...", log_fn)
+
+                        # QB may pop a "Save changes?" dialog — click Yes / press Enter
+                        time.sleep(2)
+                        send_keys("{ENTER}")
+                        time.sleep(3)
+                        self._emit("  Save dialog handled (if any).", log_fn)
+                except Exception as exc:  # noqa: BLE001
+                    self._emit(f"  WARN: Ctrl+W failed: {exc}", log_fn)
+
+                # --- Step 2: File → Exit (Alt+F4) ---
+                self._emit("  Sending Alt+F4 (Exit QuickBooks)...", log_fn)
+                try:
+                    if send_keys is not None:
+                        send_keys("%{F4}")        # Alt+F4 = Exit
+                        time.sleep(2)
+                        # Handle any additional "are you sure?" dialog
+                        send_keys("{ENTER}")
+                        time.sleep(2)
+                        self._emit("  Alt+F4 sent.", log_fn)
+                        menu_close_done = True
+                except Exception as exc:  # noqa: BLE001
+                    self._emit(f"  WARN: Alt+F4 failed: {exc}", log_fn)
+            else:
+                self._emit("  Could not find QB window for menu close.", log_fn)
         except Exception as exc:  # noqa: BLE001
-            self._emit(f"  WARN: graceful taskkill failed: {exc}", log_fn)
+            self._emit(f"  WARN: menu-based close failed: {exc}", log_fn)
 
-        # Give QB up to 60s to flush data and exit cleanly.
-        # QB 2021 is particularly slow — it checks for updates during shutdown.
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            try:
-                result = subprocess.run(
-                    ["tasklist", "/FI", "IMAGENAME eq QBW32.EXE"],
-                    capture_output=True, timeout=5, text=True, check=False,
-                )
-                if "QBW32.EXE" not in (result.stdout or ""):
-                    self._emit("  QuickBooks closed gracefully.", log_fn)
-                    break
-            except Exception:  # noqa: BLE001
-                pass
-            time.sleep(2)
-        else:
-            self._emit("  QuickBooks didn't exit in 60s — forcing termination.", log_fn)
+        # -----------------------------------------------------------
+        # PHASE 2 — Wait for QB to exit gracefully (up to 90s)
+        # QB 2021 is slow — it checks for updates during shutdown.
+        # -----------------------------------------------------------
+        if menu_close_done:
+            self._emit("  Waiting up to 90s for QB to exit...", log_fn)
+            deadline = time.time() + 90
+            while time.time() < deadline:
+                try:
+                    result = subprocess.run(
+                        ["tasklist", "/FI", "IMAGENAME eq QBW32.EXE"],
+                        capture_output=True, timeout=5, text=True, check=False,
+                    )
+                    if "QBW32.EXE" not in (result.stdout or ""):
+                        self._emit("  QuickBooks exited cleanly!", log_fn)
+                        time.sleep(3)  # let Windows release file locks
+                        return  # SUCCESS — no force kill needed
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(3)
+            self._emit("  QB still running after 90s — will force-kill.", log_fn)
 
-        # PHASE 2: only force-kill any stragglers (data already flushed by now).
+        # -----------------------------------------------------------
+        # PHASE 3 — Force-kill only as absolute last resort
+        # If we got here, menu close failed or QB is stuck. Data should
+        # already be flushed if Ctrl+W succeeded even partially.
+        # -----------------------------------------------------------
+        self._emit("  Force-killing QB processes...", log_fn)
         try:
             for image in images:
                 try:
@@ -2337,11 +2388,8 @@ class QuickBooksAutomationEngine:
                 )
 
                 # CRITICAL: allow QB to flush all QBFC writes to disk.
-                # taskkill /F immediately after session.end() loses everything that
-                # was still in QB's in-memory cache (causes empty/template-only file).
-                self._emit("Waiting 15s for QB to flush all changes to disk...", log_fn)
-                time.sleep(15)
                 self._emit(f"QBFC import complete: {sum(import_results.values())} total records", log_fn)
+                # Note: actual flush happens in _close_qb via File → Close Company
             else:
                 self._emit("Dry-run: skipping QBFC import", log_fn)
 
