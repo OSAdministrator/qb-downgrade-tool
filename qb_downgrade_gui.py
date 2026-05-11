@@ -168,7 +168,6 @@ class QuickBooksDowngradeGUI:
 
         ttk.Button(top, text="Add QBW Files", command=self._add_files).pack(side=LEFT, padx=4)
         ttk.Button(top, text="Remove Selected", command=self._remove_selected).pack(side=LEFT, padx=4)
-        ttk.Button(top, text="Load Passwords JSON", command=self._load_password_map).pack(side=LEFT, padx=4)
         ttk.Button(top, text="Settings", command=self._open_settings).pack(side=LEFT, padx=4)
 
         self.btn_start = ttk.Button(top, text="Start Processing", command=self._start_processing)
@@ -190,26 +189,17 @@ class QuickBooksDowngradeGUI:
         # Try to enable native drag-and-drop via tkinterdnd2 (optional dependency)
         self._setup_dnd()
 
-        columns = ("file", "password", "status", "message")
+        columns = ("file", "status", "message")
         self.tree = ttk.Treeview(self.root, columns=columns, show="headings", height=8)
         self.tree.pack(fill=BOTH, expand=False, padx=10, pady=8)
 
         self.tree.heading("file", text="QBW File")
-        self.tree.heading("password", text="Admin Password")
         self.tree.heading("status", text="Status")
         self.tree.heading("message", text="Message")
 
-        self.tree.column("file", width=470)
-        self.tree.column("password", width=160)
+        self.tree.column("file", width=620)
         self.tree.column("status", width=110)
         self.tree.column("message", width=330)
-
-        pw_frame = ttk.Frame(self.root)
-        pw_frame.pack(fill=tk.X, padx=10)
-        ttk.Label(pw_frame, text="Default password for selected rows:").pack(side=LEFT, padx=4)
-        self.default_password_var = tk.StringVar()
-        ttk.Entry(pw_frame, textvariable=self.default_password_var, width=30).pack(side=LEFT, padx=4)
-        ttk.Button(pw_frame, text="Apply", command=self._apply_default_password).pack(side=LEFT, padx=4)
 
         progress_frame = ttk.Frame(self.root, padding=(10, 4))
         progress_frame.pack(fill=tk.X)
@@ -268,10 +258,10 @@ class QuickBooksDowngradeGUI:
                     fp = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
                     fp = fp.strip().strip('"').strip("'")
                     if fp.lower().endswith(".qbw"):
-                        self.tree.insert("", END, values=(fp, "", "Queued", ""))
+                        self.tree.insert("", END, values=(fp, "Queued", ""))
                         added += 1
                 if added:
-                    self.drop_label.config(text=f"✅  {added} file(s) added — set passwords and click Start")
+                    self.drop_label.config(text=f"✅  {added} file(s) added — click Start")
                     self._log(f"Drag-and-drop: added {added} .QBW file(s)")
 
             windnd.hook_dropfiles(self.root, func=_on_drop)
@@ -285,7 +275,7 @@ class QuickBooksDowngradeGUI:
         try:
             files = filedialog.askopenfilenames(filetypes=[("QuickBooks Company", "*.qbw")])
             for f in files:
-                self.tree.insert("", END, values=(f, "", "Queued", ""))
+                self.tree.insert("", END, values=(f, "Queued", ""))
         except Exception:
             pass
         # If no files were added (e.g. file-in-use error), offer manual path entry
@@ -304,44 +294,13 @@ class QuickBooksDowngradeGUI:
         if path and path.strip():
             path = path.strip().strip('"').strip("'")
             if os.path.exists(path) or path.lower().endswith('.qbw'):
-                self.tree.insert("", END, values=(path, "", "Queued", ""))
+                self.tree.insert("", END, values=(path, "Queued", ""))
             else:
                 messagebox.showwarning("Invalid Path", f"File not found: {path}")
 
     def _remove_selected(self) -> None:
         for row in self.tree.selection():
             self.tree.delete(row)
-
-    def _apply_default_password(self) -> None:
-        default_pw = self.default_password_var.get().strip()
-        if not default_pw:
-            messagebox.showwarning("Password", "Enter a default password first.")
-            return
-
-        targets = self.tree.selection() or self.tree.get_children()
-        for row in targets:
-            vals = list(self.tree.item(row, "values"))
-            vals[1] = default_pw
-            self.tree.item(row, values=vals)
-
-    def _load_password_map(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
-        if not path:
-            return
-
-        with open(path, "r", encoding="utf-8") as f:
-            mapping = json.load(f)
-
-        updated = 0
-        for row in self.tree.get_children():
-            vals = list(self.tree.item(row, "values"))
-            file_name = Path(vals[0]).name
-            if file_name in mapping:
-                vals[1] = mapping[file_name]
-                self.tree.item(row, values=vals)
-                updated += 1
-
-        self._log(f"Loaded password map: updated {updated} queue entries")
 
     def _open_settings(self) -> None:
         SettingsDialog(self.root, self.config, self._save_settings)
@@ -354,10 +313,10 @@ class QuickBooksDowngradeGUI:
     def _queue_items(self) -> list[tuple[str, QueueItem]]:
         items = []
         for row in self.tree.get_children():
-            file_path, password, status, _ = self.tree.item(row, "values")
+            file_path, status, _ = self.tree.item(row, "values")
             if not file_path:
                 continue
-            items.append((row, QueueItem(qbw_path=Path(file_path), password=password or "")))
+            items.append((row, QueueItem(qbw_path=Path(file_path), password="")))
         return items
 
     def _start_processing(self) -> None:
@@ -369,15 +328,6 @@ class QuickBooksDowngradeGUI:
         if not queue_items:
             messagebox.showwarning("No files", "Add one or more .QBW files first.")
             return
-
-        missing_pw = [item.qbw_path.name for _, item in queue_items if not item.password]
-        if missing_pw:
-            proceed = messagebox.askyesno(
-                "Missing passwords",
-                f"{len(missing_pw)} files have blank passwords. Continue anyway?",
-            )
-            if not proceed:
-                return
 
         self.btn_start.configure(state=tk.DISABLED)
         self.progress["value"] = 0
@@ -428,8 +378,8 @@ class QuickBooksDowngradeGUI:
 
     def _update_row(self, row_id: str, status: str, message: str) -> None:
         vals = list(self.tree.item(row_id, "values"))
-        vals[2] = status
-        vals[3] = message
+        vals[1] = status
+        vals[2] = message
         self.tree.item(row_id, values=vals)
 
     def _start_heartbeat(self, phase: str = "Processing") -> None:
@@ -568,10 +518,10 @@ def main() -> None:
     cli_count = 0
     for arg in sys.argv[1:]:
         if arg.lower().endswith('.qbw'):
-            app.tree.insert("", END, values=(arg, "", "Queued", ""))
+            app.tree.insert("", END, values=(arg, "Queued", ""))
             cli_count += 1
     if cli_count:
-        app.drop_label.config(text=f"✅  {cli_count} file(s) loaded — set passwords and click Start")
+        app.drop_label.config(text=f"✅  {cli_count} file(s) loaded — click Start")
     root.mainloop()
 
 

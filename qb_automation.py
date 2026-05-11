@@ -1827,7 +1827,8 @@ class QuickBooksAutomationEngine:
             self._emit("", log_fn)
             self._emit("=" * 60, log_fn)
             self._emit("ACTION REQUIRED: Enter the admin password in QuickBooks 2023.", log_fn)
-            self._emit(f"  Password: {job.password}", log_fn)
+            if job.password:
+                self._emit(f"  Password: {job.password}", log_fn)
             self._emit("  The tool will auto-detect when the company is loaded.", log_fn)
             self._emit("=" * 60, log_fn)
             self._emit("", log_fn)
