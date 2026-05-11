@@ -619,120 +619,145 @@ def import_items(session: Any, items: List[Dict], accounts: Optional[List[Dict]]
 # ---------------------------------------------------------------------------
 
 def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional[LogFn] = None) -> int:
-    """Import transactions into QB using type-specific Add requests.
+    """Import transactions into QB as JournalEntries.
 
-    Each transaction dict has at minimum: type, date, account, amount.
-    Depending on type, we use the appropriate AddRq.
+    NEW FORMAT (from per-type export):
+      {type, date, num, entity, memo, txn_id,
+       lines: [{account, debit, credit}]}
+      Each transaction is self-balancing: sum(debits) == sum(credits).
 
-    For the initial version, we use JournalEntryAddRq as a universal
-    fallback — any transaction can be expressed as a journal entry.
-    This preserves balances perfectly even if the original transaction
-    type (Invoice, Bill, etc.) has nuances we haven't mapped yet.
+    OLD FORMAT (legacy, backward compat):
+      {type, date, account, amount, ...}
+      Uses Opening Balance Equity as the offset.
     """
     _emit(f"QBFC Import: Importing {len(transactions)} transactions...", log_fn)
     if transactions:
-        _emit(f"  Sample tx[0] keys: {list(transactions[0].keys())}", log_fn)
-        _emit(f"  Sample tx[0]: {transactions[0]}", log_fn)
+        sample = transactions[0]
+        has_lines = "lines" in sample
+        _emit(f"  Format: {'new (with lines)' if has_lines else 'legacy (account+amount)'}", log_fn)
+        _emit(f"  Sample tx[0] keys: {list(sample.keys())}", log_fn)
 
     ok = 0
-    skipped_no_date = 0
-    skipped_no_account = 0
-    skipped_bad_amount = 0
-    skipped_zero = 0
+    skipped = 0
     failed = 0
 
     for i, tx in enumerate(transactions):
         tx_type = tx.get('type', '').strip()
         date_str = tx.get('date', '').strip()
-        account = tx.get('account', '').strip()
-        amount_str = tx.get('amount', '')
+        lines = tx.get('lines', [])
         memo = tx.get('memo', '')
-        name = tx.get('name', '')
-        ref_num = tx.get('ref_number', '') or tx.get('num', '')
+        entity = tx.get('entity', '') or tx.get('name', '')
+        ref_num = tx.get('num', '') or tx.get('ref_number', '')
 
         if not date_str:
-            skipped_no_date += 1
-            continue
-        if not account:
-            skipped_no_account += 1
+            skipped += 1
             continue
 
-        try:
-            amount = float(amount_str) if amount_str else 0.0
-        except (ValueError, TypeError):
-            skipped_bad_amount += 1
-            continue
+        # --- New format: transaction has explicit debit/credit lines ---
+        if lines:
+            # Filter to lines with valid accounts and non-zero amounts
+            valid_lines = []
+            for ln in lines:
+                acct = (ln.get('account') or '').strip()
+                debit = float(ln.get('debit', 0) or 0)
+                credit = float(ln.get('credit', 0) or 0)
+                if acct and (debit > 0 or credit > 0):
+                    valid_lines.append((acct, debit, credit))
 
-        if amount == 0.0:
-            skipped_zero += 1
-            continue
+            if len(valid_lines) < 2:
+                skipped += 1
+                continue
 
-        # Use JournalEntry as universal import format
-        req = _create_request_set(session)
-        je = req.AppendJournalEntryAddRq()
+            req = _create_request_set(session)
+            je = req.AppendJournalEntryAddRq()
 
-        # Set date
-        _set_if(je, 'TxnDate', date_str)
-        _set_if(je, 'RefNumber', ref_num)
-        _set_if(je, 'Memo', memo or f"TimeWarp import: {tx_type}")
+            # Normalize date: strip timezone/time portion if present
+            if ' ' in date_str:
+                date_str = date_str.split(' ')[0]
+            _set_if(je, 'TxnDate', date_str)
+            _set_if(je, 'RefNumber', ref_num)
+            _set_if(je, 'Memo', memo or f"TimeWarp: {tx_type}")
 
-        # Debit line (positive = debit, negative = credit)
-        try:
-            if amount > 0:
-                debit_line = je.ORJournalLineList.AppendJournalDebitLine()
-                debit_line.JournalDebitLine.AccountRef.FullName.SetValue(account)
-                debit_line.JournalDebitLine.Amount.SetValue(abs(amount))
-                if name:
-                    try:
-                        debit_line.JournalDebitLine.EntityRef.FullName.SetValue(name)
-                    except Exception:
-                        pass
-                if memo:
-                    try:
-                        debit_line.JournalDebitLine.Memo.SetValue(memo[:4095])
-                    except Exception:
-                        pass
+            try:
+                for acct, debit, credit in valid_lines:
+                    if debit > 0:
+                        dl = je.ORJournalLineList.AppendJournalDebitLine()
+                        dl.JournalDebitLine.AccountRef.FullName.SetValue(acct)
+                        dl.JournalDebitLine.Amount.SetValue(debit)
+                        if entity:
+                            try:
+                                dl.JournalDebitLine.EntityRef.FullName.SetValue(entity)
+                            except Exception:
+                                pass
+                    elif credit > 0:
+                        cl = je.ORJournalLineList.AppendJournalCreditLine()
+                        cl.JournalCreditLine.AccountRef.FullName.SetValue(acct)
+                        cl.JournalCreditLine.Amount.SetValue(credit)
+                        if entity:
+                            try:
+                                cl.JournalCreditLine.EntityRef.FullName.SetValue(entity)
+                            except Exception:
+                                pass
+            except Exception as exc:
+                _emit(f"  JE #{i}: line setup failed: {exc}", log_fn)
+                failed += 1
+                continue
 
-                # Offsetting credit to Opening Balance Equity
-                credit_line = je.ORJournalLineList.AppendJournalCreditLine()
-                credit_line.JournalCreditLine.AccountRef.FullName.SetValue('Opening Balance Equity')
-                credit_line.JournalCreditLine.Amount.SetValue(abs(amount))
+            if _do_add_request(session, req, f"JE #{i} ({tx_type} {date_str})", log_fn):
+                ok += 1
             else:
-                credit_line = je.ORJournalLineList.AppendJournalCreditLine()
-                credit_line.JournalCreditLine.AccountRef.FullName.SetValue(account)
-                credit_line.JournalCreditLine.Amount.SetValue(abs(amount))
-                if name:
-                    try:
-                        credit_line.JournalCreditLine.EntityRef.FullName.SetValue(name)
-                    except Exception:
-                        pass
-                if memo:
-                    try:
-                        credit_line.JournalCreditLine.Memo.SetValue(memo[:4095])
-                    except Exception:
-                        pass
+                failed += 1
 
-                debit_line = je.ORJournalLineList.AppendJournalDebitLine()
-                debit_line.JournalDebitLine.AccountRef.FullName.SetValue('Opening Balance Equity')
-                debit_line.JournalDebitLine.Amount.SetValue(abs(amount))
-        except Exception as exc:
-            _emit(f"  JE #{i}: line setup failed: {exc}", log_fn)
-            failed += 1
-            continue
-
-        if _do_add_request(session, req, f"JE #{i} ({tx_type} {date_str} ${amount:.2f})", log_fn):
-            ok += 1
+        # --- Legacy format: single account + amount → offset with OBE ---
         else:
-            failed += 1
+            account = tx.get('account', '').strip()
+            try:
+                amount = float(tx.get('amount', 0) or 0)
+            except (ValueError, TypeError):
+                skipped += 1
+                continue
+            if not account or amount == 0.0:
+                skipped += 1
+                continue
 
-        # Progress update every 500 transactions
-        if (i + 1) % 500 == 0:
-            sk = skipped_no_date + skipped_no_account + skipped_bad_amount + skipped_zero
-            _emit(f"  Progress: {i+1}/{len(transactions)} ({ok} ok, {failed} failed, {sk} skipped)", log_fn)
+            req = _create_request_set(session)
+            je = req.AppendJournalEntryAddRq()
+            if ' ' in date_str:
+                date_str = date_str.split(' ')[0]
+            _set_if(je, 'TxnDate', date_str)
+            _set_if(je, 'RefNumber', ref_num)
+            _set_if(je, 'Memo', memo or f"TimeWarp: {tx_type}")
 
-    skipped_total = skipped_no_date + skipped_no_account + skipped_bad_amount + skipped_zero
-    _emit(f"QBFC Import: Transactions complete — {ok} ok, {failed} failed, {skipped_total} skipped", log_fn)
-    _emit(f"  Skip breakdown: no_date={skipped_no_date}, no_account={skipped_no_account}, bad_amount={skipped_bad_amount}, zero_amount={skipped_zero}", log_fn)
+            try:
+                if amount > 0:
+                    dl = je.ORJournalLineList.AppendJournalDebitLine()
+                    dl.JournalDebitLine.AccountRef.FullName.SetValue(account)
+                    dl.JournalDebitLine.Amount.SetValue(abs(amount))
+                    cl = je.ORJournalLineList.AppendJournalCreditLine()
+                    cl.JournalCreditLine.AccountRef.FullName.SetValue('Opening Balance Equity')
+                    cl.JournalCreditLine.Amount.SetValue(abs(amount))
+                else:
+                    cl = je.ORJournalLineList.AppendJournalCreditLine()
+                    cl.JournalCreditLine.AccountRef.FullName.SetValue(account)
+                    cl.JournalCreditLine.Amount.SetValue(abs(amount))
+                    dl = je.ORJournalLineList.AppendJournalDebitLine()
+                    dl.JournalDebitLine.AccountRef.FullName.SetValue('Opening Balance Equity')
+                    dl.JournalDebitLine.Amount.SetValue(abs(amount))
+            except Exception as exc:
+                _emit(f"  JE #{i}: line setup failed: {exc}", log_fn)
+                failed += 1
+                continue
+
+            if _do_add_request(session, req, f"JE #{i} ({tx_type} {date_str} ${amount:.2f})", log_fn):
+                ok += 1
+            else:
+                failed += 1
+
+        # Progress update every 250 transactions
+        if (i + 1) % 250 == 0:
+            _emit(f"  Progress: {i+1}/{len(transactions)} ({ok} ok, {failed} failed, {skipped} skipped)", log_fn)
+
+    _emit(f"QBFC Import: Transactions complete — {ok} ok, {failed} failed, {skipped} skipped", log_fn)
     return ok
 
 

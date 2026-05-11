@@ -917,6 +917,339 @@ def _address_dict(addr_obj: Any) -> Dict[str, str]:
     return d
 
 
+# ---------------------------------------------------------------------------
+# Per-type transaction export with full debit/credit line detail
+# ---------------------------------------------------------------------------
+
+# Transaction types to query individually (each has its own QueryRq)
+_TXN_TYPES = [
+    "JournalEntry", "Check", "Bill", "BillPaymentCheck", "BillPaymentCreditCard",
+    "CreditCardCharge", "CreditCardCredit", "Deposit", "Transfer",
+    "Invoice", "CreditMemo", "SalesReceipt", "ReceivePayment",
+    "VendorCredit", "ItemReceipt", "SalesTaxPaymentCheck",
+]
+
+
+def _extract_je_lines(ret, txn):
+    """JournalEntry: explicit debit/credit lines."""
+    jl = getattr(ret, "ORJournalLineRetList", None)
+    if not jl or not hasattr(jl, "Count"):
+        return
+    for i in range(jl.Count):
+        entry = jl.GetAt(i)
+        dl = getattr(entry, "JournalDebitLineRet", None)
+        cl = getattr(entry, "JournalCreditLineRet", None)
+        if dl:
+            acct = _safe_get(dl, "AccountRef.FullName") or ""
+            amt = abs(_safe_get_amount(dl, "Amount") or 0)
+            if acct and amt:
+                txn["lines"].append({"account": acct, "debit": amt, "credit": 0.0})
+        elif cl:
+            acct = _safe_get(cl, "AccountRef.FullName") or ""
+            amt = abs(_safe_get_amount(cl, "Amount") or 0)
+            if acct and amt:
+                txn["lines"].append({"account": acct, "debit": 0.0, "credit": amt})
+
+
+def _extract_transfer_lines(ret, txn):
+    """Transfer: debit to-account, credit from-account."""
+    from_acct = _safe_get(ret, "TransferFromAccountRef.FullName") or ""
+    to_acct = _safe_get(ret, "TransferToAccountRef.FullName") or ""
+    amt = abs(_safe_get_amount(ret, "Amount") or 0)
+    if from_acct and to_acct and amt:
+        txn["lines"] = [
+            {"account": to_acct, "debit": amt, "credit": 0.0},
+            {"account": from_acct, "debit": 0.0, "credit": amt},
+        ]
+
+
+def _extract_spending_lines(ret, type_name, txn, item_accts, reverse=False):
+    """Spending types (Check, Bill, CC Charge, ItemReceipt).
+
+    Normal:  expense/item lines → debit, header account → credit.
+    Reverse (CC Credit, VendorCredit): flip debit/credit.
+    """
+    # Find header account (bank, AP, or CC)
+    header_acct = ""
+    for prop in ("AccountRef.FullName", "APAccountRef.FullName", "BankAccountRef.FullName"):
+        header_acct = _safe_get(ret, prop) or ""
+        if header_acct:
+            break
+
+    total_amt = abs(
+        _safe_get_amount(ret, "Amount")
+        or _safe_get_amount(ret, "TotalAmount")
+        or _safe_get_amount(ret, "AmountDue")
+        or 0
+    )
+
+    lines = []
+    line_total = 0.0
+
+    # Expense lines (have explicit AccountRef)
+    el = getattr(ret, "ExpenseLineRetList", None)
+    if el and hasattr(el, "Count"):
+        for i in range(el.Count):
+            ln = el.GetAt(i)
+            acct = _safe_get(ln, "AccountRef.FullName") or ""
+            amt = abs(_safe_get_amount(ln, "Amount") or 0)
+            if acct and amt:
+                lines.append({"account": acct, "debit": amt, "credit": 0.0})
+                line_total += amt
+
+    # Item lines (need account lookup from items list)
+    il = getattr(ret, "ItemLineRetList", None)
+    if il and hasattr(il, "Count"):
+        for i in range(il.Count):
+            ln = il.GetAt(i)
+            item_name = _safe_get(ln, "ItemRef.FullName") or ""
+            amt = abs(_safe_get_amount(ln, "Amount") or 0)
+            if amt:
+                acct = ""
+                if item_name and item_name in item_accts:
+                    _, cogs = item_accts[item_name]
+                    acct = cogs
+                if not acct:
+                    acct = _safe_get(ln, "AccountRef.FullName") or ""
+                lines.append({"account": acct or "Miscellaneous", "debit": amt, "credit": 0.0})
+                line_total += amt
+
+    # No detail lines? Use total with generic account
+    if not lines and total_amt:
+        lines.append({"account": "Miscellaneous", "debit": total_amt, "credit": 0.0})
+        line_total = total_amt
+
+    # Header account is the balancing credit
+    if lines and header_acct:
+        lines.append({"account": header_acct, "debit": 0.0, "credit": line_total or total_amt})
+
+    # Reverse for CC Credit / VendorCredit
+    if reverse:
+        for ln in lines:
+            ln["debit"], ln["credit"] = ln["credit"], ln["debit"]
+
+    txn["lines"] = lines
+
+
+def _extract_billpayment_lines(ret, type_name, txn):
+    """BillPayment: debit AP, credit bank/CC."""
+    ap_acct = _safe_get(ret, "APAccountRef.FullName") or "Accounts Payable"
+    if type_name == "BillPaymentCheck":
+        pay_acct = _safe_get(ret, "BankAccountRef.FullName") or ""
+    else:
+        pay_acct = _safe_get(ret, "CreditCardAccountRef.FullName") or ""
+    total = abs(_safe_get_amount(ret, "TotalAmount") or _safe_get_amount(ret, "Amount") or 0)
+    if total and pay_acct:
+        txn["lines"] = [
+            {"account": ap_acct, "debit": total, "credit": 0.0},
+            {"account": pay_acct, "debit": 0.0, "credit": total},
+        ]
+
+
+def _extract_revenue_lines(ret, type_name, txn, item_accts):
+    """Revenue types (Invoice, SalesReceipt, CreditMemo).
+
+    Normal (Invoice/SalesReceipt): AR/bank → debit, income lines → credit.
+    CreditMemo: reversed (debit income, credit AR).
+    """
+    header_acct = ""
+    for prop in ("ARAccountRef.FullName", "DepositToAccountRef.FullName", "AccountRef.FullName"):
+        header_acct = _safe_get(ret, prop) or ""
+        if header_acct:
+            break
+
+    total_amt = abs(
+        _safe_get_amount(ret, "TotalAmount")
+        or _safe_get_amount(ret, "Amount")
+        or _safe_get_amount(ret, "Subtotal")
+        or 0
+    )
+
+    lines = []
+    line_total = 0.0
+
+    # Try various line list property names
+    for list_prop in ("ORInvoiceLineRetList", "InvoiceLineRetList",
+                      "ORSalesReceiptLineRetList", "SalesReceiptLineRetList",
+                      "ORCreditMemoLineRetList", "CreditMemoLineRetList"):
+        ll = getattr(ret, list_prop, None)
+        if not ll or not hasattr(ll, "Count"):
+            continue
+        for i in range(ll.Count):
+            entry = ll.GetAt(i)
+            # Unwrap OR wrapper if present
+            ln = entry
+            for sub in ("InvoiceLineRet", "SalesReceiptLineRet", "CreditMemoLineRet"):
+                sub_line = getattr(entry, sub, None)
+                if sub_line:
+                    ln = sub_line
+                    break
+            item_name = _safe_get(ln, "ItemRef.FullName") or ""
+            amt = abs(_safe_get_amount(ln, "Amount") or 0)
+            if amt:
+                acct = ""
+                if item_name and item_name in item_accts:
+                    income, _ = item_accts[item_name]
+                    acct = income
+                if not acct:
+                    acct = _safe_get(ln, "AccountRef.FullName") or ""
+                lines.append({"account": acct or "Sales", "debit": 0.0, "credit": amt})
+                line_total += amt
+        if lines:
+            break
+
+    # Fallback
+    if not lines and total_amt:
+        lines.append({"account": "Sales", "debit": 0.0, "credit": total_amt})
+        line_total = total_amt
+
+    # Header account
+    if lines and header_acct:
+        lines.append({"account": header_acct, "debit": line_total or total_amt, "credit": 0.0})
+
+    # CreditMemo: reverse everything
+    if type_name == "CreditMemo":
+        for ln in lines:
+            ln["debit"], ln["credit"] = ln["credit"], ln["debit"]
+
+    txn["lines"] = lines
+
+
+def _extract_deposit_lines(ret, txn):
+    """Deposit: source lines → credit, bank → debit."""
+    bank_acct = _safe_get(ret, "DepositToAccountRef.FullName") or ""
+    total_amt = abs(_safe_get_amount(ret, "TotalAmount") or _safe_get_amount(ret, "Amount") or 0)
+
+    lines = []
+    line_total = 0.0
+    dl = getattr(ret, "DepositLineRetList", None)
+    if dl and hasattr(dl, "Count"):
+        for i in range(dl.Count):
+            ln = dl.GetAt(i)
+            acct = _safe_get(ln, "AccountRef.FullName") or _safe_get(ln, "EntityRef.FullName") or ""
+            amt = abs(_safe_get_amount(ln, "Amount") or 0)
+            if amt:
+                lines.append({"account": acct or "Undeposited Funds", "debit": 0.0, "credit": amt})
+                line_total += amt
+
+    if not lines and total_amt:
+        lines.append({"account": "Undeposited Funds", "debit": 0.0, "credit": total_amt})
+        line_total = total_amt
+
+    if lines and bank_acct:
+        lines.append({"account": bank_acct, "debit": line_total or total_amt, "credit": 0.0})
+    txn["lines"] = lines
+
+
+def _extract_receive_payment_lines(ret, txn):
+    """ReceivePayment: debit bank/undeposited, credit AR."""
+    ar_acct = _safe_get(ret, "ARAccountRef.FullName") or "Accounts Receivable"
+    deposit_acct = _safe_get(ret, "DepositToAccountRef.FullName") or "Undeposited Funds"
+    total = abs(_safe_get_amount(ret, "TotalAmount") or _safe_get_amount(ret, "Amount") or 0)
+    if total:
+        txn["lines"] = [
+            {"account": deposit_acct, "debit": total, "credit": 0.0},
+            {"account": ar_acct, "debit": 0.0, "credit": total},
+        ]
+
+
+def _extract_taxpayment_lines(ret, txn):
+    """SalesTaxPaymentCheck: debit tax liability, credit bank."""
+    bank_acct = _safe_get(ret, "BankAccountRef.FullName") or ""
+    total = abs(_safe_get_amount(ret, "Amount") or 0)
+    if total and bank_acct:
+        txn["lines"] = [
+            {"account": "Sales Tax Payable", "debit": total, "credit": 0.0},
+            {"account": bank_acct, "debit": 0.0, "credit": total},
+        ]
+
+
+def _extract_txn(ret, type_name, item_accts):
+    """Extract a single transaction with debit/credit lines."""
+    txn = {
+        "type": type_name,
+        "date": _safe_get(ret, "TxnDate") or "",
+        "num": _safe_get(ret, "RefNumber") or "",
+        "entity": _safe_get(ret, "EntityRef.FullName") or "",
+        "memo": _safe_get(ret, "Memo") or "",
+        "txn_id": _safe_get(ret, "TxnID") or "",
+        "lines": [],
+    }
+
+    if type_name == "JournalEntry":
+        _extract_je_lines(ret, txn)
+    elif type_name == "Transfer":
+        _extract_transfer_lines(ret, txn)
+    elif type_name in ("BillPaymentCheck", "BillPaymentCreditCard"):
+        _extract_billpayment_lines(ret, type_name, txn)
+    elif type_name in ("Invoice", "CreditMemo", "SalesReceipt"):
+        _extract_revenue_lines(ret, type_name, txn, item_accts)
+    elif type_name == "Deposit":
+        _extract_deposit_lines(ret, txn)
+    elif type_name == "ReceivePayment":
+        _extract_receive_payment_lines(ret, txn)
+    elif type_name == "SalesTaxPaymentCheck":
+        _extract_taxpayment_lines(ret, txn)
+    elif type_name in ("CreditCardCredit", "VendorCredit"):
+        _extract_spending_lines(ret, type_name, txn, item_accts, reverse=True)
+    else:
+        # Check, Bill, CreditCardCharge, ItemReceipt
+        _extract_spending_lines(ret, type_name, txn, item_accts)
+
+    return txn if txn["lines"] else None
+
+
+def _query_typed_transactions(session, items=None, log_fn=None):
+    """Query all transactions by type with full debit/credit line detail.
+
+    Returns list of dicts:
+      {type, date, num, entity, memo, txn_id,
+       lines: [{account, debit, credit}]}
+    Each transaction is self-balancing: sum(debits) == sum(credits).
+    """
+    items = items or []
+    # Build item name → (income_account, cogs_account) lookup
+    item_accts = {}
+    for it in items:
+        n = it.get("name", "")
+        if n:
+            item_accts[n] = (
+                it.get("income_account", ""),
+                it.get("cogs_account", "") or it.get("expense_account", ""),
+            )
+
+    all_txns = []
+    for type_name in _TXN_TYPES:
+        query_method = f"Append{type_name}QueryRq"
+        try:
+            req = _create_request_set(session)
+            q = getattr(req, query_method)()
+            try:
+                q.IncludeLineItems.SetValue(True)
+            except Exception:
+                pass
+            resp_set = session.session_manager.DoRequests(req)
+            resp = resp_set.ResponseList.GetAt(0)
+            if resp and resp.StatusCode == 0 and resp.Detail:
+                count = resp.Detail.Count
+                found = 0
+                for i in range(count):
+                    ret = resp.Detail.GetAt(i)
+                    txn = _extract_txn(ret, type_name, item_accts)
+                    if txn:
+                        all_txns.append(txn)
+                        found += 1
+                if found:
+                    _emit(f"    {type_name}: {found} transactions", log_fn)
+            # StatusCode 1 = no data for this type → silently skip
+        except Exception as exc:
+            _emit(f"    {type_name}: query error: {exc}", log_fn)
+
+    all_txns.sort(key=lambda t: t.get("date", ""))
+    _emit(f"  Snapshot: {len(all_txns)} transactions (with line detail)", log_fn)
+    return all_txns
+
+
 def export_snapshot(
     session: "QBFCSession",
     snapshot_path: Path,
@@ -1211,34 +1544,13 @@ def export_snapshot(
     snapshot["items"] = items
     _emit(f"  Snapshot: {len(items)} items", log_fn)
 
-    # --- Transactions (reuse existing CSV query logic) ---
+    # --- Transactions (per-type queries with full debit/credit line detail) ---
     if include_transactions:
         try:
-            req = _create_request_set(session)
-            tq = req.AppendTransactionQueryRq()
-            try:
-                tq.IncludeLineItems.SetValue(True)
-            except Exception:
-                pass
-            resp_set = session.session_manager.DoRequests(req)
-            resp = resp_set.ResponseList.GetAt(0)
-            txns = []
-            if resp and resp.StatusCode == 0 and resp.Detail:
-                detail = resp.Detail
-                for i in range(detail.Count):
-                    t = detail.GetAt(i)
-                    txns.append({
-                        "type": _safe_get(t, "TxnType") or "",
-                        "date": _safe_get(t, "TxnDate") or "",
-                        "num": _safe_get(t, "RefNumber") or "",
-                        "name": _safe_get(t, "EntityRef.FullName") or "",
-                        "memo": _safe_get(t, "Memo") or "",
-                        "account": _safe_get(t, "AccountRef.FullName") or "",
-                        "amount": _safe_get_amount(t, "Amount"),
-                        "txn_id": _safe_get(t, "TxnID") or "",
-                    })
-            snapshot["transactions"] = txns
-            _emit(f"  Snapshot: {len(txns)} transactions", log_fn)
+            _emit("  Querying transactions by type (with line items)...", log_fn)
+            snapshot["transactions"] = _query_typed_transactions(
+                session, snapshot.get("items", []), log_fn
+            )
         except Exception as exc:  # noqa: BLE001
             _emit(f"  Snapshot: Transactions FAILED: {exc}", log_fn)
             snapshot["transactions"] = []
