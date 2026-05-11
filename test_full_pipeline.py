@@ -41,14 +41,49 @@ def log(msg):
     print(f"[{ts}] {msg}")
 
 
-def kill_qb():
-    """Kill ALL QB-related processes."""
-    for proc in ["QBW32PremierAccountant.exe", "QBWPremierAccountant.exe",
-                 "qbupdate.exe", "qbmapi64.exe"]:
+def kill_qb(wait=True):
+    """Kill ALL QB-related processes and verify they're dead."""
+    QB_PROCS = [
+        "QBW32PremierAccountant.exe",
+        "QBWPremierAccountant.exe",
+        "QBW32.exe",
+        "QBW64.exe",
+        "qbupdate.exe",
+        "qbmapi64.exe",
+        "QBDBMgrN.exe",
+        "QBDBMgr.exe",
+        "QBCFMonitorService.exe",
+    ]
+    # First pass: kill known processes
+    for proc in QB_PROCS:
         subprocess.run(["taskkill", "/f", "/im", proc], capture_output=True)
-    for pattern in ["CefSharp*", "Intuit*"]:
-        subprocess.run(f'taskkill /f /im "{pattern}"', shell=True, capture_output=True)
-    time.sleep(3)
+    # Kill by wildcard patterns
+    for pattern in ["CefSharp", "Intuit.spc", "QBW"]:
+        subprocess.run(
+            f'powershell -c "Get-Process -Name \'{pattern}*\' -ErrorAction SilentlyContinue | Stop-Process -Force"',
+            shell=True, capture_output=True
+        )
+    time.sleep(5)
+
+    if not wait:
+        return
+
+    # Verify QB is actually dead (up to 20s)
+    for attempt in range(10):
+        result = subprocess.run(
+            'powershell -c "(Get-Process -Name \'QBW*\',\'QBWPremier*\' -ErrorAction SilentlyContinue).Count"',
+            shell=True, capture_output=True, text=True
+        )
+        count = result.stdout.strip()
+        if count in ("", "0"):
+            log(f"  QB processes killed (verified after {attempt * 2}s)")
+            return
+        log(f"  Still {count} QB process(es) running, waiting...")
+        # Hit them again
+        for proc in QB_PROCS[:2]:
+            subprocess.run(["taskkill", "/f", "/im", proc], capture_output=True)
+        time.sleep(2)
+    log("  WARN: QB processes may still be running after 20s")
 
 
 def wait_for_unlock(path, timeout=30):
