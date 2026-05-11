@@ -676,7 +676,8 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                 date_str = date_str.split(' ')[0]
             _set_if(je, 'TxnDate', date_str)
             _set_if(je, 'RefNumber', ref_num)
-            _set_if(je, 'Memo', memo or f"TimeWarp: {tx_type}")
+            # NOTE: JournalEntryAdd has no top-level Memo. Memo goes on each line.
+            line_memo = memo or f"TimeWarp: {tx_type}"
 
             try:
                 for acct, debit, credit in valid_lines:
@@ -684,6 +685,10 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                         ol = je.ORJournalLineList.Append()
                         ol.JournalDebitLine.AccountRef.FullName.SetValue(acct)
                         ol.JournalDebitLine.Amount.SetValue(debit)
+                        try:
+                            ol.JournalDebitLine.Memo.SetValue(line_memo[:4095])
+                        except Exception:
+                            pass
                         if entity:
                             try:
                                 ol.JournalDebitLine.EntityRef.FullName.SetValue(entity)
@@ -693,6 +698,10 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                         ol = je.ORJournalLineList.Append()
                         ol.JournalCreditLine.AccountRef.FullName.SetValue(acct)
                         ol.JournalCreditLine.Amount.SetValue(credit)
+                        try:
+                            ol.JournalCreditLine.Memo.SetValue(line_memo[:4095])
+                        except Exception:
+                            pass
                         if entity:
                             try:
                                 ol.JournalCreditLine.EntityRef.FullName.SetValue(entity)
@@ -726,23 +735,31 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                 date_str = date_str.split(' ')[0]
             _set_if(je, 'TxnDate', date_str)
             _set_if(je, 'RefNumber', ref_num)
-            _set_if(je, 'Memo', memo or f"TimeWarp: {tx_type}")
+            line_memo = memo or f"TimeWarp: {tx_type}"
 
             try:
                 if amount > 0:
                     ol = je.ORJournalLineList.Append()
                     ol.JournalDebitLine.AccountRef.FullName.SetValue(account)
                     ol.JournalDebitLine.Amount.SetValue(abs(amount))
+                    try: ol.JournalDebitLine.Memo.SetValue(line_memo[:4095])
+                    except Exception: pass
                     ol2 = je.ORJournalLineList.Append()
                     ol2.JournalCreditLine.AccountRef.FullName.SetValue('Opening Balance Equity')
                     ol2.JournalCreditLine.Amount.SetValue(abs(amount))
+                    try: ol2.JournalCreditLine.Memo.SetValue(line_memo[:4095])
+                    except Exception: pass
                 else:
                     ol = je.ORJournalLineList.Append()
                     ol.JournalCreditLine.AccountRef.FullName.SetValue(account)
                     ol.JournalCreditLine.Amount.SetValue(abs(amount))
+                    try: ol.JournalCreditLine.Memo.SetValue(line_memo[:4095])
+                    except Exception: pass
                     ol2 = je.ORJournalLineList.Append()
                     ol2.JournalDebitLine.AccountRef.FullName.SetValue('Opening Balance Equity')
                     ol2.JournalDebitLine.Amount.SetValue(abs(amount))
+                    try: ol2.JournalDebitLine.Memo.SetValue(line_memo[:4095])
+                    except Exception: pass
             except Exception as exc:
                 _emit(f"  JE #{i}: line setup failed: {exc}", log_fn)
                 failed += 1
