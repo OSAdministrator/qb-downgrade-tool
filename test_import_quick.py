@@ -31,9 +31,11 @@ def main():
 
     try:
         from qbfc_import import import_company_via_qbfc
+        # Pass qbw_path=None to bind to the already-open company file.
+        # Passing the actual path causes QBFC to try launching a new QB instance.
         results = import_company_via_qbfc(
             snapshot_path=SNAPSHOT,
-            qbw_path=TARGET_QBW,
+            qbw_path=None,
             log_fn=log,
             skip_transactions=False,
         )
