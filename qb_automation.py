@@ -1681,24 +1681,58 @@ class QuickBooksAutomationEngine:
         if self.config.dry_run:
             return
 
-        # Hard-kill QB processes via taskkill — avoid pywinauto/comtypes
-        # which has been observed to silently crash the Python interpreter
-        # when QB is in an inconsistent UI state after QBFC operations.
+        # PHASE 1: graceful shutdown via taskkill (no /F).  This sends WM_CLOSE
+        # to QB, giving it a chance to flush its in-memory cache (QBFC writes)
+        # to the .qbw file.  /F (force) would terminate before flush completes,
+        # losing all imported data.
+        import subprocess
+        images = ("QBW32.EXE", "QBW.EXE", "qbw32.exe", "qbw.exe")
+
         try:
-            import subprocess
-            for image in ("QBW32.EXE", "QBW.EXE", "qbw32.exe", "qbw.exe"):
+            for image in images:
                 try:
                     subprocess.run(
-                        ["taskkill", "/F", "/IM", image, "/T"],
+                        ["taskkill", "/IM", image, "/T"],
                         capture_output=True, timeout=15, check=False,
                     )
                 except Exception:  # noqa: BLE001
                     pass
-            self._emit("  QuickBooks processes terminated.", log_fn)
+            self._emit("  Graceful close signal sent to QuickBooks.", log_fn)
         except Exception as exc:  # noqa: BLE001
-            self._emit(f"  WARN: taskkill failed: {exc}", log_fn)
+            self._emit(f"  WARN: graceful taskkill failed: {exc}", log_fn)
 
-        # Best-effort pywinauto kill as a backup (don't let exceptions kill us)
+        # Give QB up to 30s to flush data and exit cleanly.
+        # During this time, dismiss any "Save changes?" dialog QB pops up.
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                result = subprocess.run(
+                    ["tasklist", "/FI", "IMAGENAME eq QBW32.EXE"],
+                    capture_output=True, timeout=5, text=True, check=False,
+                )
+                if "QBW32.EXE" not in (result.stdout or ""):
+                    self._emit("  QuickBooks closed gracefully.", log_fn)
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(2)
+        else:
+            self._emit("  QuickBooks didn't exit in 30s — forcing termination.", log_fn)
+
+        # PHASE 2: only force-kill any stragglers (data already flushed by now).
+        try:
+            for image in images:
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/IM", image, "/T"],
+                        capture_output=True, timeout=10, check=False,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Best-effort pywinauto kill as a backup
         if app is not None:
             try:
                 app.kill()
@@ -1706,7 +1740,7 @@ class QuickBooksAutomationEngine:
                 pass
 
         # Give Windows a moment to release file locks
-        time.sleep(2)
+        time.sleep(3)
 
     def _is_company_already_open(self, main_window, company_name_hint: str) -> bool:
         """Check if the desired company is already open in QB.
@@ -2297,10 +2331,16 @@ class QuickBooksAutomationEngine:
                 self._emit(f"  Target file: {working_qbw}", log_fn)
                 import_results = import_company_via_qbfc(
                     snapshot_path=Path(str(snapshot_path)),
-                    qbw_path=working_qbw,  # explicit path to avoid binding to wrong QB instance
+                    qbw_path=None,  # QB 2021 already has the file open; passing path would launch a 2nd instance
                     log_fn=log_fn,
                     skip_transactions=False,
                 )
+
+                # CRITICAL: allow QB to flush all QBFC writes to disk.
+                # taskkill /F immediately after session.end() loses everything that
+                # was still in QB's in-memory cache (causes empty/template-only file).
+                self._emit("Waiting 15s for QB to flush all changes to disk...", log_fn)
+                time.sleep(15)
                 self._emit(f"QBFC import complete: {sum(import_results.values())} total records", log_fn)
             else:
                 self._emit("Dry-run: skipping QBFC import", log_fn)
