@@ -659,31 +659,80 @@ def _guess_account_type(name: str) -> int:
     return 0
 
 
-def _list_existing_accounts(session: Any) -> set:
+def _list_existing_accounts(session: Any, log_fn: Optional[LogFn] = None) -> set:
     """Query QB for all existing account FullNames (lowercase set)."""
     names = set()
     try:
         req = _create_request_set(session)
-        q = req.AppendAccountQueryRq()
+        # Plain query — do NOT use IncludeRetElementList (COM issues)
+        req.AppendAccountQueryRq()
+        resp_set = session.DoRequests(req)
+        resp = resp_set.ResponseList.GetAt(0)
+        if resp.StatusCode != 0:
+            _emit(f"  WARN: AccountQuery failed: {resp.StatusCode} {resp.StatusMessage}", log_fn)
+            return names
+        if resp.Detail is None:
+            _emit(f"  WARN: AccountQuery returned no Detail", log_fn)
+            return names
+        lst = resp.Detail
+        count = lst.Count
+        for i in range(count):
+            acct = lst.GetAt(i)
+            try:
+                fn = acct.FullName.GetValue()
+                if fn:
+                    names.add(fn.strip().lower())
+            except Exception as exc:
+                _emit(f"  WARN: Could not read account #{i} FullName: {exc}", log_fn)
+        _emit(f"  AccountQuery: found {len(names)} existing accounts in QB", log_fn)
+    except Exception as exc:
+        _emit(f"  ERROR: AccountQuery exception: {exc}", log_fn)
+    return names
+
+
+def _create_account_stub(session: Any, name: str, existing: set,
+                         log_fn: Optional[LogFn] = None) -> bool:
+    """Auto-create a single account stub. Returns True on success."""
+    parent_full = None
+    leaf = name
+    if ':' in name:
+        parent_full, leaf = name.rsplit(':', 1)
+        # Ensure parent chain exists first
+        if parent_full.strip().lower() not in existing:
+            _create_account_stub(session, parent_full, existing, log_fn)
+
+    # Already created (by recursion or prior iteration)?
+    if name.strip().lower() in existing:
+        return True
+
+    try:
+        req = _create_request_set(session)
+        add = req.AppendAccountAddRq()
+        add.Name.SetValue(leaf)
+        if parent_full:
+            add.ParentRef.FullName.SetValue(parent_full)
+        add.AccountType.SetValue(_guess_account_type(name))
+        # Desc may not be supported in all QBFC versions — skip if it fails
         try:
-            q.IncludeRetElementList.Add('FullName')
+            add.Desc.SetValue('Auto-created by TimeWarp')
         except Exception:
             pass
         resp_set = session.DoRequests(req)
         resp = resp_set.ResponseList.GetAt(0)
-        if resp.StatusCode == 0 and resp.Detail is not None:
-            lst = resp.Detail
-            for i in range(lst.Count):
-                acct = lst.GetAt(i)
-                try:
-                    fn = acct.FullName.GetValue()
-                    if fn:
-                        names.add(fn.strip().lower())
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return names
+        if resp.StatusCode == 0:
+            existing.add(name.strip().lower())
+            _emit(f"  + Created stub account '{name}' (type={_guess_account_type(name)})", log_fn)
+            return True
+        elif resp.StatusCode == 3100:
+            # Already exists — just record it
+            existing.add(name.strip().lower())
+            return True
+        else:
+            _emit(f"  ! Could not auto-create '{name}': status={resp.StatusCode} {resp.StatusMessage}", log_fn)
+            return False
+    except Exception as exc:
+        _emit(f"  ! Auto-create exception for '{name}': {exc}", log_fn)
+        return False
 
 
 def _ensure_referenced_accounts(session: Any, transactions: List[Dict], log_fn: Optional[LogFn] = None) -> int:
@@ -707,60 +756,24 @@ def _ensure_referenced_accounts(session: Any, transactions: List[Dict], log_fn: 
     if not refs:
         return 0
 
-    existing = _list_existing_accounts(session)
+    _emit(f"QBFC Import: Pre-flight — checking {len(refs)} unique account references...", log_fn)
+    existing = _list_existing_accounts(session, log_fn)
     missing = [a for a in refs if a.strip().lower() not in existing]
     if not missing:
         _emit(f"QBFC Import: All {len(refs)} referenced accounts exist.", log_fn)
         return 0
 
-    _emit(f"QBFC Import: Auto-creating {len(missing)} missing account(s) referenced by transactions...", log_fn)
+    _emit(f"QBFC Import: Auto-creating {len(missing)} missing account(s)...", log_fn)
+    for m in missing[:10]:
+        _emit(f"    e.g. '{m}'", log_fn)
 
     # Sort by depth so parents come before children
     missing.sort(key=lambda n: n.count(':'))
 
     created = 0
     for name in missing:
-        # Ensure parent exists first (create as expense stub if needed)
-        parent_full = None
-        leaf = name
-        if ':' in name:
-            parent_full, leaf = name.rsplit(':', 1)
-            if parent_full.strip().lower() not in existing:
-                # Recursively create parent as a stub Bank/Expense
-                try:
-                    p_req = _create_request_set(session)
-                    p_add = p_req.AppendAccountAddRq()
-                    p_add.Name.SetValue(parent_full.rsplit(':', 1)[-1])
-                    if ':' in parent_full:
-                        try: p_add.ParentRef.FullName.SetValue(parent_full.rsplit(':', 1)[0])
-                        except Exception: pass
-                    p_add.AccountType.SetValue(_guess_account_type(parent_full))
-                    p_add.Desc.SetValue('Auto-created by TimeWarp')
-                    session.DoRequests(p_req)
-                    existing.add(parent_full.strip().lower())
-                except Exception:
-                    pass
-
-        try:
-            req = _create_request_set(session)
-            add = req.AppendAccountAddRq()
-            add.Name.SetValue(leaf)
-            if parent_full:
-                try: add.ParentRef.FullName.SetValue(parent_full)
-                except Exception: pass
-            add.AccountType.SetValue(_guess_account_type(name))
-            try: add.Desc.SetValue('Auto-created by TimeWarp (referenced by imported transaction)')
-            except Exception: pass
-            resp_set = session.DoRequests(req)
-            resp = resp_set.ResponseList.GetAt(0)
-            if resp.StatusCode == 0:
-                created += 1
-                existing.add(name.strip().lower())
-                _emit(f"  + Created stub account '{name}' (type {_guess_account_type(name)})", log_fn)
-            else:
-                _emit(f"  ! Could not auto-create '{name}': {resp.StatusMessage}", log_fn)
-        except Exception as exc:
-            _emit(f"  ! Auto-create exception for '{name}': {exc}", log_fn)
+        if _create_account_stub(session, name, existing, log_fn):
+            created += 1
 
     _emit(f"QBFC Import: Auto-created {created}/{len(missing)} stub accounts.", log_fn)
     return created
