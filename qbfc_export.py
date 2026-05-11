@@ -1202,6 +1202,7 @@ def _extract_txn(ret, type_name, item_accts):
         "entity": _safe_get(ret, "EntityRef.FullName") or "",
         "memo": _safe_get(ret, "Memo") or "",
         "txn_id": _safe_get(ret, "TxnID") or "",
+        "cleared": _safe_get(ret, "ClearedStatus") or "",
         "lines": [],
     }
 

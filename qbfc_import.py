@@ -94,25 +94,34 @@ def _set_ref_if(obj: Any, ref_attr: str, value: Optional[str]) -> None:
         logger.debug(f"Could not set ref {ref_attr}={value}: {exc}")
 
 
-def _do_add_request(session: Any, req: Any, label: str, log_fn: Optional[LogFn]) -> bool:
-    """Execute an Add request and return True on success."""
+def _do_add_request(session: Any, req: Any, label: str, log_fn: Optional[LogFn],
+                    return_txn_id: bool = False):
+    """Execute an Add request and return True on success (or TxnID string if return_txn_id)."""
     try:
         resp_set = session.session_manager.DoRequests(req)
         resp = resp_set.ResponseList.GetAt(0)
         if resp is None:
             _emit(f"  {label}: No response", log_fn)
-            return False
+            return None if return_txn_id else False
         if resp.StatusCode == 0:
+            if return_txn_id:
+                # Try to pull TxnID from the response detail
+                detail = resp.Detail
+                if detail is not None:
+                    txn_id = _safe_get(detail, "TxnID")
+                    if txn_id:
+                        return txn_id
+                return "OK"  # truthy fallback
             return True
         elif resp.StatusCode == 3100:  # Name already exists
             _emit(f"  {label}: Already exists (skipped)", log_fn)
-            return True
+            return "EXISTS" if return_txn_id else True
         else:
             _emit(f"  {label}: status={resp.StatusCode} msg={resp.StatusMessage}", log_fn)
-            return False
+            return None if return_txn_id else False
     except Exception as exc:
         _emit(f"  {label}: FAILED: {exc}", log_fn)
-        return False
+        return None if return_txn_id else False
 
 
 # ---------------------------------------------------------------------------
@@ -812,10 +821,11 @@ def _ensure_referenced_accounts(session: Any, transactions: List[Dict], log_fn: 
 # We must use CreditCardChargeAdd / CreditCardCreditAdd so QB shows
 # transactions in the correct Charge or Payment column.
 
-def _import_cc_charge(session, tx, date_str, ref_num, entity, memo, lines, log_fn):
+def _import_cc_charge(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                     return_txn_id=False):
     """Import a CreditCardCharge using AppendCreditCardChargeAddRq.
 
-    Returns 1=ok, 0=skipped, -1=failed.
+    Returns 1=ok/0=skipped/-1=failed, OR TxnID string if return_txn_id.
     """
     # Identify the CC (header) account — it's the line with a credit
     # whose account type is CreditCard.
@@ -852,18 +862,21 @@ def _import_cc_charge(session, tx, date_str, ref_num, entity, memo, lines, log_f
             el.AccountRef.FullName.SetValue(acct)
             el.Amount.SetValue(amt)
 
-        if _do_add_request(session, req, f"CCCharge {ref_num} {entity}", log_fn):
-            return 1
-        return -1
+        result = _do_add_request(session, req, f"CCCharge {ref_num} {entity}", log_fn,
+                                return_txn_id=return_txn_id)
+        if return_txn_id:
+            return result  # TxnID string or None
+        return 1 if result else -1
     except Exception as exc:
         _emit(f"  CCCharge failed: {exc}", log_fn)
-        return -1
+        return None if return_txn_id else -1
 
 
-def _import_cc_credit(session, tx, date_str, ref_num, entity, memo, lines, log_fn):
+def _import_cc_credit(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                     return_txn_id=False):
     """Import a CreditCardCredit using AppendCreditCardCreditAddRq.
 
-    Returns 1=ok, 0=skipped, -1=failed.
+    Returns 1=ok/0=skipped/-1=failed, OR TxnID string if return_txn_id.
     """
     # In a CC Credit (refund/return), the export reverses the lines:
     #   header CC account → debit (reduces liability)
@@ -912,13 +925,38 @@ def _import_cc_credit(session, tx, date_str, ref_num, entity, memo, lines, log_f
             el.AccountRef.FullName.SetValue(acct)
             el.Amount.SetValue(amt)
 
-        if _do_add_request(session, req, f"CCCredit {ref_num} {entity}", log_fn):
-            return 1
-        return -1
+        result = _do_add_request(session, req, f"CCCredit {ref_num} {entity}", log_fn,
+                                return_txn_id=return_txn_id)
+        if return_txn_id:
+            return result
+        return 1 if result else -1
     except Exception as exc:
         _emit(f"  CCCredit failed: {exc}", log_fn)
-        return -1
+        return None if return_txn_id else -1
 
+
+
+def _set_cleared_status(session: Any, txn_id: str, status: str, log_fn: Optional[LogFn] = None) -> bool:
+    """Set the ClearedStatus on a transaction via ClearedStatusModRq.
+
+    status should be 'Cleared' or 'NotCleared'.
+    """
+    try:
+        req = _create_request_set(session)
+        mod = req.AppendClearedStatusModRq()
+        mod.TxnID.SetValue(txn_id)
+        # ClearedStatus enum: csCleared=0, csNotCleared=1, csPending=2
+        if status.lower() in ("cleared", "cscleared", "true"):
+            mod.ClearedStatus.SetValue(0)  # csCleared
+        else:
+            mod.ClearedStatus.SetValue(1)  # csNotCleared
+        resp_set = session.session_manager.DoRequests(req)
+        resp = resp_set.ResponseList.GetAt(0)
+        if resp and resp.StatusCode == 0:
+            return True
+        return False
+    except Exception:
+        return False
 
 
 def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional[LogFn] = None) -> int:
@@ -960,6 +998,8 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
     ok = 0
     skipped = 0
     failed = 0
+    # Track (new_txn_id, cleared_status) for post-import reconciliation
+    txns_to_clear: list = []
 
     for i, tx in enumerate(transactions):
         tx_type = tx.get('type', '').strip()
@@ -968,6 +1008,7 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
         memo = tx.get('memo', '')
         entity = tx.get('entity', '') or tx.get('name', '')
         ref_num = tx.get('num', '') or tx.get('ref_number', '')
+        cleared = tx.get('cleared', '').strip()
 
         if not date_str:
             skipped += 1
@@ -981,19 +1022,25 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
         # JournalEntries flip the charge/payment presentation in the CC
         # register, so we must use native CreditCardCharge / CreditCardCredit.
         if tx_type == 'CreditCardCharge' and lines:
-            result = _import_cc_charge(session, tx, date_str, ref_num, entity, memo, lines, log_fn)
-            if result == 1:
+            result = _import_cc_charge(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                                       return_txn_id=True)
+            if result and result not in (None, -1, 0):
                 ok += 1
-            elif result == 0:
+                if cleared.lower() == 'cleared' and isinstance(result, str) and result not in ('OK', 'EXISTS'):
+                    txns_to_clear.append(result)
+            elif result == 0 or result is None:
                 skipped += 1
             else:
                 failed += 1
             continue
         if tx_type == 'CreditCardCredit' and lines:
-            result = _import_cc_credit(session, tx, date_str, ref_num, entity, memo, lines, log_fn)
-            if result == 1:
+            result = _import_cc_credit(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                                       return_txn_id=True)
+            if result and result not in (None, -1, 0):
                 ok += 1
-            elif result == 0:
+                if cleared.lower() == 'cleared' and isinstance(result, str) and result not in ('OK', 'EXISTS'):
+                    txns_to_clear.append(result)
+            elif result == 0 or result is None:
                 skipped += 1
             else:
                 failed += 1
@@ -1091,8 +1138,12 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                 failed += 1
                 continue
 
-            if _do_add_request(session, req, f"JE #{i} ({tx_type} {date_str})", log_fn):
+            je_txn_id = _do_add_request(session, req, f"JE #{i} ({tx_type} {date_str})", log_fn,
+                                        return_txn_id=True)
+            if je_txn_id:
                 ok += 1
+                if cleared.lower() == 'cleared' and isinstance(je_txn_id, str) and je_txn_id not in ('OK', 'EXISTS'):
+                    txns_to_clear.append(je_txn_id)
             else:
                 failed += 1
 
@@ -1144,8 +1195,12 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                 failed += 1
                 continue
 
-            if _do_add_request(session, req, f"JE #{i} ({tx_type} {date_str} ${amount:.2f})", log_fn):
+            je_txn_id = _do_add_request(session, req, f"JE #{i} ({tx_type} {date_str} ${amount:.2f})",
+                                        log_fn, return_txn_id=True)
+            if je_txn_id:
                 ok += 1
+                if cleared.lower() == 'cleared' and isinstance(je_txn_id, str) and je_txn_id not in ('OK', 'EXISTS'):
+                    txns_to_clear.append(je_txn_id)
             else:
                 failed += 1
 
@@ -1154,6 +1209,16 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
             _emit(f"  Progress: {i+1}/{len(transactions)} ({ok} ok, {failed} failed, {skipped} skipped)", log_fn)
 
     _emit(f"QBFC Import: Transactions complete — {ok} ok, {failed} failed, {skipped} skipped", log_fn)
+
+    # Post-import: set ClearedStatus for reconciled transactions
+    if txns_to_clear:
+        _emit(f"  Setting reconciled status on {len(txns_to_clear)} transactions...", log_fn)
+        cleared_ok = 0
+        for txn_id in txns_to_clear:
+            if _set_cleared_status(session, txn_id, "Cleared", log_fn):
+                cleared_ok += 1
+        _emit(f"  Reconciled: {cleared_ok}/{len(txns_to_clear)} marked as cleared ✓", log_fn)
+
     return ok
 
 
