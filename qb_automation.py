@@ -1867,60 +1867,28 @@ class QuickBooksAutomationEngine:
         if self._qb2023_app is None:
             raise RuntimeError("QB 2023 app instance is not initialized")
 
-        # Handle any startup dialogs (password, accountant user, memorized transactions)
-        self._handle_startup_dialogs(job.password, timeout_s=30, log_fn=log_fn)
+        # =================================================================
+        # SIMPLIFIED FLOW (2026-05-11):
+        # run_job() already launched QB with the .qbw file as a command-line
+        # parameter.  QB is auto-opening the company and prompting for the
+        # password.  We just need to:
+        #   1. Handle the password dialog (type + Enter)
+        #   2. Wait for the company to fully load (title bar check)
+        #   3. Dismiss post-login popups
+        # We NEVER call _open_company_file() here — that method kills and
+        # relaunches QB, causing the double-open bug.
+        # =================================================================
+        self._emit("Waiting for QB 2023 to finish opening company file...", log_fn)
 
+        # 1. Handle startup password dialog
+        self._handle_startup_dialogs(job.password, timeout_s=60, log_fn=log_fn)
+
+        # 2. Find the main window and wait for company to load
         main_window = self._find_qb_main_window(self._qb2023_app, "2023", self.config.timeouts.launch_qb_seconds)
+        self._wait_for_company_ready(main_window, timeout_s=self.config.timeouts.open_company_seconds, log_fn=log_fn)
+
+        # 3. Dismiss post-login popups
         self._dismiss_common_dialogs(log_fn)
-
-        # =====================================================================
-        # FIX (2026-05-08): Prevent redundant company reopen after startup
-        # password entry.
-        #
-        # BUG: When _handle_startup_dialogs() successfully enters the admin
-        # password, the company IS already open — but QB's main window title
-        # hasn't updated yet at this point.  _is_company_already_open() checks
-        # the window title, so it returns False, causing _open_company_file()
-        # to close and reopen the company.  This triggers a *second* password
-        # prompt, which the user must answer manually (the tool already typed
-        # the password once during startup).
-        #
-        # FIX: Track whether the password was entered during startup via the
-        # instance flag self._startup_password_handled.  If True, the company
-        # is already open — skip the _open_company_file() call entirely.
-        # =====================================================================
-        company_hint = job.qbw_path.stem.split(" ")[0]  # e.g., "joshs" from "joshs gold coast ii 23"
-
-        if self._startup_password_handled:
-            # Password was entered during startup — company is already open.
-            # Do NOT call _open_company_file(); it would close & reopen,
-            # causing a duplicate password prompt.
-            self._emit(
-                "Startup password was already handled — company is open, "
-                "skipping redundant File->Open",
-                log_fn,
-            )
-        elif self._is_company_already_open(main_window, company_hint):
-            self._emit("Company already open in QB 2023, skipping File->Open", log_fn)
-        else:
-            self._emit("Company not open, opening company file...", log_fn)
-            self._open_company_file(
-                main_window,
-                job.qbw_path,
-                job.password,
-                timeout_s=self.config.timeouts.open_company_seconds,
-                log_fn=log_fn,
-            )
-            # Re-acquire main window reference after opening company
-            time.sleep(3)
-            main_window = self._find_qb_main_window(self._qb2023_app, "2023", self.config.timeouts.launch_qb_seconds)
-            # Verify the company actually opened
-            if not self._is_company_already_open(main_window, company_hint):
-                self._emit("WARNING: Company may not have opened successfully, proceeding anyway", log_fn)
-
-        # Note: _open_company_file() now handles dialog/popup dismissal internally
-        # (Step 6 of its sequential approach). Only do a final safety check here.
-        time.sleep(1)
         self._close_popup_windows(main_window, log_fn)
 
         # Export all QuickBooks list panes in one shot to a single combined IIF.
@@ -2321,6 +2289,16 @@ class QuickBooksAutomationEngine:
                     self.config.install_paths.qb_2021_path, log_fn, qbw_path=working_qbw
                 )
                 self._qb2021_app = qb2021_app
+
+                # Wait for QB 2021 to open, handle password, dismiss dialogs
+                template_password = self.config.install_paths.qb_2021_template_password
+                self._emit("Waiting for QB 2021 to open template file...", log_fn)
+                self._handle_startup_dialogs(template_password, timeout_s=60, log_fn=log_fn)
+                qb2021_main = self._find_qb_main_window(qb2021_app, "2021", self.config.timeouts.launch_qb_seconds)
+                self._wait_for_company_ready(qb2021_main, timeout_s=self.config.timeouts.open_company_seconds, log_fn=log_fn)
+                self._dismiss_common_dialogs(log_fn)
+                self._close_popup_windows(qb2021_main, log_fn)
+                self._emit("QB 2021 template is open and ready for QBFC import.", log_fn)
             else:
                 self._emit("Dry-run: skipping QB 2021 launch", log_fn)
 
