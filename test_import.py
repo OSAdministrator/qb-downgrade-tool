@@ -57,8 +57,12 @@ def main():
         try:
             f.unlink()
             log(f"  Removed {f.name}")
+        except FileNotFoundError:
+            pass
         except PermissionError:
             log(f"  WARN: could not remove {f.name} (locked?)")
+        except Exception as exc:
+            log(f"  WARN: could not remove {f.name}: {exc}")
 
     log(f"Copying template to {WORKING_QBW}")
     shutil.copy2(TEMPLATE, WORKING_QBW)
