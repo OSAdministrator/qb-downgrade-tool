@@ -1701,9 +1701,9 @@ class QuickBooksAutomationEngine:
         except Exception as exc:  # noqa: BLE001
             self._emit(f"  WARN: graceful taskkill failed: {exc}", log_fn)
 
-        # Give QB up to 30s to flush data and exit cleanly.
-        # During this time, dismiss any "Save changes?" dialog QB pops up.
-        deadline = time.time() + 30
+        # Give QB up to 60s to flush data and exit cleanly.
+        # QB 2021 is particularly slow — it checks for updates during shutdown.
+        deadline = time.time() + 60
         while time.time() < deadline:
             try:
                 result = subprocess.run(
@@ -1717,7 +1717,7 @@ class QuickBooksAutomationEngine:
                 pass
             time.sleep(2)
         else:
-            self._emit("  QuickBooks didn't exit in 30s — forcing termination.", log_fn)
+            self._emit("  QuickBooks didn't exit in 60s — forcing termination.", log_fn)
 
         # PHASE 2: only force-kill any stragglers (data already flushed by now).
         try:
