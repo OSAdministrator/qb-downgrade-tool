@@ -187,6 +187,7 @@ def import_classes(session: Any, classes: List[Dict], log_fn: Optional[LogFn] = 
 
 # QBFC account type enum mapping
 ACCOUNT_TYPE_MAP = {
+    # Friendly name -> QBFC enum value
     'Bank': 0,
     'AccountsReceivable': 1,
     'OtherCurrentAsset': 2,
@@ -204,6 +205,8 @@ ACCOUNT_TYPE_MAP = {
     'OtherExpense': 14,
     'NonPosting': 15,
 }
+# QBFC export returns enum integers (as strings), so also accept those
+ACCOUNT_TYPE_MAP.update({str(v): v for v in ACCOUNT_TYPE_MAP.values()})
 
 
 def import_accounts(session: Any, accounts: List[Dict], log_fn: Optional[LogFn] = None) -> int:
@@ -381,7 +384,7 @@ def import_vendors(session: Any, vendors: List[Dict], log_fn: Optional[LogFn] = 
         _set_amount_if(add, 'CreditLimit', v.get('credit_limit'))
 
         # 1099 eligibility
-        if v.get('is_1099', '').upper() in ('Y', 'TRUE', '1', 'YES'):
+        if str(v.get('is_1099', '')).upper() in ('Y', 'TRUE', '1', 'YES'):
             try:
                 add.IsVendorEligibleFor1099.SetValue(True)
             except Exception:
