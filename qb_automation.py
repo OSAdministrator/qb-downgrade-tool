@@ -1813,19 +1813,31 @@ class QuickBooksAutomationEngine:
         # ------------------------------------------------------------------
         # QBFC SDK path (preferred)
         # ------------------------------------------------------------------
-        # By the time _export_from_qb2023 is called, the orchestrator has
-        # already launched QB, waited for the user to enter the password
-        # manually, and confirmed the company is fully loaded. We just
-        # connect QBFC to the already-open company file — no UI at all.
+        # QBFC requires the company to be FULLY OPEN before we can connect.
+        # Handle password + wait for company to load BEFORE attempting QBFC.
         # ------------------------------------------------------------------
         if not self.config.dry_run:
+            if self._qb2023_app is None:
+                raise RuntimeError("QB 2023 app instance is not initialized")
+
+            self._emit("Waiting for QB 2023 to finish opening company file (pre-QBFC)...", log_fn)
+            try:
+                self._handle_startup_dialogs(job.password, timeout_s=60, log_fn=log_fn)
+                main_window = self._find_qb_main_window(self._qb2023_app, "2023", self.config.timeouts.launch_qb_seconds)
+                self._wait_for_company_ready(main_window, timeout_s=self.config.timeouts.open_company_seconds, log_fn=log_fn)
+                self._dismiss_common_dialogs(log_fn)
+                self._close_popup_windows(main_window, log_fn)
+                self._emit("QB 2023 company is loaded. Proceeding to QBFC export.", log_fn)
+            except Exception as exc:  # noqa: BLE001
+                import traceback as _tb
+                self._emit(f"WARN: pre-QBFC company-load wait failed: {exc}", log_fn)
+                self._emit(_tb.format_exc(), log_fn)
+
             try:
                 from qbfc_export import export_company_via_qbfc  # local import to avoid mandatory dep
 
                 self._emit("=== Attempting QBFC SDK export ===", log_fn)
                 self._emit(f"  Target company file: {job.qbw_path}", log_fn)
-                # Pass the actual qbw_path so QBFC connects to the correct company
-                # (avoids binding to a previously-open file when QB has multiple windows)
                 results = export_company_via_qbfc(qbw_path=job.qbw_path, export_dir=export_dir, log_fn=log_fn)
                 self._emit("=== QBFC SDK export succeeded ===", log_fn)
                 return results
@@ -1833,7 +1845,11 @@ class QuickBooksAutomationEngine:
                 import traceback as _tb
                 self._emit(f"QBFC export failed: {exc}", log_fn)
                 self._emit(_tb.format_exc(), log_fn)
-                self._emit("Falling back to legacy UI automation export path", log_fn)
+                # FAIL HARD — do not fall back to legacy IIF UI automation.
+                # IIF export loses too much data (no entity refs, no proper
+                # AP/AR linkage, no rich fields).  If QBFC fails we want the
+                # job to fail loudly so we can debug it.
+                raise RuntimeError(f"QBFC SDK export failed and legacy IIF fallback is disabled: {exc}")
 
         if self.config.dry_run:
             sample_root = Path.home() / "Uploads" / "QBDowngrade_Results"
