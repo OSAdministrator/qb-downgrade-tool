@@ -521,7 +521,10 @@ def import_items(session: Any, items: List[Dict], accounts: Optional[List[Dict]]
         elif item_type in ('Payment',):
             add = req.AppendItemPaymentAddRq()
         elif item_type in ('SalesTaxGroup',):
-            add = req.AppendItemSalesTaxGroupAddRq()
+            # SalesTaxGroup requires non-empty ItemSalesTaxRefList of child tax items.
+            # Skip — customer can recreate via QB UI if needed.
+            _emit(f"  Item '{name}' (SalesTaxGroup): SKIPPED (rebuild manually in QB)", log_fn)
+            continue
         elif item_type in ('Group',):
             add = req.AppendItemGroupAddRq()
         elif item_type in ('FixedAsset',):
