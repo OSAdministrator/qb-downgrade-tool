@@ -805,6 +805,122 @@ def _ensure_referenced_accounts(session: Any, transactions: List[Dict], log_fn: 
     return created
 
 
+# ---------------------------------------------------------------------------
+# Native Credit Card transaction import
+# ---------------------------------------------------------------------------
+# JournalEntries flip the charge/payment column in the CC register.
+# We must use CreditCardChargeAdd / CreditCardCreditAdd so QB shows
+# transactions in the correct Charge or Payment column.
+
+def _import_cc_charge(session, tx, date_str, ref_num, entity, memo, lines, log_fn):
+    """Import a CreditCardCharge using AppendCreditCardChargeAddRq.
+
+    Returns 1=ok, 0=skipped, -1=failed.
+    """
+    # Identify the CC (header) account — it's the line with a credit
+    # whose account type is CreditCard.
+    cc_acct = ""
+    expense_lines = []
+    for ln in lines:
+        acct = (ln.get('account') or '').strip()
+        debit = float(ln.get('debit', 0) or 0)
+        credit = float(ln.get('credit', 0) or 0)
+        if credit > 0 and not debit:
+            # This is the header (credit card account itself)
+            cc_acct = acct
+        elif debit > 0:
+            expense_lines.append((acct, round(debit, 2)))
+
+    if not cc_acct or not expense_lines:
+        return 0  # skip — can't determine structure
+
+    try:
+        req = _create_request_set(session)
+        add = req.AppendCreditCardChargeAddRq()
+        add.AccountRef.FullName.SetValue(cc_acct)
+        _set_if(add, 'TxnDate', date_str)
+        _set_if(add, 'RefNumber', ref_num)
+        _set_if(add, 'Memo', memo[:4095] if memo else f"TimeWarp: CreditCardCharge")
+        if entity:
+            try:
+                add.PayeeEntityRef.FullName.SetValue(entity)
+            except Exception:
+                pass
+
+        for acct, amt in expense_lines:
+            el = add.ExpenseLineAddList.Append()
+            el.AccountRef.FullName.SetValue(acct)
+            el.Amount.SetValue(amt)
+
+        if _do_add_request(session, req, f"CCCharge {ref_num} {entity}", log_fn):
+            return 1
+        return -1
+    except Exception as exc:
+        _emit(f"  CCCharge failed: {exc}", log_fn)
+        return -1
+
+
+def _import_cc_credit(session, tx, date_str, ref_num, entity, memo, lines, log_fn):
+    """Import a CreditCardCredit using AppendCreditCardCreditAddRq.
+
+    Returns 1=ok, 0=skipped, -1=failed.
+    """
+    # In a CC Credit (refund/return), the export reverses the lines:
+    #   header CC account → debit (reduces liability)
+    #   expense accounts → credit (reduces expense)
+    cc_acct = ""
+    expense_lines = []
+    for ln in lines:
+        acct = (ln.get('account') or '').strip()
+        debit = float(ln.get('debit', 0) or 0)
+        credit = float(ln.get('credit', 0) or 0)
+        if debit > 0 and not credit:
+            # This is the header (CC account being debited = reducing liability)
+            # But could also be an expense line... need to distinguish.
+            acct_key = acct.strip().lower()
+            acct_type = _ACCOUNT_TYPE_CACHE.get(acct_key)
+            if acct_type == 6:  # CreditCard
+                cc_acct = acct
+            else:
+                # Check by name heuristic
+                n = acct.lower()
+                if any(k in n for k in ('credit card', 'visa', 'mastercard', 'amex', 'discover', 'cc ')):
+                    cc_acct = acct
+                else:
+                    expense_lines.append((acct, round(debit, 2)))
+        elif credit > 0:
+            expense_lines.append((acct, round(credit, 2)))
+
+    if not cc_acct or not expense_lines:
+        return 0  # skip
+
+    try:
+        req = _create_request_set(session)
+        add = req.AppendCreditCardCreditAddRq()
+        add.AccountRef.FullName.SetValue(cc_acct)
+        _set_if(add, 'TxnDate', date_str)
+        _set_if(add, 'RefNumber', ref_num)
+        _set_if(add, 'Memo', memo[:4095] if memo else f"TimeWarp: CreditCardCredit")
+        if entity:
+            try:
+                add.PayeeEntityRef.FullName.SetValue(entity)
+            except Exception:
+                pass
+
+        for acct, amt in expense_lines:
+            el = add.ExpenseLineAddList.Append()
+            el.AccountRef.FullName.SetValue(acct)
+            el.Amount.SetValue(amt)
+
+        if _do_add_request(session, req, f"CCCredit {ref_num} {entity}", log_fn):
+            return 1
+        return -1
+    except Exception as exc:
+        _emit(f"  CCCredit failed: {exc}", log_fn)
+        return -1
+
+
+
 def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional[LogFn] = None) -> int:
     """Import transactions into QB as JournalEntries.
 
@@ -855,6 +971,32 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
 
         if not date_str:
             skipped += 1
+            continue
+
+        # Normalize date
+        if ' ' in date_str:
+            date_str = date_str.split(' ')[0]
+
+        # --- Native credit card transactions ---
+        # JournalEntries flip the charge/payment presentation in the CC
+        # register, so we must use native CreditCardCharge / CreditCardCredit.
+        if tx_type == 'CreditCardCharge' and lines:
+            result = _import_cc_charge(session, tx, date_str, ref_num, entity, memo, lines, log_fn)
+            if result == 1:
+                ok += 1
+            elif result == 0:
+                skipped += 1
+            else:
+                failed += 1
+            continue
+        if tx_type == 'CreditCardCredit' and lines:
+            result = _import_cc_credit(session, tx, date_str, ref_num, entity, memo, lines, log_fn)
+            if result == 1:
+                ok += 1
+            elif result == 0:
+                skipped += 1
+            else:
+                failed += 1
             continue
 
         # --- New format: transaction has explicit debit/credit lines ---
