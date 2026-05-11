@@ -1820,11 +1820,21 @@ class QuickBooksAutomationEngine:
             if self._qb2023_app is None:
                 raise RuntimeError("QB 2023 app instance is not initialized")
 
-            self._emit("Waiting for QB 2023 to finish opening company file (pre-QBFC)...", log_fn)
+            # Wait for the user to enter the password in QB 2023 manually.
+            # send_keys password typing is unreliable with QB's non-standard
+            # dialogs, so we just tell the user what to do and poll for the
+            # company to load (title bar changes from "No Company Open").
+            self._emit("", log_fn)
+            self._emit("=" * 60, log_fn)
+            self._emit("ACTION REQUIRED: Enter the admin password in QuickBooks 2023.", log_fn)
+            self._emit(f"  Password: {job.password}", log_fn)
+            self._emit("  The tool will auto-detect when the company is loaded.", log_fn)
+            self._emit("=" * 60, log_fn)
+            self._emit("", log_fn)
             try:
-                self._handle_startup_dialogs(job.password, timeout_s=60, log_fn=log_fn)
                 main_window = self._find_qb_main_window(self._qb2023_app, "2023", self.config.timeouts.launch_qb_seconds)
-                self._wait_for_company_ready(main_window, timeout_s=self.config.timeouts.open_company_seconds, log_fn=log_fn)
+                # Give user up to 5 minutes to type the password
+                self._wait_for_company_ready(main_window, timeout_s=300, log_fn=log_fn)
                 self._dismiss_common_dialogs(log_fn)
                 self._close_popup_windows(main_window, log_fn)
                 self._emit("QB 2023 company is loaded. Proceeding to QBFC export.", log_fn)
@@ -1880,107 +1890,6 @@ class QuickBooksAutomationEngine:
 
             return {"lists_iif": lists_iif, "tx_csv": tx_csv, **report_files}
 
-        if self._qb2023_app is None:
-            raise RuntimeError("QB 2023 app instance is not initialized")
-
-        # =================================================================
-        # SIMPLIFIED FLOW (2026-05-11):
-        # run_job() already launched QB with the .qbw file as a command-line
-        # parameter.  QB is auto-opening the company and prompting for the
-        # password.  We just need to:
-        #   1. Handle the password dialog (type + Enter)
-        #   2. Wait for the company to fully load (title bar check)
-        #   3. Dismiss post-login popups
-        # We NEVER call _open_company_file() here — that method kills and
-        # relaunches QB, causing the double-open bug.
-        # =================================================================
-        self._emit("Waiting for QB 2023 to finish opening company file...", log_fn)
-
-        # 1. Handle startup password dialog
-        self._handle_startup_dialogs(job.password, timeout_s=60, log_fn=log_fn)
-
-        # 2. Find the main window and wait for company to load
-        main_window = self._find_qb_main_window(self._qb2023_app, "2023", self.config.timeouts.launch_qb_seconds)
-        self._wait_for_company_ready(main_window, timeout_s=self.config.timeouts.open_company_seconds, log_fn=log_fn)
-
-        # 3. Dismiss post-login popups
-        self._dismiss_common_dialogs(log_fn)
-        self._close_popup_windows(main_window, log_fn)
-
-        # Export all QuickBooks list panes in one shot to a single combined IIF.
-        # This avoids the prior N-pass isolate/toggle flow that could accidentally
-        # leave every checkbox selected while trying to isolate one list.
-        self._with_retries(
-            lambda: self._export_single_list_iif(
-                main_window,
-                "All Lists",
-                lists_iif,
-                log_fn,
-                select_all=True,
-            ),
-            "Export all lists IIF",
-            log_fn,
-        )
-
-        # Export report PDFs BEFORE the transaction CSV, because the CSV
-        # export can take a very long time (Building Report dialog) and is the
-        # most failure-prone step.  Getting reports first ensures we have them
-        # even if the CSV step times out.
-        report_exports = {
-            "TrialBalance_QB2023.pdf": (
-                "Reports->Accountant & Taxes->Trial Balance",
-                "%rab",
-            ),
-            "BalanceSheet_QB2023.pdf": (
-                "Reports->Company & Financial->Balance Sheet Standard",
-                "%rcb",
-            ),
-            "ProfitLoss_QB2023.pdf": (
-                "Reports->Company & Financial->Profit & Loss Standard",
-                "%rcp",
-            ),
-            "AR_Aging_QB2023.pdf": (
-                "Reports->Customers & Receivables->A/R Aging Summary",
-                "%rcr",
-            ),
-            "AP_Aging_QB2023.pdf": (
-                "Reports->Vendors & Payables->A/P Aging Summary",
-                "%rvp",
-            ),
-        }
-
-        generated_report_paths: Dict[str, Path] = {}
-        for report_file, (menu_path, fallback_keys) in report_exports.items():
-            out_path = export_dir / report_file
-            self._with_retries(
-                lambda menu_path=menu_path, fallback_keys=fallback_keys, out_path=out_path: self._export_report_pdf(
-                    main_window,
-                    menu_path,
-                    fallback_keys,
-                    out_path,
-                    log_fn,
-                ),
-                f"Export report {report_file}",
-                log_fn,
-            )
-            generated_report_paths[report_file] = out_path
-
-        # Transaction CSV export is last — it's the slowest step and may
-        # trigger a long "Building Report" dialog.  The timeout/polling
-        # improvements in _export_transaction_list_csv handle this gracefully.
-        self._with_retries(
-            lambda: self._export_transaction_list_csv(main_window, tx_csv, log_fn),
-            "Export transaction report CSV",
-            log_fn,
-        )
-
-        return {
-            "lists_iif": lists_iif,
-            "tx_csv": tx_csv,
-            **generated_report_paths,
-        }
-
-    # -------- QB 2021 import --------
 
     def _create_qb2021_company(self, job: CompanyJob, target_dir: Path, log_fn: Optional[LogFn]) -> Path:
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -2306,12 +2215,17 @@ class QuickBooksAutomationEngine:
                 )
                 self._qb2021_app = qb2021_app
 
-                # Wait for QB 2021 to open, handle password, dismiss dialogs
+                # Wait for the user to enter the template password in QB 2021.
                 template_password = self.config.install_paths.qb_2021_template_password
-                self._emit("Waiting for QB 2021 to open template file...", log_fn)
-                self._handle_startup_dialogs(template_password, timeout_s=60, log_fn=log_fn)
+                self._emit("", log_fn)
+                self._emit("=" * 60, log_fn)
+                self._emit("ACTION REQUIRED: Enter the template password in QuickBooks 2021.", log_fn)
+                self._emit(f"  Password: {template_password}", log_fn)
+                self._emit("  The tool will auto-detect when the company is loaded.", log_fn)
+                self._emit("=" * 60, log_fn)
+                self._emit("", log_fn)
                 qb2021_main = self._find_qb_main_window(qb2021_app, "2021", self.config.timeouts.launch_qb_seconds)
-                self._wait_for_company_ready(qb2021_main, timeout_s=self.config.timeouts.open_company_seconds, log_fn=log_fn)
+                self._wait_for_company_ready(qb2021_main, timeout_s=300, log_fn=log_fn)
                 self._dismiss_common_dialogs(log_fn)
                 self._close_popup_windows(qb2021_main, log_fn)
                 self._emit("QB 2021 template is open and ready for QBFC import.", log_fn)
