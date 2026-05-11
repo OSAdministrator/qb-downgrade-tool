@@ -655,12 +655,28 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
 
         # --- New format: transaction has explicit debit/credit lines ---
         if lines:
-            # Filter to lines with valid accounts and non-zero amounts
+            # Filter to lines with valid accounts and non-zero amounts.
+            # QBFC Amount must be positive, finite, max 2 decimals.
+            import math
             valid_lines = []
             for ln in lines:
                 acct = (ln.get('account') or '').strip()
-                debit = float(ln.get('debit', 0) or 0)
-                credit = float(ln.get('credit', 0) or 0)
+                try:
+                    debit = float(ln.get('debit', 0) or 0)
+                    credit = float(ln.get('credit', 0) or 0)
+                except (ValueError, TypeError):
+                    continue
+                if not math.isfinite(debit) or not math.isfinite(credit):
+                    continue
+                # Treat negatives as their opposite side
+                if debit < 0:
+                    credit = credit + (-debit)
+                    debit = 0.0
+                if credit < 0:
+                    debit = debit + (-credit)
+                    credit = 0.0
+                debit = round(debit, 2)
+                credit = round(credit, 2)
                 if acct and (debit > 0 or credit > 0):
                     valid_lines.append((acct, debit, credit))
 
