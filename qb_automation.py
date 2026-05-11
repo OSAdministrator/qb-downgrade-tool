@@ -1977,21 +1977,36 @@ class QuickBooksAutomationEngine:
             if self._qb2023_app is None:
                 raise RuntimeError("QB 2023 app instance is not initialized")
 
-            # Wait for the user to enter the password in QB 2023 manually.
-            # send_keys password typing is unreliable with QB's non-standard
-            # dialogs, so we just tell the user what to do and poll for the
-            # company to load (title bar changes from "No Company Open").
-            self._emit("", log_fn)
-            self._emit("=" * 60, log_fn)
-            self._emit("ACTION REQUIRED: Enter the admin password in QuickBooks 2023.", log_fn)
-            if job.password:
-                self._emit(f"  Password: {job.password}", log_fn)
-            self._emit("  The tool will auto-detect when the company is loaded.", log_fn)
-            self._emit("=" * 60, log_fn)
-            self._emit("", log_fn)
+            # Auto-type the source file password.
+            # For Tax Man Mike build: all files share the same password,
+            # so we auto-enter it via _handle_startup_dialogs().
+            # For public/retail build: job.password comes from the GUI
+            # password field (user enters it before clicking Start).
+            source_password = job.password or ""
+            if source_password:
+                self._emit("Auto-entering source file password in QB 2023...", log_fn)
+                self._handle_startup_dialogs(
+                    password=source_password,
+                    timeout_s=120,
+                    log_fn=log_fn,
+                )
+            else:
+                self._emit("", log_fn)
+                self._emit("=" * 60, log_fn)
+                self._emit("ACTION REQUIRED: Enter the admin password in QuickBooks 2023.", log_fn)
+                self._emit("  The tool will auto-detect when the company is loaded.", log_fn)
+                self._emit("=" * 60, log_fn)
+                self._emit("", log_fn)
+
             try:
-                main_window = self._find_qb_main_window(self._qb2023_app, "2023", self.config.timeouts.launch_qb_seconds)
-                # Give user up to 5 minutes to type the password
+                # Watchdog hides QB main windows — use include_hidden
+                # so we can still find and poll the title bar.
+                main_window = self._find_qb_main_window(
+                    self._qb2023_app, "2023",
+                    self.config.timeouts.launch_qb_seconds,
+                    include_hidden=True,
+                )
+                # Give up to 5 minutes for company to finish loading
                 self._wait_for_company_ready(main_window, timeout_s=300, log_fn=log_fn)
                 self._dismiss_common_dialogs(log_fn)
                 self._close_popup_windows(main_window, log_fn)
