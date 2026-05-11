@@ -1653,22 +1653,23 @@ class QuickBooksAutomationEngine:
         # instance first. This prevents the "Secondary" window problem where
         # QB opens the new file as a secondary window while the old file
         # remains the primary — QBFC then connects to the wrong company.
+        #
+        # 2026-05-11: Skip the graceful menu-close for stale instances.
+        # The old _close_qb path gets stuck on password dialogs from cached
+        # company files, wasting 90+ seconds before force-killing anyway.
+        # Just force-kill immediately — we don't care about data in the
+        # stale instance (we're about to open a fresh template).
         if qbw_path:
-            try:
-                existing = Application(backend="uia").connect(path=exe_path)
-                self._emit(f"  Killing existing QB instance before clean launch...", log_fn)
-                self._close_qb(existing, log_fn)
-                time.sleep(5)  # give QB time to fully exit
-            except Exception:  # noqa: BLE001
-                pass  # not running — good
-
-            # Also force-kill any lingering QB processes
             import subprocess
-            subprocess.run(
-                ["taskkill", "/F", "/IM", exe_name],
-                capture_output=True, timeout=10
-            )
-            time.sleep(3)
+            self._emit(f"  Force-killing any existing QB instance before clean launch...", log_fn)
+            for img in (exe_name, "QBW32.EXE", "QBW.EXE",
+                        "QBW32PremierAccountant.exe", "QBWPremierAccountant.exe",
+                        "qbw32.exe", "qbw.exe"):
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", img],
+                    capture_output=True, timeout=10
+                )
+            time.sleep(5)  # give Windows time to release file locks
 
             cmd_line = f'"{exe_path}" "{qbw_path}"'
             self._emit(f"  Starting QB with command: {cmd_line}", log_fn)
