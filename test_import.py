@@ -37,23 +37,26 @@ def main():
 
     # Step 1: Copy template
     TARGET_DIR.mkdir(parents=True, exist_ok=True)
-    if TARGET_QBW.exists():
-        log(f"Removing old target: {TARGET_QBW}")
-        TARGET_QBW.unlink()
-        for ext in (".tlg", ".nd", ".DSN"):
-            old = TARGET_QBW.with_suffix(ext)
-            if old.exists():
-                old.unlink()
+    # Clean old target files (some may be locked by QB)
+    for f in TARGET_DIR.glob("joshs gold coast ii 21*"):
+        try:
+            f.unlink()
+            log(f"  Removed {f.name}")
+        except PermissionError:
+            log(f"  WARN: could not remove {f.name} (locked?) — continuing")
 
     log(f"Copying template to {TARGET_QBW}")
     shutil.copy2(TEMPLATE, TARGET_QBW)
-    # Copy companion files
+    # Copy companion files (best-effort, not critical)
     for ext in (".qbw.DSN", ".qbw.ND"):
         src = TEMPLATE.parent / f"Blank Template{ext}"
         if src.exists():
             dst = TARGET_DIR / f"joshs gold coast ii 21{ext}"
-            shutil.copy2(src, dst)
-            log(f"  Copied {src.name}")
+            try:
+                shutil.copy2(src, dst)
+                log(f"  Copied {src.name}")
+            except PermissionError:
+                log(f"  WARN: could not copy {src.name} (locked?) — QB will recreate it")
 
     log(f"Template copied ({TARGET_QBW.stat().st_size / 1024 / 1024:.1f} MB)")
 
