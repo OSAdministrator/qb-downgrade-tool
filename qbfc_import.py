@@ -776,6 +776,11 @@ def _ensure_referenced_accounts(session: Any, transactions: List[Dict], log_fn: 
     existing, types = _list_accounts_with_types(session, log_fn)
     _ACCOUNT_TYPE_CACHE.clear()
     _ACCOUNT_TYPE_CACHE.update(types)
+    # Debug: show accounts detected as AP(5) or AR(1)
+    ap_ar = {k: v for k, v in _ACCOUNT_TYPE_CACHE.items() if v in (1, 5)}
+    _emit(f"  Account type cache: {len(_ACCOUNT_TYPE_CACHE)} entries, {len(ap_ar)} are AP/AR:", log_fn)
+    for k, v in sorted(ap_ar.items()):
+        _emit(f"    type={v} -> '{k}'", log_fn)
     missing = [a for a in refs if a.strip().lower() not in existing]
     if not missing:
         _emit(f"QBFC Import: All {len(refs)} referenced accounts exist.", log_fn)
@@ -909,6 +914,8 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                     line_entity = entity
                     if needs_entity and not line_entity:
                         line_entity = 'TimeWarp Migration'
+                    if needs_entity:
+                        _emit(f"    -> AP/AR line: acct='{acct}' type={acct_type} entity='{line_entity}'", log_fn)
 
                     if debit > 0:
                         ol = je.ORJournalLineList.Append()
