@@ -618,6 +618,154 @@ def import_items(session: Any, items: List[Dict], accounts: Optional[List[Dict]]
 # Transaction import via QBFC
 # ---------------------------------------------------------------------------
 
+def _guess_account_type(name: str) -> int:
+    """Best-effort type guess from account name. Default = Bank.
+
+    Returns a QBFC AccountType enum int.
+    """
+    n = name.lower()
+    # Bank / cash
+    if any(k in n for k in ('bank', 'checking', 'savings', 'cash', 'petty', 'money market', 'mm acct', 'bk acct')):
+        return 0  # Bank
+    # Credit card
+    if any(k in n for k in ('credit card', 'visa', 'mastercard', 'amex', 'discover', 'cc ')):
+        return 6  # CreditCard
+    # A/R, A/P
+    if 'accounts receivable' in n or n.startswith('a/r'):
+        return 1
+    if 'accounts payable' in n or n.startswith('a/p'):
+        return 5
+    # Equity hints
+    if any(k in n for k in ('equity', 'retained', 'opening balance')):
+        return 9
+    # Income hints
+    if any(k in n for k in ('income', 'revenue', 'sales')):
+        return 10
+    # COGS
+    if 'cost of goods' in n or 'cogs' in n:
+        return 11
+    # Liability hints
+    if any(k in n for k in ('loan', 'payable', 'liability', 'note payable', 'mortgage')):
+        return 8 if 'long' in n or 'mortgage' in n else 7
+    # Asset hints
+    if any(k in n for k in ('depreciation', 'fixed asset', 'equipment', 'building', 'vehicle', 'furniture')):
+        return 3  # FixedAsset
+    if any(k in n for k in ('asset', 'prepaid', 'deposit', 'receivable')):
+        return 2  # OtherCurrentAsset
+    # Expense (default for unrecognized)
+    if any(k in n for k in ('expense', 'fee', 'cost', 'tax', 'utilities', 'rent', 'insurance', 'supplies', 'payroll', 'wages', 'meals')):
+        return 12
+    # Final fallback: Bank (safe for transfers/checks which is what triggers missing refs)
+    return 0
+
+
+def _list_existing_accounts(session: Any) -> set:
+    """Query QB for all existing account FullNames (lowercase set)."""
+    names = set()
+    try:
+        req = _create_request_set(session)
+        q = req.AppendAccountQueryRq()
+        try:
+            q.IncludeRetElementList.Add('FullName')
+        except Exception:
+            pass
+        resp_set = session.DoRequests(req)
+        resp = resp_set.ResponseList.GetAt(0)
+        if resp.StatusCode == 0 and resp.Detail is not None:
+            lst = resp.Detail
+            for i in range(lst.Count):
+                acct = lst.GetAt(i)
+                try:
+                    fn = acct.FullName.GetValue()
+                    if fn:
+                        names.add(fn.strip().lower())
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return names
+
+
+def _ensure_referenced_accounts(session: Any, transactions: List[Dict], log_fn: Optional[LogFn] = None) -> int:
+    """Scan all transactions, find referenced account names that don't exist
+    in QB, and auto-create stub accounts with a best-effort type guess.
+
+    Returns count of accounts created.
+    """
+    # Collect all referenced account names
+    refs = set()
+    for tx in transactions:
+        for ln in tx.get('lines', []) or []:
+            acct = (ln.get('account') or '').strip()
+            if acct:
+                refs.add(acct)
+        # Legacy single-account form
+        legacy = (tx.get('account') or '').strip()
+        if legacy:
+            refs.add(legacy)
+
+    if not refs:
+        return 0
+
+    existing = _list_existing_accounts(session)
+    missing = [a for a in refs if a.strip().lower() not in existing]
+    if not missing:
+        _emit(f"QBFC Import: All {len(refs)} referenced accounts exist.", log_fn)
+        return 0
+
+    _emit(f"QBFC Import: Auto-creating {len(missing)} missing account(s) referenced by transactions...", log_fn)
+
+    # Sort by depth so parents come before children
+    missing.sort(key=lambda n: n.count(':'))
+
+    created = 0
+    for name in missing:
+        # Ensure parent exists first (create as expense stub if needed)
+        parent_full = None
+        leaf = name
+        if ':' in name:
+            parent_full, leaf = name.rsplit(':', 1)
+            if parent_full.strip().lower() not in existing:
+                # Recursively create parent as a stub Bank/Expense
+                try:
+                    p_req = _create_request_set(session)
+                    p_add = p_req.AppendAccountAddRq()
+                    p_add.Name.SetValue(parent_full.rsplit(':', 1)[-1])
+                    if ':' in parent_full:
+                        try: p_add.ParentRef.FullName.SetValue(parent_full.rsplit(':', 1)[0])
+                        except Exception: pass
+                    p_add.AccountType.SetValue(_guess_account_type(parent_full))
+                    p_add.Desc.SetValue('Auto-created by TimeWarp')
+                    session.DoRequests(p_req)
+                    existing.add(parent_full.strip().lower())
+                except Exception:
+                    pass
+
+        try:
+            req = _create_request_set(session)
+            add = req.AppendAccountAddRq()
+            add.Name.SetValue(leaf)
+            if parent_full:
+                try: add.ParentRef.FullName.SetValue(parent_full)
+                except Exception: pass
+            add.AccountType.SetValue(_guess_account_type(name))
+            try: add.Desc.SetValue('Auto-created by TimeWarp (referenced by imported transaction)')
+            except Exception: pass
+            resp_set = session.DoRequests(req)
+            resp = resp_set.ResponseList.GetAt(0)
+            if resp.StatusCode == 0:
+                created += 1
+                existing.add(name.strip().lower())
+                _emit(f"  + Created stub account '{name}' (type {_guess_account_type(name)})", log_fn)
+            else:
+                _emit(f"  ! Could not auto-create '{name}': {resp.StatusMessage}", log_fn)
+        except Exception as exc:
+            _emit(f"  ! Auto-create exception for '{name}': {exc}", log_fn)
+
+    _emit(f"QBFC Import: Auto-created {created}/{len(missing)} stub accounts.", log_fn)
+    return created
+
+
 def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional[LogFn] = None) -> int:
     """Import transactions into QB as JournalEntries.
 
@@ -636,6 +784,9 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
         has_lines = "lines" in sample
         _emit(f"  Format: {'new (with lines)' if has_lines else 'legacy (account+amount)'}", log_fn)
         _emit(f"  Sample tx[0] keys: {list(sample.keys())}", log_fn)
+
+    # ── Pre-flight: ensure all referenced accounts exist (auto-create stubs) ──
+    _ensure_referenced_accounts(session, transactions, log_fn)
 
     ok = 0
     skipped = 0
