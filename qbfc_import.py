@@ -1030,7 +1030,7 @@ def import_opening_balances(
 
     For each account, compute the net movement implied by the snapshot
     transactions, compare to the actual balance recorded by QB 2023, and
-    post the difference against "Opening Bal Equity".
+    post the difference against "Opening Balance Equity".
 
     This must run AFTER import_transactions so we don't double-count.
     The JE is dated one day before the earliest transaction.
@@ -1086,6 +1086,22 @@ def import_opening_balances(
     for name, gap in sorted(gaps, key=lambda x: -abs(x[1])):
         _emit(f"    {name}: gap={gap:+.2f}", log_fn)
 
+    # Ensure "Opening Balance Equity" account exists (QB creates it by
+    # default, but the Blank Template may not have it).
+    try:
+        req = _create_request_set(session)
+        add = req.AppendAccountAddRq()
+        add.Name.SetValue("Opening Balance Equity")
+        add.AccountType.SetValue(14)  # Equity
+        resp_set = session.session_manager.DoRequests(req)
+        resp = resp_set.ResponseList.GetAt(0)
+        if resp.StatusCode == 0:
+            _emit("  + Created 'Opening Balance Equity' account", log_fn)
+        elif resp.StatusCode == 3100:
+            pass  # already exists
+    except Exception:
+        pass
+
     # 4. Split into batches of ~20 lines (QBFC JE line limit is ~1000, but
     #    smaller batches are safer and easier to debug).
     BATCH = 20
@@ -1123,12 +1139,12 @@ def import_opening_balances(
                     pass
                 obe_debit_total += abs(gap)
 
-        # Offset everything against "Opening Bal Equity"
+        # Offset everything against "Opening Balance Equity"
         net_obe = obe_credit_total - obe_debit_total
         if abs(net_obe) >= 0.005:
             if net_obe > 0:
                 ol = je.ORJournalLineList.Append()
-                ol.JournalCreditLine.AccountRef.FullName.SetValue("Opening Bal Equity")
+                ol.JournalCreditLine.AccountRef.FullName.SetValue("Opening Balance Equity")
                 ol.JournalCreditLine.Amount.SetValue(round(abs(net_obe), 2))
                 try:
                     ol.JournalCreditLine.Memo.SetValue("TimeWarp: Opening balance offset")
@@ -1136,7 +1152,7 @@ def import_opening_balances(
                     pass
             else:
                 ol = je.ORJournalLineList.Append()
-                ol.JournalDebitLine.AccountRef.FullName.SetValue("Opening Bal Equity")
+                ol.JournalDebitLine.AccountRef.FullName.SetValue("Opening Balance Equity")
                 ol.JournalDebitLine.Amount.SetValue(round(abs(net_obe), 2))
                 try:
                     ol.JournalDebitLine.Memo.SetValue("TimeWarp: Opening balance offset")
