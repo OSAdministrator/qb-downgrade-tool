@@ -2493,6 +2493,28 @@ class QuickBooksAutomationEngine:
             if import_results:
                 generated_files["import_summary"] = str(import_results)
 
+            # Generate Memorized Transactions report (Excel + PDF) so the
+            # operator has a printable cheat-sheet for re-memorizing the
+            # templates QBFC cannot recreate.
+            try:
+                snapshot_path = exports_dir / "company_snapshot.json"
+                if snapshot_path.exists():
+                    import json as _json
+                    with snapshot_path.open("r", encoding="utf-8") as fh:
+                        snap = _json.load(fh)
+                    memorized = snap.get("memorized_txns") or []
+                    if memorized:
+                        from memorized_report import generate_reports as _gen_memo
+                        memo_out = _gen_memo(memorized, validation_dir, job.qbw_path.stem)
+                        if memo_out.get("xlsx"):
+                            generated_files["memorized_xlsx"] = str(memo_out["xlsx"])
+                            self._emit(f"  Memorized report (Excel): {memo_out['xlsx']}", log_fn)
+                        if memo_out.get("pdf"):
+                            generated_files["memorized_pdf"] = str(memo_out["pdf"])
+                            self._emit(f"  Memorized report (PDF):   {memo_out['pdf']}", log_fn)
+            except Exception as _exc:  # noqa: BLE001
+                self._emit(f"  Memorized report generation failed: {_exc}", log_fn)
+
             return CompanyJobResult(
                 qbw_path=str(job.qbw_path),
                 success=True,

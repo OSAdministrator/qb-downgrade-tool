@@ -386,6 +386,8 @@ class QuickBooksDowngradeGUI:
             if result.success:
                 self._update_row(row_id, "Success", "Completed")
                 self._log(f"✔ {item.qbw_path.name}: success")
+                # Surface the finish screen on the UI thread
+                self.root.after(0, lambda r=result, n=item.qbw_path.name: self._show_finish_dialog(r, n))
             else:
                 self._update_row(row_id, "Failed", result.message)
                 self._log(f"✖ {item.qbw_path.name}: {result.message}")
@@ -398,6 +400,14 @@ class QuickBooksDowngradeGUI:
         self.btn_start.configure(state=tk.NORMAL)
         self._stop_heartbeat()
         self._log("Batch processing finished.")
+
+    def _show_finish_dialog(self, result, original_name: str) -> None:
+        """Pop up the finish/download screen for a completed company."""
+        try:
+            from finish_dialog import FinishDialog
+            FinishDialog(self.root, result, original_name)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"Could not open finish dialog: {exc}")
 
     def _set_batch_progress(self, item_index: int, total_items: int, item_percent: float) -> None:
         base = (item_index - 1) / total_items * 100
