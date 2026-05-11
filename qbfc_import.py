@@ -467,7 +467,7 @@ def import_items(session: Any, items: List[Dict], log_fn: Optional[LogFn] = None
     ok = 0
     for it in items:
         name = it.get('name', '').strip()
-        item_type = it.get('type', 'Service').strip()
+        item_type = (it.get('item_type') or it.get('type') or 'Service').strip()
         if not name:
             continue
 
@@ -502,35 +502,74 @@ def import_items(session: Any, items: List[Dict], log_fn: Optional[LogFn] = None
         else:
             _set_if(add, 'Name', name)
 
-        # For service/non-inventory items, use SalesOrPurchase or SalesAndPurchase
-        # Try setting direct fields first, fall back to nested
-        desc = it.get('description') or it.get('sales_desc')
-        price = it.get('price')
-        cost = it.get('cost')
-        income_acct = it.get('income_account')
-        expense_acct = it.get('cogs_account') or it.get('expense_account')
+        # Extract field values from snapshot
+        desc = it.get('description') or it.get('sales_desc') or ''
+        purchase_desc = it.get('purchase_desc') or ''
+        price = it.get('sales_price') or it.get('price')
+        cost = it.get('purchase_cost') or it.get('cost')
+        income_acct = it.get('income_account') or ''
+        expense_acct = it.get('cogs_account') or it.get('expense_account') or ''
+        asset_acct = it.get('asset_account') or ''
 
-        # Try direct fields (works for Inventory items)
-        _set_if(add, 'SalesDesc', desc)
-        _set_if(add, 'PurchaseDesc', it.get('purchase_desc'))
-        _set_amount_if(add, 'SalesPrice', price)
-        _set_amount_if(add, 'PurchaseCost', cost)
-        _set_ref_if(add, 'IncomeAccountRef', income_acct)
-        _set_ref_if(add, 'COGSAccountRef', expense_acct)
-        _set_ref_if(add, 'AssetAccountRef', it.get('asset_account'))
-        _set_ref_if(add, 'AccountRef', income_acct)  # For some item types
+        # Item structure depends on type:
+        # - Inventory items use direct fields (SalesDesc, PurchaseDesc, SalesPrice, etc.)
+        # - Service/NonInventory/OtherCharge/Discount use ORSalesPurchase
+        #   which contains EITHER SalesOrPurchase OR SalesAndPurchase
+        # - SalesTax uses TaxRate + TaxVendorRef (no SalesOrPurchase)
+        # - Subtotal/Payment/Group have no price fields
 
-        # For Service/NonInventory, try the SalesOrPurchase pattern
-        try:
-            sop = getattr(add, 'ORSalesPurchase', None)
-            if sop is not None:
-                sp = getattr(sop, 'SalesOrPurchase', None)
-                if sp is not None:
-                    _set_if(sp, 'Desc', desc)
-                    _set_amount_if(sp, 'Price', price)
-                    _set_ref_if(sp, 'AccountRef', income_acct)
-        except Exception:
-            pass
+        if item_type in ('Inventory', 'InventoryAssembly', 'InvAssy'):
+            # Inventory: direct fields
+            _set_if(add, 'SalesDesc', desc)
+            _set_if(add, 'PurchaseDesc', purchase_desc)
+            _set_amount_if(add, 'SalesPrice', price)
+            _set_amount_if(add, 'PurchaseCost', cost)
+            _set_ref_if(add, 'IncomeAccountRef', income_acct)
+            _set_ref_if(add, 'COGSAccountRef', expense_acct)
+            _set_ref_if(add, 'AssetAccountRef', asset_acct)
+
+        elif item_type in ('SalesTax',):
+            # SalesTax: set tax rate and vendor
+            tax_vendor = it.get('tax_vendor') or ''
+            if tax_vendor:
+                _set_ref_if(add, 'TaxVendorRef', tax_vendor)
+            _set_if(add, 'ItemDesc', desc)
+
+        elif item_type in ('Subtotal', 'Payment', 'Group', 'SalesTaxGroup'):
+            # These types have minimal fields
+            _set_if(add, 'ItemDesc', desc)
+
+        else:
+            # Service, NonInventory, OtherCharge, Discount:
+            # Must use ORSalesPurchase -> SalesOrPurchase or SalesAndPurchase
+            try:
+                sop = getattr(add, 'ORSalesPurchase', None)
+                if sop is not None:
+                    if income_acct and expense_acct and income_acct != expense_acct:
+                        # Different accounts for sales vs purchase -> SalesAndPurchase
+                        sap = getattr(sop, 'SalesAndPurchase', None)
+                        if sap is not None:
+                            _set_if(sap, 'SalesDesc', desc)
+                            _set_amount_if(sap, 'SalesPrice', price or 0)
+                            _set_ref_if(sap, 'IncomeAccountRef', income_acct)
+                            _set_if(sap, 'PurchaseDesc', purchase_desc or desc)
+                            _set_amount_if(sap, 'PurchaseCost', cost or 0)
+                            _set_ref_if(sap, 'ExpenseAccountRef', expense_acct)
+                    else:
+                        # Same account or only one -> SalesOrPurchase
+                        sp = getattr(sop, 'SalesOrPurchase', None)
+                        if sp is not None:
+                            _set_if(sp, 'Desc', desc)
+                            _set_amount_if(sp, 'Price', price or 0)
+                            acct = income_acct or expense_acct
+                            if acct:
+                                _set_ref_if(sp, 'AccountRef', acct)
+                            else:
+                                # No account in snapshot — use a sensible default
+                                # QB requires an account; use first income-type account
+                                _set_ref_if(sp, 'AccountRef', 'Services')
+            except Exception:
+                pass
 
         if _do_add_request(session, req, f"Item '{name}' ({item_type})", log_fn):
             ok += 1

@@ -160,11 +160,17 @@ def _create_request_set(session: QBFCSession) -> Any:
 
 
 def _safe_get(obj: Any, attr: str) -> Optional[str]:
-    """Defensively read a string-ish attribute off a QBFC response object."""
+    """Defensively read a string-ish attribute off a QBFC response object.
+    
+    Supports dotted paths like 'IncomeAccountRef.FullName' by traversing
+    each level. QBFC COM objects are nested — getattr only works one level.
+    """
     try:
-        v = getattr(obj, attr, None)
-        if v is None:
-            return None
+        v = obj
+        for part in attr.split('.'):
+            v = getattr(v, part, None)
+            if v is None:
+                return None
         # QBFC returns IQBStringType etc. These have GetValue().
         if hasattr(v, "GetValue"):
             try:
@@ -179,9 +185,11 @@ def _safe_get(obj: Any, attr: str) -> Optional[str]:
 
 def _safe_get_amount(obj: Any, attr: str) -> Optional[float]:
     try:
-        v = getattr(obj, attr, None)
-        if v is None:
-            return None
+        v = obj
+        for part in attr.split('.'):
+            v = getattr(v, part, None)
+            if v is None:
+                return None
         if hasattr(v, "GetValue"):
             val = v.GetValue()
             return float(val) if val is not None else None
