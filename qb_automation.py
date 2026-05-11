@@ -2211,10 +2211,9 @@ class QuickBooksAutomationEngine:
             "Export from QB 2023",
             "Close QB 2023",
             "Parse CSV transactions",
+            "Copy QB 2021 template",
             "Launch QB 2021",
-            "Create QB 2021 company",
-            "Import list IIF",
-            "Import transaction IIF",
+            "QBFC import into QB 2021",
             "Validation report generation",
             "Close QB 2021",
         ]
@@ -2269,25 +2268,70 @@ class QuickBooksAutomationEngine:
             parse_stats = self.tx_parser.convert_csv_to_iif(exported["tx_csv"], tx_iif)
             self._emit(f"Generated transaction IIF with {parse_stats['record_count']} records", log_fn)
 
-            # 5) Launch QB 2021
+            # 5) Copy QB 2021 template -> target directory
             set_progress(4)
-            qb2021_app = self._launch_qb(self.config.install_paths.qb_2021_path, log_fn)
-            self._qb2021_app = qb2021_app
+            target_dir.mkdir(parents=True, exist_ok=True)
+            raw_name = job.target_company_name or job.qbw_path.stem
+            target_name = re.sub(r"\b23\b", "21", raw_name) if "23" in raw_name else raw_name
+            target_qbw = target_dir / f"{target_name}.qbw"
 
-            # 6) Create company
+            template_path = Path(self.config.install_paths.qb_2021_template_path)
+            if not self.config.dry_run:
+                if not template_path.exists():
+                    raise FileNotFoundError(
+                        f"QB 2021 template not found at {template_path}. "
+                        "Place a blank QB 2021 .qbw file there first."
+                    )
+                shutil.copy2(template_path, target_qbw)
+                self._emit(f"Copied QB 2021 template to {target_qbw}", log_fn)
+
+                # Also copy the .tlg and .nd files if they exist alongside the template
+                for ext in (".tlg", ".nd"):
+                    src = template_path.with_suffix(ext)
+                    if src.exists():
+                        shutil.copy2(src, target_qbw.with_suffix(ext))
+            else:
+                target_qbw.write_text("DRY RUN PLACEHOLDER - QBW FILE CREATED", encoding="utf-8")
+                self._emit(f"Created dry-run target company file: {target_qbw}", log_fn)
+
+            # 6) Launch QB 2021 with the target company file
             set_progress(5)
-            target_qbw = self._create_qb2021_company(job, target_dir, log_fn)
+            snapshot_path = exported.get("snapshot")
+            if not self.config.dry_run and not snapshot_path:
+                snapshot_path = exports_dir / "company_snapshot.json"
+            if not self.config.dry_run and (not snapshot_path or not Path(str(snapshot_path)).exists()):
+                raise FileNotFoundError(
+                    f"JSON snapshot not found at {snapshot_path}. "
+                    "QBFC export must produce company_snapshot.json."
+                )
 
-            # 7) Import list IIF
+            if not self.config.dry_run:
+                qb2021_app = self._launch_qb(
+                    self.config.install_paths.qb_2021_path, log_fn, qbw_path=target_qbw
+                )
+                self._qb2021_app = qb2021_app
+            else:
+                self._emit("Dry-run: skipping QB 2021 launch", log_fn)
+
+            # 7) QBFC import — pure SDK, no UI automation
             set_progress(6)
-            self._with_retries(lambda: self._import_iif_lists_qb2021(exported["lists_iif"], log_fn), "QB 2021 list import", log_fn)
+            import_results: Dict[str, int] = {}
+            if not self.config.dry_run:
+                from qbfc_import import import_company_via_qbfc
 
-            # 8) Import transaction IIF
+                self._emit("=== Starting QBFC SDK import into QB 2021 ===", log_fn)
+                import_results = import_company_via_qbfc(
+                    snapshot_path=Path(str(snapshot_path)),
+                    qbw_path=target_qbw,
+                    log_fn=log_fn,
+                    skip_transactions=False,
+                )
+                self._emit(f"QBFC import complete: {sum(import_results.values())} total records", log_fn)
+            else:
+                self._emit("Dry-run: skipping QBFC import", log_fn)
+
+            # 8) Validation
             set_progress(7)
-            self._with_retries(lambda: self._import_iif_transactions_qb2021(tx_iif, log_fn), "QB 2021 transaction import", log_fn)
-
-            # 9) Validation
-            set_progress(8)
             source_snapshot = self._extract_validation_snapshot(exports_dir)
             target_snapshot = self._extract_validation_snapshot(exports_dir)
             validation_files = self.validator.generate_reports(
@@ -2297,12 +2341,12 @@ class QuickBooksAutomationEngine:
                 company_name=job.qbw_path.stem,
             )
 
-            # 10) Close QB 2021
-            set_progress(9)
+            # 9) Close QB 2021
+            set_progress(8)
             self._close_qb(qb2021_app, log_fn)
             qb2021_app = None
             self._qb2021_app = None
-            set_progress(10)
+            set_progress(9)
 
             generated_files = {
                 "lists_iif": str(exported["lists_iif"]),
@@ -2312,6 +2356,10 @@ class QuickBooksAutomationEngine:
                 "validation_excel": validation_files["excel"],
                 "validation_html": validation_files["html"],
             }
+            if snapshot_path:
+                generated_files["snapshot"] = str(snapshot_path)
+            if import_results:
+                generated_files["import_summary"] = str(import_results)
 
             for key in ["accounts_iif", "customers_iif", "vendors_iif", "items_iif", "employees_iif"]:
                 if key in exported:
