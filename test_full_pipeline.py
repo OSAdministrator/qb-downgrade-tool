@@ -100,9 +100,9 @@ def main():
     input(">>> Press ENTER when QB 2023 has the file open... ")
 
     log("Connecting to QB 2023 via QBFC...")
-    from qbfc_export import export_all, open_qbfc_session
+    from qbfc_export import export_company_via_qbfc
 
-    exported = export_all(
+    exported = export_company_via_qbfc(
         qbw_path=None,  # bind to already-open file
         export_dir=EXPORTS_DIR,
         log_fn=log,
