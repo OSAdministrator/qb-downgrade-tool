@@ -2445,7 +2445,6 @@ class QuickBooksAutomationEngine:
             # (done AFTER closing QB so no file locks)
             target_qbw = final_target_qbw
             if not self.config.dry_run and working_qbw != final_target_qbw:
-                import shutil
                 import subprocess as _sp
                 # Force-kill any lingering QBW32 / qbupdate processes that may
                 # still hold a file handle on the working copy.
