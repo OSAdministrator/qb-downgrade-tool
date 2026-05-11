@@ -1647,21 +1647,32 @@ class QuickBooksAutomationEngine:
         if self.config.dry_run:
             return
 
-        if app is not None:
-            try:
-                win = self._find_qb_main_window(app, None, timeout_s=5)
-                self._focus_window(win)
-                if send_keys is not None:
-                    send_keys("%{F4}")
-                time.sleep(2)
-                self._dismiss_common_dialogs(log_fn)
-            except Exception:  # noqa: BLE001
-                pass
+        # Hard-kill QB processes via taskkill — avoid pywinauto/comtypes
+        # which has been observed to silently crash the Python interpreter
+        # when QB is in an inconsistent UI state after QBFC operations.
+        try:
+            import subprocess
+            for image in ("QBW32.EXE", "QBW.EXE", "qbw32.exe", "qbw.exe"):
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/IM", image, "/T"],
+                        capture_output=True, timeout=15, check=False,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            self._emit("  QuickBooks processes terminated.", log_fn)
+        except Exception as exc:  # noqa: BLE001
+            self._emit(f"  WARN: taskkill failed: {exc}", log_fn)
 
+        # Best-effort pywinauto kill as a backup (don't let exceptions kill us)
+        if app is not None:
             try:
                 app.kill()
             except Exception:  # noqa: BLE001
                 pass
+
+        # Give Windows a moment to release file locks
+        time.sleep(2)
 
     def _is_company_already_open(self, main_window, company_name_hint: str) -> bool:
         """Check if the desired company is already open in QB.
