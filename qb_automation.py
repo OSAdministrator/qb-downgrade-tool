@@ -1882,10 +1882,28 @@ class QuickBooksAutomationEngine:
             if login_dlg is not None and not password_entered:
                 self._emit("Found startup login dialog, entering password", log_fn)
 
-                # Simple approach: just type the password and press Enter.
-                # The dialog appears with cursor in the password field by default.
+                # Focus the dialog, click the password field, then type.
+                # send_keys types into the *focused* window, so we must
+                # bring the login dialog to the foreground first.
                 if send_keys is not None:
                     time.sleep(1)  # Let dialog fully render
+                    try:
+                        login_dlg.set_focus()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    time.sleep(0.3)
+
+                    # Try to click the password Edit field so the cursor
+                    # is definitely there (QB may default focus elsewhere).
+                    try:
+                        edits = [c for c in login_dlg.children()
+                                 if c.friendly_class_name() == "Edit"]
+                        if edits:
+                            edits[0].click_input()
+                            time.sleep(0.2)
+                    except Exception:  # noqa: BLE001
+                        pass  # Fallback: just type and hope for the best
+
                     send_keys(password, pause=0.02)
                     time.sleep(0.3)
                     send_keys("{ENTER}")
