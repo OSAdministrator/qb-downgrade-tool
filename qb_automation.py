@@ -2156,11 +2156,11 @@ class QuickBooksAutomationEngine:
             qb2023_app = None
             self._qb2023_app = None
 
-            # 4) Parse transactions CSV -> IIF
+            # 4) QBFC export produces a JSON snapshot — no CSV parsing needed.
+            #    (Legacy step removed — tx_parser.convert_csv_to_iif was for
+            #    the old IIF-based flow.  QBFC import reads the snapshot directly.)
             set_progress(3)
-            tx_iif = exports_dir / "transactions_generated.IIF"
-            parse_stats = self.tx_parser.convert_csv_to_iif(exported["tx_csv"], tx_iif)
-            self._emit(f"Generated transaction IIF with {parse_stats['record_count']} records", log_fn)
+            self._emit("QBFC snapshot ready — skipping legacy CSV parse step.", log_fn)
 
             # 5) Copy QB 2021 template -> target directory (KEEP ORIGINAL NAME)
             #    The QBFC app authorization is baked into the template by file name.
