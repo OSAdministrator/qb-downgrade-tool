@@ -1928,7 +1928,8 @@ class QuickBooksAutomationEngine:
         return False
 
     def _handle_startup_dialogs(self, password: str, timeout_s: int, log_fn: Optional[LogFn],
-                                alt_password: Optional[str] = None) -> None:
+                                alt_password: Optional[str] = None,
+                                min_wait_s: int = 30) -> None:
         """Handle dialogs that appear when QB starts up.
 
         =====================================================================
@@ -1947,6 +1948,13 @@ class QuickBooksAutomationEngine:
         before the main thread can detect them.  Also added alt_password
         parameter — if the primary password fails, we retry with the
         alternate password before giving up.
+
+        2026-05-11 (fix): Added min_wait_s parameter (default 30s).
+        QB can show non-blocking dialogs (Update Service, promo popups)
+        BEFORE the password dialog appears. Without a minimum wait, the
+        loop would see no blocking dialogs and break early — before the
+        password dialog ever appeared. Then _find_qb_main_window would
+        time out because nobody entered the password.
         =====================================================================
         """
         passwords_to_try = [password]
@@ -2060,7 +2068,17 @@ class QuickBooksAutomationEngine:
                     continue
 
             if not blocking_dialogs:
-                break
+                elapsed = time.time() - start
+                if password_entered or elapsed >= min_wait_s:
+                    # Safe to exit: either we already entered the password,
+                    # or we've waited long enough for the password dialog to
+                    # appear (it never did — file may not be password-protected).
+                    if not password_entered and elapsed >= min_wait_s:
+                        self._emit(f"  No password dialog after {int(elapsed)}s — continuing (file may not be protected)", log_fn)
+                    break
+                # Haven't entered password yet and haven't waited min_wait_s —
+                # keep polling in case the password dialog hasn't appeared yet.
+                # (QB may show other dialogs like Update Service first.)
 
     def _export_from_qb2023(self, job: CompanyJob, export_dir: Path, log_fn: Optional[LogFn]) -> Dict[str, Path]:
         """Exports list IIF, transaction CSV, and report PDFs from QB 2023.
