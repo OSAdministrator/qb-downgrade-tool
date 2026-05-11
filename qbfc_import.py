@@ -666,7 +666,7 @@ def _list_existing_accounts(session: Any, log_fn: Optional[LogFn] = None) -> set
         req = _create_request_set(session)
         # Plain query — do NOT use IncludeRetElementList (COM issues)
         req.AppendAccountQueryRq()
-        resp_set = session.DoRequests(req)
+        resp_set = session.session_manager.DoRequests(req)
         resp = resp_set.ResponseList.GetAt(0)
         if resp.StatusCode != 0:
             _emit(f"  WARN: AccountQuery failed: {resp.StatusCode} {resp.StatusMessage}", log_fn)
@@ -717,7 +717,7 @@ def _create_account_stub(session: Any, name: str, existing: set,
             add.Desc.SetValue('Auto-created by TimeWarp')
         except Exception:
             pass
-        resp_set = session.DoRequests(req)
+        resp_set = session.session_manager.DoRequests(req)
         resp = resp_set.ResponseList.GetAt(0)
         if resp.StatusCode == 0:
             existing.add(name.strip().lower())
