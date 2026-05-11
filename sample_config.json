@@ -11,7 +11,8 @@
     "report_seconds": 240,
     "app_close_seconds": 45
   },
-  "default_output_dir": "C:\\QBDowngrade\\Results",
+  "default_output_dir": "C:\\QB-TimeWarp\\Final Output",
+  "default_working_dir": "C:\\QB-TimeWarp\\working",
   "retry_attempts": 2,
   "retry_delay_seconds": 5,
   "continue_on_error": true,

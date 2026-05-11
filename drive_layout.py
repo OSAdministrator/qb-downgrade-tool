@@ -315,7 +315,8 @@ def get_workspace_paths() -> Dict[str, Path]:
     """
     root = get_workspace_root()
     return {
-        "output_dir": root / "Output",
+        "output_dir": root / "Final Output",
+        "working_dir": root / "working",
         "log_dir": root / "logs",
         "settings_file": root / "settings.json",
         "workspace_root": root,

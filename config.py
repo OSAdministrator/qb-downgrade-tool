@@ -16,7 +16,8 @@ try:
 except Exception:
     _WORKSPACE = {
         "settings_file": _PROGRAM_DIR / "settings.json",
-        "output_dir": _PROGRAM_DIR / "Output",
+        "output_dir": _PROGRAM_DIR / "Final Output",
+        "working_dir": _PROGRAM_DIR / "working",
         "log_dir": _PROGRAM_DIR / "logs",
     }
 DEFAULT_CONFIG_PATH = _WORKSPACE["settings_file"]
@@ -36,7 +37,7 @@ class TimeoutConfig:
 class QBInstallPaths:
     qb_2023_path: str = r"C:\Program Files\Intuit\QuickBooks 2023\QBWPremierAccountant.exe"
     qb_2021_path: str = r"C:\Program Files (x86)\Intuit\QuickBooks 2021\QBW32PremierAccountant.exe"
-    qb_2021_template_path: str = r"C:\QBDowngrade\QB-2021 Template\Blank Template.qbw"
+    qb_2021_template_path: str = r"C:\QB-TimeWarp\working\source\QB-2021 Template\Blank Template.qbw"
     qb_2021_template_password: str = "01Hello02!@!"
 
 
@@ -46,6 +47,7 @@ class AppConfig:
     timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
     # Output goes to workspace (flash drive partition or program folder — auto-detected)
     default_output_dir: str = str(_WORKSPACE["output_dir"])
+    default_working_dir: str = str(_WORKSPACE["working_dir"])
     retry_attempts: int = 2
     retry_delay_seconds: int = 5
     continue_on_error: bool = True
@@ -59,6 +61,7 @@ class AppConfig:
             install_paths=install_paths,
             timeouts=timeouts,
             default_output_dir=payload.get("default_output_dir", cls().default_output_dir),
+            default_working_dir=payload.get("default_working_dir", cls().default_working_dir),
             retry_attempts=payload.get("retry_attempts", cls().retry_attempts),
             retry_delay_seconds=payload.get("retry_delay_seconds", cls().retry_delay_seconds),
             continue_on_error=payload.get("continue_on_error", cls().continue_on_error),

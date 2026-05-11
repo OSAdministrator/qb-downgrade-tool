@@ -2260,23 +2260,54 @@ class QuickBooksAutomationEngine:
             watchdog = None
 
         try:
-            job.output_dir.mkdir(parents=True, exist_ok=True)
-            exports_dir = job.output_dir / "exports"
-            target_dir = job.output_dir / "target"
-            validation_dir = job.output_dir / "validation"
+            # --- Directory layout ---
+            #   working\source\   — staged copy of customer's original + QB-2021 Template
+            #   working\Export\   — extracted data (snapshot, IIF, CSV)
+            #   Final Output\<Company>\ — deliverables (converted .qbw, reports)
+            working_root = Path(self.config.default_working_dir)
+            source_dir   = working_root / "source"
+            export_dir   = working_root / "Export"
+            output_dir   = job.output_dir   # already points to Final Output\<Company>
 
-            # Wipe ALL stale subdirs (exports, target, validation, logs) before run
-            # so a previous failed run never pollutes a fresh attempt.
-            for stale_dir in (exports_dir, target_dir, validation_dir, job.output_dir / "logs"):
+            # Wipe stale working dirs so a previous failed run never pollutes
+            for stale_dir in (export_dir, output_dir):
                 if stale_dir.exists():
                     self._emit(f"Cleaning stale directory: {stale_dir}", log_fn)
                     try:
                         shutil.rmtree(stale_dir)
                     except Exception as exc:  # noqa: BLE001
                         self._emit(f"  WARN: could not remove {stale_dir}: {exc}", log_fn)
-            exports_dir.mkdir(parents=True, exist_ok=True)
+            for d in (source_dir, export_dir, output_dir):
+                d.mkdir(parents=True, exist_ok=True)
 
-            # 1) Launch QB 2023 with company file as parameter (auto-opens it)
+            # --- Phase 0: Stage Source ---
+            # Copy customer's original .qbw (and sidecars) into working\source\
+            # so we NEVER touch the original. All subsequent steps use the copy.
+            self._emit("=== Phase 0 — Stage Source (safe copy) ===", log_fn)
+            original_qbw = job.qbw_path
+            staged_qbw = source_dir / original_qbw.name
+            if not self.config.dry_run:
+                shutil.copy2(str(original_qbw), str(staged_qbw))
+                self._emit(f"  Staged: {original_qbw} -> {staged_qbw}", log_fn)
+                for ext_s in (".qbw.ND", ".qbw.DSN", ".tlg", ".TLG"):
+                    sidecar = original_qbw.parent / f"{original_qbw.stem}{ext_s}"
+                    if sidecar.exists():
+                        try:
+                            shutil.copy2(str(sidecar), str(source_dir / sidecar.name))
+                        except Exception:
+                            pass
+                # Repoint job to staged copy for the rest of the run
+                job = CompanyJob(
+                    qbw_path=staged_qbw,
+                    password=job.password,
+                    output_dir=job.output_dir,
+                    target_company_name=job.target_company_name,
+                )
+                self._emit(f"  Original untouched at: {original_qbw}", log_fn)
+            else:
+                self._emit("  (dry run — skipping source staging)", log_fn)
+
+            # 1) Launch QB 2023 with STAGED company file (never the original)
             set_progress(0)
             qb2023_app = self._launch_qb(self.config.install_paths.qb_2023_path, log_fn, qbw_path=job.qbw_path)
             self._qb2023_app = qb2023_app
@@ -2285,7 +2316,7 @@ class QuickBooksAutomationEngine:
             set_progress(1)
             exported: Dict[str, Path] = {}
             self._with_retries(
-                lambda: exported.update(self._export_from_qb2023(job, exports_dir, log_fn)),
+                lambda: exported.update(self._export_from_qb2023(job, export_dir, log_fn)),
                 "QB 2023 export",
                 log_fn,
             )
@@ -2302,19 +2333,19 @@ class QuickBooksAutomationEngine:
             set_progress(3)
             self._emit("QBFC snapshot ready — skipping legacy CSV parse step.", log_fn)
 
-            # 5) Copy QB 2021 template -> target directory (KEEP ORIGINAL NAME)
+            # 5) Copy QB 2021 template -> working\source\ (KEEP ORIGINAL NAME)
             #    The QBFC app authorization is baked into the template by file name.
             #    We copy as "Blank Template.qbw", do the import, then rename AFTER
             #    closing QB so the authorization stays valid throughout.
+            #    The final renamed .qbw gets placed in Final Output\<Company>\.
             set_progress(4)
-            target_dir.mkdir(parents=True, exist_ok=True)
-            raw_name = job.target_company_name or job.qbw_path.stem
+            raw_name = job.target_company_name or original_qbw.stem
             target_name = re.sub(r"\b23\b", "21", raw_name) if "23" in raw_name else raw_name
-            # Final destination after rename
-            final_target_qbw = target_dir / f"{target_name}.qbw"
-            # Working copy keeps the template name so QBFC auth is inherited
+            # Final destination is in Final Output\<Company>\
+            final_target_qbw = output_dir / f"{target_name}.qbw"
+            # Working copy lives in working\source\ (template name for QBFC auth)
             template_path = Path(self.config.install_paths.qb_2021_template_path)
-            working_qbw = target_dir / template_path.name
+            working_qbw = source_dir / template_path.name
 
             if not self.config.dry_run:
                 if not template_path.exists():
@@ -2329,13 +2360,14 @@ class QuickBooksAutomationEngine:
                 for ext_suffix in (".qbw.ND", ".qbw.DSN", ".tlg"):
                     src = template_path.parent / f"{template_path.stem}{ext_suffix}"
                     if src.exists():
-                        dst = target_dir / f"{working_qbw.stem}{ext_suffix}"
+                        dst = source_dir / f"{working_qbw.stem}{ext_suffix}"
                         try:
                             shutil.copy2(src, dst)
                         except Exception:
                             pass  # QB will recreate these
             else:
                 working_qbw = final_target_qbw
+                working_qbw.parent.mkdir(parents=True, exist_ok=True)
                 working_qbw.write_text("DRY RUN PLACEHOLDER - QBW FILE CREATED", encoding="utf-8")
                 self._emit(f"Created dry-run target company file: {working_qbw}", log_fn)
 
@@ -2343,7 +2375,7 @@ class QuickBooksAutomationEngine:
             set_progress(5)
             snapshot_path = exported.get("snapshot")
             if not self.config.dry_run and not snapshot_path:
-                snapshot_path = exports_dir / "company_snapshot.json"
+                snapshot_path = export_dir / "company_snapshot.json"
             if not self.config.dry_run and (not snapshot_path or not Path(str(snapshot_path)).exists()):
                 raise FileNotFoundError(
                     f"JSON snapshot not found at {snapshot_path}. "
@@ -2415,12 +2447,12 @@ class QuickBooksAutomationEngine:
 
             # 8) Validation
             set_progress(7)
-            source_snapshot = self._extract_validation_snapshot(exports_dir)
-            target_snapshot = self._extract_validation_snapshot(exports_dir)
+            source_snapshot = self._extract_validation_snapshot(export_dir)
+            target_snapshot = self._extract_validation_snapshot(export_dir)
             validation_files = self.validator.generate_reports(
                 source_snapshot,
                 target_snapshot,
-                validation_dir,
+                output_dir,
                 company_name=job.qbw_path.stem,
             )
 
@@ -2466,10 +2498,10 @@ class QuickBooksAutomationEngine:
                         time.sleep(3)
                 if last_err is not None:
                     raise last_err
-                # Rename companion files too
+                # Move companion files from working\source\ -> Final Output\<Company>\
                 for ext_suffix in (".qbw.ND", ".qbw.DSN", ".tlg"):
-                    old_f = target_dir / f"{working_qbw.stem}{ext_suffix}"
-                    new_f = target_dir / f"{final_target_qbw.stem}{ext_suffix}"
+                    old_f = source_dir / f"{working_qbw.stem}{ext_suffix}"
+                    new_f = output_dir / f"{final_target_qbw.stem}{ext_suffix}"
                     if old_f.exists():
                         try:
                             if new_f.exists():
@@ -2497,7 +2529,7 @@ class QuickBooksAutomationEngine:
             # operator has a printable cheat-sheet for re-memorizing the
             # templates QBFC cannot recreate.
             try:
-                snapshot_path = exports_dir / "company_snapshot.json"
+                snapshot_path = export_dir / "company_snapshot.json"
                 if snapshot_path.exists():
                     import json as _json
                     with snapshot_path.open("r", encoding="utf-8") as fh:
@@ -2505,7 +2537,7 @@ class QuickBooksAutomationEngine:
                     memorized = snap.get("memorized_txns") or []
                     if memorized:
                         from memorized_report import generate_reports as _gen_memo
-                        memo_out = _gen_memo(memorized, validation_dir, job.qbw_path.stem)
+                        memo_out = _gen_memo(memorized, output_dir, original_qbw.stem)
                         if memo_out.get("xlsx"):
                             generated_files["memorized_xlsx"] = str(memo_out["xlsx"])
                             self._emit(f"  Memorized report (Excel): {memo_out['xlsx']}", log_fn)

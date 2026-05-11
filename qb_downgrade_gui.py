@@ -368,6 +368,8 @@ class QuickBooksDowngradeGUI:
         engine = QuickBooksAutomationEngine(self.config, logger=self.logger)
         output_root = Path(self.config.default_output_dir)
         output_root.mkdir(parents=True, exist_ok=True)
+        working_root = Path(self.config.default_working_dir)
+        working_root.mkdir(parents=True, exist_ok=True)
 
         total = len(queue_items)
         for idx, (row_id, item) in enumerate(queue_items, start=1):
