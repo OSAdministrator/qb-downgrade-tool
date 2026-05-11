@@ -134,7 +134,14 @@ class QuickBooksAutomationEngine:
         self._ensure_automation_ready()
         return Desktop(backend="uia")
 
-    def _find_qb_main_window(self, app: Optional[object], version_hint: Optional[str], timeout_s: int):
+    def _find_qb_main_window(self, app: Optional[object], version_hint: Optional[str], timeout_s: int, include_hidden: bool = False):
+        """Find the QB main window.
+
+        When *include_hidden* is True the visibility check is skipped so
+        windows hidden by the watchdog are still returned.  This is
+        necessary for the QB 2021 import phase because the watchdog hides
+        the main window before the company fully loads.
+        """
         def _is_own_gui(title: str) -> bool:
             """Return True if *title* belongs to our own GUI, not real QB."""
             tl = title.lower()
@@ -144,7 +151,9 @@ class QuickBooksAutomationEngine:
             if app is not None:
                 try:
                     for win in app.windows():
-                        if not win.exists() or not win.is_visible():
+                        if not win.exists():
+                            continue
+                        if not include_hidden and not win.is_visible():
                             continue
                         title = win.window_text()
                         if _is_own_gui(title):
@@ -154,7 +163,7 @@ class QuickBooksAutomationEngine:
                         if re.search(self.QB_WINDOW_RE, title):
                             return win
                     top = app.top_window()
-                    if top.exists() and top.is_visible():
+                    if top.exists() and (include_hidden or top.is_visible()):
                         title = top.window_text() or ""
                         if not _is_own_gui(title):
                             return top
@@ -163,9 +172,9 @@ class QuickBooksAutomationEngine:
 
             desktop = self._get_desktop()
             candidates = []
-            for w in desktop.windows(title_re=self.QB_WINDOW_RE):
+            for w in desktop.windows(title_re=self.QB_WINDOW_RE, visible_only=not include_hidden):
                 try:
-                    if not w.is_visible():
+                    if not include_hidden and not w.is_visible():
                         continue
                     title = w.window_text()
                     if _is_own_gui(title):
@@ -2388,18 +2397,31 @@ class QuickBooksAutomationEngine:
                 )
                 self._qb2021_app = qb2021_app
 
-                # Wait for the user to enter the template password in QB 2021.
+                # -------------------------------------------------------
+                # Auto-type the template password.
+                # The template password is hardcoded (it's OUR template,
+                # not the customer's file), so auto-entry is safe.
+                # _handle_startup_dialogs() watches for the QB login
+                # dialog, types the password, presses Enter, and
+                # dismisses any other startup popups.
+                # -------------------------------------------------------
                 template_password = self.config.install_paths.qb_2021_template_password
-                self._emit("", log_fn)
-                self._emit("=" * 60, log_fn)
-                self._emit("ACTION REQUIRED: Enter the template password in QuickBooks 2021.", log_fn)
-                self._emit(f"  Password: {template_password}", log_fn)
-                self._emit("  The tool will auto-detect when the company is loaded.", log_fn)
-                self._emit("=" * 60, log_fn)
-                self._emit("", log_fn)
-                qb2021_main = self._find_qb_main_window(qb2021_app, "2021", self.config.timeouts.launch_qb_seconds)
+                self._emit("Auto-entering template password in QB 2021...", log_fn)
+                self._handle_startup_dialogs(
+                    password=template_password,
+                    timeout_s=120,     # generous — QB 2021 can be slow to launch
+                    log_fn=log_fn,
+                )
+
+                # The watchdog hides QB main windows, so use
+                # include_hidden=True to find the (hidden) main window.
+                qb2021_main = self._find_qb_main_window(
+                    qb2021_app, "2021",
+                    self.config.timeouts.launch_qb_seconds,
+                    include_hidden=True,
+                )
                 # Use the template filename as a positive hint so the poller
-                # waits until the user enters the password and the company
+                # waits until the password is accepted and the company
                 # actually opens (title shows "Blank Template - QuickBooks …").
                 template_hint = template_path.stem  # e.g. "Blank Template"
                 self._wait_for_company_ready(
