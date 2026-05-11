@@ -215,11 +215,39 @@ class QuickBooksDowngradeGUI:
         self._heartbeat_phase: str = ""
         self._heartbeat_after_id: str | None = None
 
-        log_frame = ttk.LabelFrame(self.root, text="Status Log", padding=8)
+        # Sub-status line: shows the current step in human-friendly text
+        # (e.g. "Importing customers: 234 / 891"). Sits between progress
+        # bar and the scrolling log so the operator always knows what
+        # phase we're in without reading the log.
+        self.status_var = tk.StringVar(value="Idle — drop or add .QBW files to begin")
+        status_label = tk.Label(
+            self.root, textvariable=self.status_var,
+            font=("Segoe UI", 10, "bold"),
+            fg="#0f172a", bg="#e2e8f0",
+            anchor="w", padx=12, pady=6,
+        )
+        status_label.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        log_frame = ttk.LabelFrame(self.root, text="Activity Log", padding=8)
         log_frame.pack(fill=BOTH, expand=True, padx=10, pady=4)
 
-        self.log_text = tk.Text(log_frame, height=6, wrap="word")
+        self.log_text = tk.Text(
+            log_frame, height=6, wrap="word",
+            bg="#0f172a", fg="#e2e8f0",
+            font=("Consolas", 9),
+            insertbackground="#e2e8f0",
+            selectbackground="#334155",
+        )
         self.log_text.pack(side=LEFT, fill=BOTH, expand=True)
+
+        # Color tags for the log: green=success, yellow=warn/retry, red=error,
+        # cyan=phase header, gray=watchdog / housekeeping.
+        self.log_text.tag_configure("ok",       foreground="#4ade80")
+        self.log_text.tag_configure("warn",     foreground="#facc15")
+        self.log_text.tag_configure("err",      foreground="#f87171")
+        self.log_text.tag_configure("phase",    foreground="#22d3ee", font=("Consolas", 9, "bold"))
+        self.log_text.tag_configure("watchdog", foreground="#94a3b8")
+        self.log_text.tag_configure("info",     foreground="#e2e8f0")
 
         scroll = ttk.Scrollbar(log_frame, orient=VERTICAL, command=self.log_text.yview)
         scroll.pack(side=RIGHT, fill=tk.Y)
@@ -437,12 +465,44 @@ class QuickBooksDowngradeGUI:
         self.log_queue.put(message)
         self._update_heartbeat_phase(message)
 
+    def _classify_log(self, msg: str) -> str:
+        """Pick a color tag based on log message content."""
+        m = msg.lower()
+        if msg.startswith("===") or "phase" in m and ":" in msg:
+            return "phase"
+        if "[watchdog]" in m:
+            return "watchdog"
+        if "✔" in msg or "succeeded" in m or "complete" in m or "✓" in msg:
+            return "ok"
+        if "✖" in msg or "failed" in m or "error" in m or "traceback" in m:
+            return "err"
+        if "warn" in m or "retry" in m or "skipped" in m or "timeout" in m:
+            return "warn"
+        return "info"
+
+    def _update_status_from_log(self, msg: str) -> None:
+        """Update the bold sub-status line based on key log markers."""
+        # Phase headers like "=== QBFC Import: Phase 3 — Entities ==="
+        if msg.startswith("===") and msg.endswith("==="):
+            self.status_var.set(msg.strip("= ").strip())
+            return
+        # Per-step lines: "  Snapshot: 234 customers" etc.
+        for marker in ("Snapshot:", "Importing", "Exporting", "Validating",
+                       "Opening", "Closing", "QBFC import complete",
+                       "Company:", "Restored"):
+            if marker in msg:
+                # Trim leading whitespace/bullets so status reads cleanly
+                self.status_var.set(msg.strip().lstrip("•-> "))
+                return
+
     def _poll_log_queue(self) -> None:
         while True:
             try:
                 msg = self.log_queue.get_nowait()
-                self.log_text.insert(END, msg + "\n")
+                tag = self._classify_log(msg)
+                self.log_text.insert(END, msg + "\n", tag)
                 self.log_text.see(END)
+                self._update_status_from_log(msg)
             except queue.Empty:
                 break
         self.root.after(200, self._poll_log_queue)

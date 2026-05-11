@@ -2249,6 +2249,16 @@ class QuickBooksAutomationEngine:
         qb2023_app = None
         qb2021_app = None
 
+        # Start the dialog watchdog: auto-dismisses QB popups and hides QB
+        # windows so the operator sees only our GUI for the entire run.
+        try:
+            from dialog_watchdog import DialogWatchdog
+            watchdog = DialogWatchdog(log_fn=lambda m: self._emit(m, log_fn), hide_qb=True)
+            watchdog.start()
+        except Exception as _wd_exc:  # noqa: BLE001
+            self._emit(f"[Watchdog] failed to start: {_wd_exc}", log_fn)
+            watchdog = None
+
         try:
             job.output_dir.mkdir(parents=True, exist_ok=True)
             exports_dir = job.output_dir / "exports"
@@ -2508,3 +2518,10 @@ class QuickBooksAutomationEngine:
                 self._close_qb(qb2021_app, log_fn)
             self._qb2023_app = None
             self._qb2021_app = None
+            # Stop dialog watchdog last so it can dismiss any final popups
+            # produced while QB shuts down.
+            try:
+                if watchdog is not None:
+                    watchdog.stop()
+            except Exception:  # noqa: BLE001
+                pass
