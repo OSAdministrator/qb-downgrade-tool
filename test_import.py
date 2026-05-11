@@ -1,10 +1,11 @@
 """Standalone test: QBFC import Gold Coast II snapshot into blank QB 2021 template.
 
 Usage: python test_import.py
-  - Copies blank template to target dir
+  - Copies blank template to target dir (keeping name 'Blank Template.qbw' for QBFC auth)
   - Launches QB 2021 with the target file
-  - Waits for you to enter the password manually
+  - Template has no password (pre-authorized)
   - Runs QBFC import from the existing snapshot
+  - After import, renames to final name
 """
 import shutil
 import subprocess
@@ -16,12 +17,23 @@ from pathlib import Path
 TEMPLATE = Path(r"C:\QBDowngrade\QB-2021 Template\Blank Template.qbw")
 SNAPSHOT = Path(r"C:\QBDowngrade\Output\joshs gold coast ii 23\exports\company_snapshot.json")
 TARGET_DIR = Path(r"C:\QBDowngrade\Output\joshs gold coast ii 23\target")
-TARGET_QBW = TARGET_DIR / "joshs gold coast ii 21.qbw"
+WORKING_QBW = TARGET_DIR / "Blank Template.qbw"  # keep original name for QBFC auth
+FINAL_QBW = TARGET_DIR / "joshs gold coast ii 21.qbw"
 QB2021_EXE = Path(r"C:\Program Files (x86)\Intuit\QuickBooks 2021\QBW32PremierAccountant.exe")
 
 def log(msg):
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] {msg}")
+
+def kill_qb():
+    """Kill all QB-related processes."""
+    for proc in ["QBW32PremierAccountant.exe", "QBWPremierAccountant.exe",
+                 "qbupdate.exe", "qbmapi64.exe"]:
+        subprocess.run(["taskkill", "/f", "/im", proc], capture_output=True)
+    # Also kill CefSharp/Intuit background processes
+    for pattern in ["CefSharp*", "Intuit*"]:
+        subprocess.run(f'taskkill /f /im "{pattern}"', shell=True, capture_output=True)
+    time.sleep(3)
 
 def main():
     # Verify prerequisites
@@ -35,58 +47,50 @@ def main():
         log(f"ERROR: QB 2021 not found at {QB2021_EXE}")
         sys.exit(1)
 
-    # Step 1: Copy template
+    # Step 1: Kill any existing QB
+    log("Killing any existing QB processes...")
+    kill_qb()
+
+    # Step 2: Copy template (keep name for QBFC auth)
     TARGET_DIR.mkdir(parents=True, exist_ok=True)
-    # Clean old target files (some may be locked by QB)
-    for f in TARGET_DIR.glob("joshs gold coast ii 21*"):
+    for f in TARGET_DIR.glob("*"):
         try:
             f.unlink()
             log(f"  Removed {f.name}")
         except PermissionError:
-            log(f"  WARN: could not remove {f.name} (locked?) — continuing")
+            log(f"  WARN: could not remove {f.name} (locked?)")
 
-    log(f"Copying template to {TARGET_QBW}")
-    shutil.copy2(TEMPLATE, TARGET_QBW)
-    # Copy companion files (best-effort, not critical)
-    for ext in (".qbw.DSN", ".qbw.ND"):
+    log(f"Copying template to {WORKING_QBW}")
+    shutil.copy2(TEMPLATE, WORKING_QBW)
+    for ext in (".qbw.DSN", ".qbw.ND", ".qbw.tlg"):
         src = TEMPLATE.parent / f"Blank Template{ext}"
         if src.exists():
-            dst = TARGET_DIR / f"joshs gold coast ii 21{ext}"
+            dst = TARGET_DIR / f"Blank Template{ext}"
             try:
                 shutil.copy2(src, dst)
-                log(f"  Copied {src.name}")
             except PermissionError:
-                log(f"  WARN: could not copy {src.name} (locked?) — QB will recreate it")
+                pass
+    log(f"Template copied ({WORKING_QBW.stat().st_size / 1024 / 1024:.1f} MB)")
 
-    log(f"Template copied ({TARGET_QBW.stat().st_size / 1024 / 1024:.1f} MB)")
+    # Step 3: Launch QB 2021
+    log(f"Launching QB 2021 with {WORKING_QBW}")
+    subprocess.Popen([str(QB2021_EXE), str(WORKING_QBW)])
 
-    # Step 2: Kill any existing QB processes
-    log("Killing any existing QB processes...")
-    subprocess.run(["taskkill", "/f", "/im", "QBW32PremierAccountant.exe"], 
-                    capture_output=True)
-    subprocess.run(["taskkill", "/f", "/im", "QBWPremierAccountant.exe"],
-                    capture_output=True)
-    time.sleep(3)
-
-    # Step 3: Launch QB 2021 with the target file
-    log(f"Launching QB 2021 with {TARGET_QBW}")
-    subprocess.Popen([str(QB2021_EXE), str(TARGET_QBW)])
-    
     log("")
     log("=" * 60)
-    log("  QB 2021 is launching. ENTER THE PASSWORD MANUALLY.")
-    log("  Password: 3825You171")
+    log("  QB 2021 is launching with Blank Template.")
+    log("  No password needed. Dismiss any startup dialogs.")
     log("  Once the company file is fully open, press ENTER here.")
     log("=" * 60)
     input("\n>>> Press ENTER when QB 2021 has the file open... ")
 
-    # Step 4: QBFC import
+    # Step 4: QBFC import (qbw_path=None = use already-open file)
     log("Starting QBFC import...")
     try:
         from qbfc_import import import_company_via_qbfc
         results = import_company_via_qbfc(
             snapshot_path=SNAPSHOT,
-            qbw_path=TARGET_QBW,
+            qbw_path=None,
             log_fn=log,
             skip_transactions=False,
         )
@@ -102,6 +106,25 @@ def main():
         log(f"IMPORT FAILED: {exc}")
         traceback.print_exc()
         sys.exit(1)
+
+    # Step 5: Close QB and rename
+    log("Closing QB...")
+    kill_qb()
+    time.sleep(3)
+
+    log(f"Renaming {WORKING_QBW.name} -> {FINAL_QBW.name}")
+    try:
+        WORKING_QBW.rename(FINAL_QBW)
+        for ext in (".qbw.ND", ".qbw.DSN", ".qbw.tlg"):
+            src = TARGET_DIR / f"Blank Template{ext}"
+            dst = TARGET_DIR / f"joshs gold coast ii 21{ext}"
+            if src.exists():
+                src.rename(dst)
+        log("Rename complete.")
+    except Exception as exc:
+        log(f"WARN: Rename failed: {exc} — file is still 'Blank Template.qbw'")
+
+    log("Done!")
 
 if __name__ == "__main__":
     main()
