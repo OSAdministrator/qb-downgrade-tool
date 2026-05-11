@@ -2294,9 +2294,10 @@ class QuickBooksAutomationEngine:
                 from qbfc_import import import_company_via_qbfc
 
                 self._emit("=== Starting QBFC SDK import into QB 2021 ===", log_fn)
+                self._emit(f"  Target file: {working_qbw}", log_fn)
                 import_results = import_company_via_qbfc(
                     snapshot_path=Path(str(snapshot_path)),
-                    qbw_path=None,  # bind to already-open file
+                    qbw_path=working_qbw,  # explicit path to avoid binding to wrong QB instance
                     log_fn=log_fn,
                     skip_transactions=False,
                 )

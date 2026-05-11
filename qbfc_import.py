@@ -30,7 +30,8 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
+# Use the main app logger so import messages land in the same log file
+logger = logging.getLogger("qb_downgrade")
 
 LogFn = Callable[[str], None]
 
