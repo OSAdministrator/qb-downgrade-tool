@@ -1962,6 +1962,20 @@ class QuickBooksAutomationEngine:
             passwords_to_try.append(alt_password)
         password_attempt_idx = 0
         password_entered = False
+
+        # PAUSE the watchdog for the ENTIRE startup-dialog phase.
+        # Critical: the watchdog hides QB main windows (SW_HIDE).
+        # In Windows, hiding a parent window also hides its owned
+        # child windows — including the password dialog!  If the
+        # watchdog hides QB's main frame before the password dialog
+        # appears, _find_active_dialog will never see it (it only
+        # searches visible windows).  Pausing the watchdog keeps
+        # the main window visible so the password dialog is
+        # discoverable.  We resume once the password is entered
+        # (or we give up).
+        if self._watchdog is not None:
+            self._watchdog.pause()
+
         start = time.time()
         while time.time() - start < timeout_s:
             # Check for password/login dialog first
@@ -1969,11 +1983,6 @@ class QuickBooksAutomationEngine:
             if login_dlg is not None and not password_entered:
                 current_pw = passwords_to_try[password_attempt_idx]
                 self._emit(f"Found startup login dialog, entering password (attempt {password_attempt_idx + 1}/{len(passwords_to_try)})", log_fn)
-
-                # PAUSE the watchdog so it doesn't dismiss "wrong password"
-                # warnings before we can detect them.
-                if self._watchdog is not None:
-                    self._watchdog.pause()
 
                 # Focus the dialog, click the password field, then type.
                 if send_keys is not None:
@@ -2035,14 +2044,10 @@ class QuickBooksAutomationEngine:
                         else:
                             self._emit("All passwords exhausted — will keep retrying last one", log_fn)
 
-                    # RESUME the watchdog now that we've handled the password
-                    if self._watchdog is not None:
-                        self._watchdog.resume()
+                    # (watchdog stays paused — will be resumed at end of method)
                     continue
                 else:
                     self._emit("WARNING: send_keys unavailable, cannot enter password", log_fn)
-                    if self._watchdog is not None:
-                        self._watchdog.resume()
 
             elif login_dlg is not None and password_entered:
                 # Password was already entered but dialog is still showing - wait
@@ -2079,6 +2084,11 @@ class QuickBooksAutomationEngine:
                 # Haven't entered password yet and haven't waited min_wait_s —
                 # keep polling in case the password dialog hasn't appeared yet.
                 # (QB may show other dialogs like Update Service first.)
+
+        # RESUME the watchdog — startup dialog handling is done.
+        # The watchdog will now hide QB main windows as usual.
+        if self._watchdog is not None:
+            self._watchdog.resume()
 
     def _export_from_qb2023(self, job: CompanyJob, export_dir: Path, log_fn: Optional[LogFn]) -> Dict[str, Path]:
         """Exports list IIF, transaction CSV, and report PDFs from QB 2023.
