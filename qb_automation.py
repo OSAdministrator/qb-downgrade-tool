@@ -1929,7 +1929,7 @@ class QuickBooksAutomationEngine:
 
     def _handle_startup_dialogs(self, password: str, timeout_s: int, log_fn: Optional[LogFn],
                                 alt_password: Optional[str] = None,
-                                min_wait_s: int = 30) -> None:
+                                min_wait_s: int = 90) -> None:
         """Handle dialogs that appear when QB starts up.
 
         =====================================================================
@@ -2057,6 +2057,11 @@ class QuickBooksAutomationEngine:
             # Dismiss other common startup dialogs
             self._dismiss_common_dialogs(log_fn)
             time.sleep(1)
+
+            # Periodic progress log so we know the wait is alive
+            elapsed_now = time.time() - start
+            if int(elapsed_now) % 10 == 0 and int(elapsed_now) > 0:
+                self._emit(f"  [Startup] waiting for password dialog... {int(elapsed_now)}s elapsed", log_fn)
 
             # Check if we're past all startup dialogs
             desktop = self._get_desktop()
