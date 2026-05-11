@@ -2390,34 +2390,14 @@ class QuickBooksAutomationEngine:
                 self._emit(f"QBFC import complete: {sum(import_results.values())} total records", log_fn)
 
                 # ---------------------------------------------------------------
-                # MANUAL CLOSE MODE: Do NOT auto-close QB.
-                # Let the user verify data in QB, then do File → Close Company
-                # and exit QB manually.  We poll until the process is gone.
+                # AUTOMATED CLOSE: drive QB through its own File menu so the
+                # data file is flushed cleanly to disk (Ctrl+W to close company,
+                # Yes on the save dialog, Alt+F4 to exit). _close_qb() handles
+                # all of this and falls back to taskkill if the menu path
+                # fails. This must run BEFORE the rename so no file lock.
                 # ---------------------------------------------------------------
-                self._emit("", log_fn)
-                self._emit("=" * 60, log_fn)
-                self._emit("IMPORT DONE — WAITING FOR YOU TO CLOSE QB MANUALLY", log_fn)
-                self._emit("  1) Switch to QB 2021 and verify data (Chart of Accounts, etc.)", log_fn)
-                self._emit("  2) File → Close Company  (this flushes data to disk)", log_fn)
-                self._emit("  3) File → Exit  (or just close the window)", log_fn)
-                self._emit("  Script will continue automatically once QB process is gone.", log_fn)
-                self._emit("=" * 60, log_fn)
-
-                import subprocess as _sp
-                while True:
-                    try:
-                        chk = _sp.run(
-                            ["tasklist", "/FI", "IMAGENAME eq QBW32.EXE"],
-                            capture_output=True, timeout=5, text=True, check=False,
-                        )
-                        if "QBW32.EXE" not in (chk.stdout or ""):
-                            self._emit("QB process gone — continuing.", log_fn)
-                            break
-                    except Exception:  # noqa: BLE001
-                        pass
-                    time.sleep(5)
-
-                # QB is gone — skip auto-close
+                self._emit("Import done — auto-closing QB 2021 (menu-driven)...", log_fn)
+                self._close_qb(qb2021_app, log_fn)
                 qb2021_app = None
                 self._qb2021_app = None
             else:

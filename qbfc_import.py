@@ -1188,6 +1188,66 @@ def save_snapshot(snapshot: Dict, snapshot_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Company profile (name, legal name, address, phone, EIN, fiscal year, etc.)
+# ---------------------------------------------------------------------------
+
+def _apply_address_block(addr_obj: Any, src: Dict[str, str]) -> None:
+    """Copy address dict (addr1..addr5/city/state/postalcode/country) into a QBFC address object."""
+    if not addr_obj or not src:
+        return
+    for k in ("Addr1", "Addr2", "Addr3", "Addr4", "Addr5",
+              "City", "State", "PostalCode", "Country"):
+        _set_if(addr_obj, k, src.get(k.lower()))
+
+
+def import_company_info(session: Any, info: Dict[str, Any], log_fn: Optional[LogFn] = None) -> int:
+    """Restore company profile via AppendCompanyActivityModRq.
+
+    Writes back every field captured by _extract_company_info on the export side.
+    Empty fields are skipped (so we never clobber a value with an empty string).
+    Returns 1 on success, 0 on no-op/failure.
+    """
+    if not info:
+        _emit("  Company: no company info in snapshot, skipping", log_fn)
+        return 0
+    try:
+        req = _create_request_set(session)
+        mod = req.AppendCompanyActivityModRq()
+
+        _set_if(mod, "CompanyName",                info.get("company_name"))
+        _set_if(mod, "LegalCompanyName",           info.get("legal_name"))
+        _apply_address_block(getattr(mod, "Address", None),       info.get("address") or {})
+        _apply_address_block(getattr(mod, "LegalAddress", None),  info.get("legal_address") or {})
+        _set_if(mod, "Phone",                      info.get("phone"))
+        _set_if(mod, "Fax",                        info.get("fax"))
+        _set_if(mod, "Email",                      info.get("email"))
+        _set_if(mod, "CompanyWebSite",             info.get("website"))
+        _set_if(mod, "EIN",                        info.get("ein"))
+        _set_if(mod, "SSN",                        info.get("ssn"))
+        _set_if(mod, "TaxForm",                    info.get("tax_form"))
+        _set_if(mod, "FirstMonthInFiscalYear",     info.get("first_month_fiscal_year"))
+        _set_if(mod, "FirstMonthInIncomeTaxYear",  info.get("first_month_income_tax_year"))
+        _set_if(mod, "CompanyType",                info.get("company_type"))
+
+        resp_set = session.session_manager.DoRequests(req)
+        resp = resp_set.ResponseList.GetAt(0)
+        if resp is None:
+            _emit("  Company: no response", log_fn)
+            return 0
+        if resp.StatusCode == 0:
+            cn = info.get("company_name") or "(no name)"
+            ln = info.get("legal_name") or "(no legal name)"
+            _emit(f"  Company: restored '{cn}' / legal '{ln}'", log_fn)
+            return 1
+        else:
+            _emit(f"  Company: CompanyActivityMod status={resp.StatusCode} msg={resp.StatusMessage}", log_fn)
+            return 0
+    except Exception as exc:  # noqa: BLE001
+        _emit(f"  Company: import_company_info failed: {exc}", log_fn)
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # High-level orchestrator
 # ---------------------------------------------------------------------------
 
@@ -1266,6 +1326,10 @@ def import_company_via_qbfc(
         else:
             _emit("QBFC Import: Skipping transactions (skip_transactions=True)", log_fn)
             results['transactions'] = 0
+
+        _emit("=== QBFC Import: Phase 7 — Company Profile ===", log_fn)
+        results['company'] = import_company_info(
+            session, snapshot.get('company', {}), log_fn)
 
     finally:
         session.end()

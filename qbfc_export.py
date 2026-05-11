@@ -1278,6 +1278,57 @@ def _query_typed_transactions(session, items=None, log_fn=None):
     _emit(f"  Snapshot: {len(all_txns)} transactions (with line detail)", log_fn)
     return all_txns
 
+def _extract_company_info(session: "QBFCSession", log_fn: Optional[LogFn] = None) -> Dict[str, Any]:
+    """Capture full company profile via AppendCompanyQueryRq.
+
+    Returns dict with every CompanyRet field we can read back so the import side
+    can restore the exact same identity (name, legal name, address, phone, EIN,
+    fiscal year, tax form, etc.). Empty/missing values are stored as "" so the
+    import knows to skip rather than blank them.
+    """
+    info: Dict[str, Any] = {}
+    try:
+        req = _create_request_set(session)
+        appender = getattr(req, "AppendCompanyQueryRq", None)
+        if appender is None:
+            _emit("  Snapshot: AppendCompanyQueryRq not available", log_fn)
+            return info
+        appender()
+        resp_set = session.session_manager.DoRequests(req)
+        r = resp_set.ResponseList.GetAt(0)
+        if r is None or r.StatusCode != 0:
+            _emit(f"  Snapshot: CompanyQuery status={r.StatusCode if r else 'None'}", log_fn)
+            return info
+        c = r.Detail
+        if c is None:
+            return info
+
+        info["company_name"]      = _safe_get(c, "CompanyName") or ""
+        info["legal_name"]        = _safe_get(c, "LegalCompanyName") or ""
+        info["address"]           = _address_dict(getattr(c, "Address", None))
+        info["legal_address"]     = _address_dict(getattr(c, "LegalAddress", None))
+        info["company_address"]   = _address_dict(getattr(c, "CompanyAddress", None))
+        info["customer_address"]  = _address_dict(getattr(c, "CustomerAddress", None))
+        info["phone"]             = _safe_get(c, "Phone") or ""
+        info["fax"]               = _safe_get(c, "Fax") or ""
+        info["email"]             = _safe_get(c, "Email") or ""
+        info["website"]           = _safe_get(c, "CompanyWebSite") or _safe_get(c, "WebSite") or ""
+        info["ein"]               = _safe_get(c, "EIN") or ""
+        info["ssn"]               = _safe_get(c, "SSN") or ""
+        info["tax_form"]          = _safe_get(c, "TaxForm") or ""
+        info["first_month_fiscal_year"]     = _safe_get(c, "FirstMonthInFiscalYear") or ""
+        info["first_month_income_tax_year"] = _safe_get(c, "FirstMonthInIncomeTaxYear") or ""
+        info["company_type"]      = _safe_get(c, "CompanyType") or ""
+        info["is_sample_company"] = _safe_get(c, "IsSampleCompany") or ""
+
+        cn = info.get("company_name") or "(no name)"
+        ln = info.get("legal_name") or "(no legal name)"
+        _emit(f"  Snapshot: company info captured — '{cn}' / legal '{ln}'", log_fn)
+    except Exception as exc:  # noqa: BLE001
+        _emit(f"  Snapshot: CompanyQuery failed: {exc}", log_fn)
+    return info
+
+
 
 def export_snapshot(
     session: "QBFCSession",
@@ -1316,6 +1367,9 @@ def export_snapshot(
             "company_path": session.company_path or "",
         },
     }
+
+    # --- Company profile (name, legal name, address, phone, EIN, fiscal year, etc.) ---
+    snapshot["company"] = _extract_company_info(session, log_fn)
 
     # --- Query each list type individually (same pattern as export_lists_to_iif) ---
     query_appenders = [
