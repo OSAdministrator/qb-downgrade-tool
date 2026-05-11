@@ -61,7 +61,9 @@ class CompanyJobResult:
 class QuickBooksAutomationEngine:
     """End-to-end orchestrator for one company file."""
 
+    # Match QB windows but EXCLUDE our own GUI ("QuickBooks TimeWarp®")
     QB_WINDOW_RE = r"(?i).*quickbooks.*"
+    _OWN_GUI_KEYWORDS = ("timewarp", "downgrade tool")
 
     def __init__(self, config: AppConfig, logger: Optional[logging.Logger] = None):
         self.config = config
@@ -133,6 +135,11 @@ class QuickBooksAutomationEngine:
         return Desktop(backend="uia")
 
     def _find_qb_main_window(self, app: Optional[object], version_hint: Optional[str], timeout_s: int):
+        def _is_own_gui(title: str) -> bool:
+            """Return True if *title* belongs to our own GUI, not real QB."""
+            tl = title.lower()
+            return any(kw in tl for kw in self._OWN_GUI_KEYWORDS)
+
         def _pick_window() -> Optional[object]:
             if app is not None:
                 try:
@@ -140,13 +147,17 @@ class QuickBooksAutomationEngine:
                         if not win.exists() or not win.is_visible():
                             continue
                         title = win.window_text()
+                        if _is_own_gui(title):
+                            continue
                         if version_hint and version_hint not in title:
                             continue
                         if re.search(self.QB_WINDOW_RE, title):
                             return win
                     top = app.top_window()
                     if top.exists() and top.is_visible():
-                        return top
+                        title = top.window_text() or ""
+                        if not _is_own_gui(title):
+                            return top
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -157,6 +168,8 @@ class QuickBooksAutomationEngine:
                     if not w.is_visible():
                         continue
                     title = w.window_text()
+                    if _is_own_gui(title):
+                        continue
                     score = 0
                     if version_hint and version_hint in title:
                         score += 10
