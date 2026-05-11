@@ -2268,33 +2268,44 @@ class QuickBooksAutomationEngine:
             parse_stats = self.tx_parser.convert_csv_to_iif(exported["tx_csv"], tx_iif)
             self._emit(f"Generated transaction IIF with {parse_stats['record_count']} records", log_fn)
 
-            # 5) Copy QB 2021 template -> target directory
+            # 5) Copy QB 2021 template -> target directory (KEEP ORIGINAL NAME)
+            #    The QBFC app authorization is baked into the template by file name.
+            #    We copy as "Blank Template.qbw", do the import, then rename AFTER
+            #    closing QB so the authorization stays valid throughout.
             set_progress(4)
             target_dir.mkdir(parents=True, exist_ok=True)
             raw_name = job.target_company_name or job.qbw_path.stem
             target_name = re.sub(r"\b23\b", "21", raw_name) if "23" in raw_name else raw_name
-            target_qbw = target_dir / f"{target_name}.qbw"
-
+            # Final destination after rename
+            final_target_qbw = target_dir / f"{target_name}.qbw"
+            # Working copy keeps the template name so QBFC auth is inherited
             template_path = Path(self.config.install_paths.qb_2021_template_path)
+            working_qbw = target_dir / template_path.name
+
             if not self.config.dry_run:
                 if not template_path.exists():
                     raise FileNotFoundError(
                         f"QB 2021 template not found at {template_path}. "
                         "Place a blank QB 2021 .qbw file there first."
                     )
-                shutil.copy2(template_path, target_qbw)
-                self._emit(f"Copied QB 2021 template to {target_qbw}", log_fn)
+                shutil.copy2(template_path, working_qbw)
+                self._emit(f"Copied QB 2021 template to {working_qbw} (keeping name for QBFC auth)", log_fn)
 
-                # Also copy the .tlg and .nd files if they exist alongside the template
-                for ext in (".tlg", ".nd"):
-                    src = template_path.with_suffix(ext)
+                # Also copy companion files (.tlg, .nd, .DSN) if they exist
+                for ext_suffix in (".qbw.ND", ".qbw.DSN", ".tlg"):
+                    src = template_path.parent / f"{template_path.stem}{ext_suffix}"
                     if src.exists():
-                        shutil.copy2(src, target_qbw.with_suffix(ext))
+                        dst = target_dir / f"{working_qbw.stem}{ext_suffix}"
+                        try:
+                            shutil.copy2(src, dst)
+                        except Exception:
+                            pass  # QB will recreate these
             else:
-                target_qbw.write_text("DRY RUN PLACEHOLDER - QBW FILE CREATED", encoding="utf-8")
-                self._emit(f"Created dry-run target company file: {target_qbw}", log_fn)
+                working_qbw = final_target_qbw
+                working_qbw.write_text("DRY RUN PLACEHOLDER - QBW FILE CREATED", encoding="utf-8")
+                self._emit(f"Created dry-run target company file: {working_qbw}", log_fn)
 
-            # 6) Launch QB 2021 with the target company file
+            # 6) Launch QB 2021 with the WORKING copy (original template name)
             set_progress(5)
             snapshot_path = exported.get("snapshot")
             if not self.config.dry_run and not snapshot_path:
@@ -2307,13 +2318,15 @@ class QuickBooksAutomationEngine:
 
             if not self.config.dry_run:
                 qb2021_app = self._launch_qb(
-                    self.config.install_paths.qb_2021_path, log_fn, qbw_path=target_qbw
+                    self.config.install_paths.qb_2021_path, log_fn, qbw_path=working_qbw
                 )
                 self._qb2021_app = qb2021_app
             else:
                 self._emit("Dry-run: skipping QB 2021 launch", log_fn)
 
             # 7) QBFC import — pure SDK, no UI automation
+            #    Pass qbw_path=None so QBFC binds to the already-open file
+            #    (passing the path causes QBFC to try launching a new QB instance)
             set_progress(6)
             import_results: Dict[str, int] = {}
             if not self.config.dry_run:
@@ -2322,7 +2335,7 @@ class QuickBooksAutomationEngine:
                 self._emit("=== Starting QBFC SDK import into QB 2021 ===", log_fn)
                 import_results = import_company_via_qbfc(
                     snapshot_path=Path(str(snapshot_path)),
-                    qbw_path=target_qbw,
+                    qbw_path=None,  # bind to already-open file
                     log_fn=log_fn,
                     skip_transactions=False,
                 )
@@ -2346,6 +2359,22 @@ class QuickBooksAutomationEngine:
             self._close_qb(qb2021_app, log_fn)
             qb2021_app = None
             self._qb2021_app = None
+
+            # Rename the working copy to the final target name
+            # (done AFTER closing QB so no file locks)
+            target_qbw = final_target_qbw
+            if not self.config.dry_run and working_qbw != final_target_qbw:
+                self._emit(f"Renaming {working_qbw.name} -> {final_target_qbw.name}", log_fn)
+                working_qbw.rename(final_target_qbw)
+                # Rename companion files too
+                for ext_suffix in (".qbw.ND", ".qbw.DSN", ".tlg"):
+                    old_f = target_dir / f"{working_qbw.stem}{ext_suffix}"
+                    new_f = target_dir / f"{final_target_qbw.stem}{ext_suffix}"
+                    if old_f.exists():
+                        try:
+                            old_f.rename(new_f)
+                        except Exception:
+                            pass
             set_progress(9)
 
             generated_files = {
