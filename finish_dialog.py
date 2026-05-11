@@ -18,10 +18,16 @@ from tkinter import ttk
 from typing import Any, Dict, Optional
 
 
+# TODO: Replace these placeholders with the real review URLs once Joseph
+# sets up the listings. To update:
+#   - Google:     Google Business Profile -> Reviews -> "Get more reviews"
+#                 (copy the link that looks like https://g.page/r/.../review)
+#   - Trustpilot: https://business.trustpilot.com -> claim domain -> share URL
+#   - Facebook:   https://www.facebook.com/<page>/reviews/
 REVIEW_URLS = {
-    "Google":      "https://search.google.com/local/writereview?placeid=ChIJ8WnxNJZE3IgRX3kK_5Z76yU",
-    "Trustpilot":  "https://www.trustpilot.com/evaluate/oursystemadmin.com",
-    "Facebook":    "https://www.facebook.com/oursystemadmin/reviews",
+    "Google":     "https://www.google.com/search?q=our+system+administrator+reviews",   # placeholder
+    "Trustpilot": "https://www.trustpilot.com/review/oursystemadmin.com",                # placeholder
+    "Facebook":   "https://www.facebook.com/oursystemadmin",                             # placeholder
 }
 
 
