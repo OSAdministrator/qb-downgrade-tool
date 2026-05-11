@@ -681,21 +681,21 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
             try:
                 for acct, debit, credit in valid_lines:
                     if debit > 0:
-                        dl = je.ORJournalLineList.AppendJournalDebitLine()
-                        dl.JournalDebitLine.AccountRef.FullName.SetValue(acct)
-                        dl.JournalDebitLine.Amount.SetValue(debit)
+                        ol = je.ORJournalLineList.Append()
+                        ol.JournalDebitLine.AccountRef.FullName.SetValue(acct)
+                        ol.JournalDebitLine.Amount.SetValue(debit)
                         if entity:
                             try:
-                                dl.JournalDebitLine.EntityRef.FullName.SetValue(entity)
+                                ol.JournalDebitLine.EntityRef.FullName.SetValue(entity)
                             except Exception:
                                 pass
                     elif credit > 0:
-                        cl = je.ORJournalLineList.AppendJournalCreditLine()
-                        cl.JournalCreditLine.AccountRef.FullName.SetValue(acct)
-                        cl.JournalCreditLine.Amount.SetValue(credit)
+                        ol = je.ORJournalLineList.Append()
+                        ol.JournalCreditLine.AccountRef.FullName.SetValue(acct)
+                        ol.JournalCreditLine.Amount.SetValue(credit)
                         if entity:
                             try:
-                                cl.JournalCreditLine.EntityRef.FullName.SetValue(entity)
+                                ol.JournalCreditLine.EntityRef.FullName.SetValue(entity)
                             except Exception:
                                 pass
             except Exception as exc:
@@ -730,19 +730,19 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
 
             try:
                 if amount > 0:
-                    dl = je.ORJournalLineList.AppendJournalDebitLine()
-                    dl.JournalDebitLine.AccountRef.FullName.SetValue(account)
-                    dl.JournalDebitLine.Amount.SetValue(abs(amount))
-                    cl = je.ORJournalLineList.AppendJournalCreditLine()
-                    cl.JournalCreditLine.AccountRef.FullName.SetValue('Opening Balance Equity')
-                    cl.JournalCreditLine.Amount.SetValue(abs(amount))
+                    ol = je.ORJournalLineList.Append()
+                    ol.JournalDebitLine.AccountRef.FullName.SetValue(account)
+                    ol.JournalDebitLine.Amount.SetValue(abs(amount))
+                    ol2 = je.ORJournalLineList.Append()
+                    ol2.JournalCreditLine.AccountRef.FullName.SetValue('Opening Balance Equity')
+                    ol2.JournalCreditLine.Amount.SetValue(abs(amount))
                 else:
-                    cl = je.ORJournalLineList.AppendJournalCreditLine()
-                    cl.JournalCreditLine.AccountRef.FullName.SetValue(account)
-                    cl.JournalCreditLine.Amount.SetValue(abs(amount))
-                    dl = je.ORJournalLineList.AppendJournalDebitLine()
-                    dl.JournalDebitLine.AccountRef.FullName.SetValue('Opening Balance Equity')
-                    dl.JournalDebitLine.Amount.SetValue(abs(amount))
+                    ol = je.ORJournalLineList.Append()
+                    ol.JournalCreditLine.AccountRef.FullName.SetValue(account)
+                    ol.JournalCreditLine.Amount.SetValue(abs(amount))
+                    ol2 = je.ORJournalLineList.Append()
+                    ol2.JournalDebitLine.AccountRef.FullName.SetValue('Opening Balance Equity')
+                    ol2.JournalDebitLine.Amount.SetValue(abs(amount))
             except Exception as exc:
                 _emit(f"  JE #{i}: line setup failed: {exc}", log_fn)
                 failed += 1
