@@ -2395,6 +2395,22 @@ class QuickBooksAutomationEngine:
                         f"QB 2021 template not found at {template_path}. "
                         "Place a blank QB 2021 .qbw file there first."
                     )
+                # Remove stale destination first (previous failed run may leave a locked copy)
+                if working_qbw.exists():
+                    try:
+                        working_qbw.unlink()
+                    except PermissionError:
+                        # File is locked — kill any stale QB 2021 processes and retry
+                        self._emit("Stale template file is locked — killing residual QB processes...", log_fn)
+                        import subprocess as _sp
+                        for img in ("QBW32PremierAccountant.exe", "QBWPremierAccountant.exe",
+                                    "qbw32.exe", "qbw.exe"):
+                            _sp.run(["taskkill", "/F", "/IM", img], capture_output=True)
+                        time.sleep(3)
+                        try:
+                            working_qbw.unlink()
+                        except Exception as e2:
+                            self._emit(f"WARN: Could not delete stale template: {e2}", log_fn)
                 shutil.copy2(template_path, working_qbw)
                 self._emit(f"Copied QB 2021 template to {working_qbw} (keeping name for QBFC auth)", log_fn)
 
