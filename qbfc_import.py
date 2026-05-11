@@ -458,12 +458,42 @@ def import_other_names(session: Any, others: List[Dict], log_fn: Optional[LogFn]
     return ok
 
 
-def import_items(session: Any, items: List[Dict], log_fn: Optional[LogFn] = None) -> int:
+def _find_default_account(accounts: List[Dict], type_codes) -> str:
+    """Return FullName of the first active account matching any of the given type codes (as strings)."""
+    type_set = {str(t) for t in type_codes}
+    for a in accounts:
+        if str(a.get('type', '')).strip() in type_set:
+            name = (a.get('full_name') or a.get('name') or '').strip()
+            if name:
+                return name
+    return ''
+
+
+def _set_amount_required(obj: Any, attr: str, value) -> None:
+    """Set a QBFC amount field, defaulting to 0.0 if value is None/empty."""
+    try:
+        amt = float(value) if value not in (None, '') else 0.0
+    except (TypeError, ValueError):
+        amt = 0.0
+    try:
+        field = getattr(obj, attr, None)
+        if field is not None and hasattr(field, 'SetValue'):
+            field.SetValue(amt)
+    except Exception as exc:
+        logger.debug(f"Could not set amount {attr}={amt}: {exc}")
+
+
+def import_items(session: Any, items: List[Dict], accounts: Optional[List[Dict]] = None, log_fn: Optional[LogFn] = None) -> int:
     """Create Item entries in QB.
 
     Items are complex — different types (Service, NonInventory, Inventory, etc.)
     have different Add request types. We handle the main ones.
     """
+    accounts = accounts or []
+    default_income = _find_default_account(accounts, [10, 13])  # Income, OtherIncome
+    default_expense = _find_default_account(accounts, [12, 11, 14])  # Expense, COGS, OtherExpense
+    default_asset = _find_default_account(accounts, [2, 4])  # OtherCurrentAsset, OtherAsset
+    _emit(f"QBFC Import: Item defaults — income='{default_income}' expense='{default_expense}' asset='{default_asset}'", log_fn)
     ok = 0
     for it in items:
         name = it.get('name', '').strip()
@@ -519,14 +549,14 @@ def import_items(session: Any, items: List[Dict], log_fn: Optional[LogFn] = None
         # - Subtotal/Payment/Group have no price fields
 
         if item_type in ('Inventory', 'InventoryAssembly', 'InvAssy'):
-            # Inventory: direct fields
-            _set_if(add, 'SalesDesc', desc)
-            _set_if(add, 'PurchaseDesc', purchase_desc)
-            _set_amount_if(add, 'SalesPrice', price)
-            _set_amount_if(add, 'PurchaseCost', cost)
-            _set_ref_if(add, 'IncomeAccountRef', income_acct)
-            _set_ref_if(add, 'COGSAccountRef', expense_acct)
-            _set_ref_if(add, 'AssetAccountRef', asset_acct)
+            # Inventory: direct fields. Account refs are required.
+            _set_if(add, 'SalesDesc', desc or name)
+            _set_if(add, 'PurchaseDesc', purchase_desc or desc or name)
+            _set_amount_required(add, 'SalesPrice', price)
+            _set_amount_required(add, 'PurchaseCost', cost)
+            _set_ref_if(add, 'IncomeAccountRef', income_acct or default_income)
+            _set_ref_if(add, 'COGSAccountRef', expense_acct or default_expense)
+            _set_ref_if(add, 'AssetAccountRef', asset_acct or default_asset)
 
         elif item_type in ('SalesTax',):
             # SalesTax: set tax rate and vendor
@@ -542,6 +572,7 @@ def import_items(session: Any, items: List[Dict], log_fn: Optional[LogFn] = None
         else:
             # Service, NonInventory, OtherCharge, Discount:
             # Must use ORSalesPurchase -> SalesOrPurchase or SalesAndPurchase
+            # AccountRef and Desc are REQUIRED — must always be set or QB rejects.
             try:
                 sop = getattr(add, 'ORSalesPurchase', None)
                 if sop is not None:
@@ -549,27 +580,23 @@ def import_items(session: Any, items: List[Dict], log_fn: Optional[LogFn] = None
                         # Different accounts for sales vs purchase -> SalesAndPurchase
                         sap = getattr(sop, 'SalesAndPurchase', None)
                         if sap is not None:
-                            _set_if(sap, 'SalesDesc', desc)
-                            _set_amount_if(sap, 'SalesPrice', price or 0)
+                            _set_if(sap, 'SalesDesc', desc or name)
+                            _set_amount_required(sap, 'SalesPrice', price)
                             _set_ref_if(sap, 'IncomeAccountRef', income_acct)
-                            _set_if(sap, 'PurchaseDesc', purchase_desc or desc)
-                            _set_amount_if(sap, 'PurchaseCost', cost or 0)
+                            _set_if(sap, 'PurchaseDesc', purchase_desc or desc or name)
+                            _set_amount_required(sap, 'PurchaseCost', cost)
                             _set_ref_if(sap, 'ExpenseAccountRef', expense_acct)
                     else:
                         # Same account or only one -> SalesOrPurchase
                         sp = getattr(sop, 'SalesOrPurchase', None)
                         if sp is not None:
-                            _set_if(sp, 'Desc', desc)
-                            _set_amount_if(sp, 'Price', price or 0)
-                            acct = income_acct or expense_acct
-                            if acct:
-                                _set_ref_if(sp, 'AccountRef', acct)
-                            else:
-                                # No account in snapshot — use a sensible default
-                                # QB requires an account; use first income-type account
-                                _set_ref_if(sp, 'AccountRef', 'Services')
-            except Exception:
-                pass
+                            _set_if(sp, 'Desc', desc or name)
+                            _set_amount_required(sp, 'Price', price)
+                            # AccountRef is REQUIRED. Fall back to defaults.
+                            acct = income_acct or expense_acct or default_income or default_expense
+                            _set_ref_if(sp, 'AccountRef', acct)
+            except Exception as exc:
+                logger.debug(f"ORSalesPurchase setup failed for item '{name}': {exc}")
 
         if _do_add_request(session, req, f"Item '{name}' ({item_type})", log_fn):
             ok += 1
@@ -768,7 +795,7 @@ def import_company_via_qbfc(
 
         _emit("=== QBFC Import: Phase 4 — Items ===", log_fn)
         results['items'] = import_items(
-            session, snapshot.get('items', []), log_fn)
+            session, snapshot.get('items', []), snapshot.get('accounts', []), log_fn)
 
         if not skip_transactions:
             _emit("=== QBFC Import: Phase 5 — Transactions ===", log_fn)
