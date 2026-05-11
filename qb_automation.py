@@ -1809,6 +1809,9 @@ class QuickBooksAutomationEngine:
                                 time.sleep(0.2)
                         except Exception:
                             pass
+                        # Clear any existing text before typing
+                        send_keys("^a", pause=0.02)
+                        time.sleep(0.1)
                         # Escape special chars for send_keys
                         safe_pw = pw
                         for ch in ('{', '}'):
@@ -1980,6 +1983,11 @@ class QuickBooksAutomationEngine:
                             time.sleep(0.2)
                     except Exception:  # noqa: BLE001
                         pass  # Fallback: just type and hope for the best
+
+                    # Clear any existing text in the field (previous failed
+                    # attempt may have left partial text) before typing.
+                    send_keys("^a", pause=0.02)  # Ctrl+A = select all
+                    time.sleep(0.1)
 
                     # Escape pywinauto special chars: + ^ % { } ( ) ~
                     # so passwords with these chars are typed literally.
