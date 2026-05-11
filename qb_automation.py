@@ -2314,19 +2314,25 @@ class QuickBooksAutomationEngine:
             # Wipe stale working dirs so a previous failed run never pollutes.
             # source_dir MUST be cleaned too — a stale template .qbw from a
             # previous failed run may still be locked by a residual QB process.
-            # Kill any QB processes first, then wipe all three directories.
+            # Kill any QB processes first, wait for locks to release, then wipe.
             import subprocess as _sp
             for img in ("QBW32PremierAccountant.exe", "QBWPremierAccountant.exe",
                         "qbw32.exe", "qbw.exe"):
                 _sp.run(["taskkill", "/F", "/IM", img], capture_output=True)
-            time.sleep(2)
+
+            # Retry rmtree with backoff — Windows file locks can linger after taskkill
             for stale_dir in (source_dir, export_dir, output_dir):
                 if stale_dir.exists():
                     self._emit(f"Cleaning stale directory: {stale_dir}", log_fn)
-                    try:
-                        shutil.rmtree(stale_dir)
-                    except Exception as exc:  # noqa: BLE001
-                        self._emit(f"  WARN: could not remove {stale_dir}: {exc}", log_fn)
+                    for attempt in range(5):
+                        try:
+                            shutil.rmtree(stale_dir)
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            if attempt < 4:
+                                time.sleep(2)  # wait for file locks to release
+                            else:
+                                self._emit(f"  WARN: could not remove {stale_dir} after 5 attempts: {exc}", log_fn)
             for d in (source_dir, export_dir, output_dir):
                 d.mkdir(parents=True, exist_ok=True)
 
@@ -2337,6 +2343,12 @@ class QuickBooksAutomationEngine:
             original_qbw = job.qbw_path
             staged_qbw = source_dir / original_qbw.name
             if not self.config.dry_run:
+                # Delete destination first if it survived cleanup (locked file edge case)
+                if staged_qbw.exists():
+                    try:
+                        staged_qbw.unlink()
+                    except Exception:  # noqa: BLE001
+                        pass  # copy2 will overwrite or fail with clear error
                 shutil.copy2(str(original_qbw), str(staged_qbw))
                 self._emit(f"  Staged: {original_qbw} -> {staged_qbw}", log_fn)
                 for ext_s in (".qbw.ND", ".qbw.DSN", ".tlg", ".TLG"):
