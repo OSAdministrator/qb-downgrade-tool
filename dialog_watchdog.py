@@ -52,6 +52,7 @@ LogFn = Callable[[str], None]
 _RULES: List[Tuple[str, List[str]]] = [
     # ---- Updates / maintenance / registration / promo ----
     (r"(?i)quickbooks\s+update",          ["Install Later", "Later", "Cancel", "No", "Close"]),
+    (r"(?i)auto.?update",                 ["OK", "Close", "Cancel"]),
     (r"(?i)update\s+available",           ["Install Later", "Later", "Cancel", "No", "Close"]),
     (r"(?i)maintenance\s+release",        ["Install Later", "Later", "Cancel", "Close"]),
     (r"(?i)product\s+information",        ["OK", "Close"]),
@@ -114,12 +115,19 @@ _HIDE_PATTERNS: List[str] = [
     r"(?i) - quickbooks",  # title bar suffix on company window
 ]
 
-# Window titles we MUST NOT dismiss or hide — these are our own GUI / Tk.
+# Window titles we MUST NOT dismiss or hide — these are our own GUI / Tk,
+# plus login/password dialogs which require user interaction.
 _OWN_WINDOW_PATTERNS: List[str] = [
     r"(?i)quickbooks\s+timewarp",
     r"(?i)timewarp",
     r"(?i)settings$",
     r"(?i)tk$",
+]
+_NEVER_HIDE_PATTERNS: List[str] = [
+    r"(?i)login",
+    r"(?i)password",
+    r"(?i)sign.?in",
+    r"(?i)log.?on",
 ]
 
 
@@ -206,6 +214,10 @@ class DialogWatchdog:
             if any(re.search(p, title) for p in _OWN_WINDOW_PATTERNS):
                 continue
 
+            # Never hide login/password dialogs — user needs to interact
+            if any(re.search(p, title) for p in _NEVER_HIDE_PATTERNS):
+                continue
+
             # Hide QB main windows (don't dismiss — we need the file open)
             if self._hide_qb and any(re.search(p, title) for p in _HIDE_PATTERNS):
                 # Only hide if it's a QBW32 process window
@@ -221,10 +233,12 @@ class DialogWatchdog:
                     handled = True
                     break
 
-            if not handled:
-                # Log unknown popups once so we can add a rule next time.
-                # Skip if it's a QB process window (likely a transient internal frame).
-                if self._looks_like_dialog(hwnd) and title not in self._unknown_titles:
+            if not handled and self._looks_like_dialog(hwnd):
+                # Unknown dialog — try a generic dismiss as last resort
+                if self._is_qb_process(hwnd):
+                    self._dismiss(hwnd, title, ["OK", "Close", "Yes", "Cancel", "No"])
+                    handled = True
+                elif title not in self._unknown_titles:
                     self._unknown_titles.add(title)
                     self._log_fn(f"[Watchdog] unknown dialog (left alone): '{title}'")
 
