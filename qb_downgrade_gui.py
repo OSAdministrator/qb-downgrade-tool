@@ -131,7 +131,7 @@ class SettingsDialog(tk.Toplevel):
 class QuickBooksDowngradeGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("QuickBooks TimeWarp\u00ae \u2014 Matt Mike Tax Build")
+        self.root.title("QuickBooks TimeWarp\u00ae \u2014 Tax Man Mike Build")
         self.root.geometry("1100x430")
 
         self.config_manager = ConfigManager()
