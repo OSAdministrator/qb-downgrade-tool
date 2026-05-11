@@ -2454,15 +2454,20 @@ class QuickBooksAutomationEngine:
                         break
                     except (PermissionError, OSError):
                         time.sleep(2)
+                import shutil
                 self._emit(f"Renaming {working_qbw.name} -> {final_target_qbw.name}", log_fn)
-                working_qbw.rename(final_target_qbw)
+                if final_target_qbw.exists():
+                    final_target_qbw.unlink()
+                shutil.move(str(working_qbw), str(final_target_qbw))
                 # Rename companion files too
                 for ext_suffix in (".qbw.ND", ".qbw.DSN", ".tlg"):
                     old_f = target_dir / f"{working_qbw.stem}{ext_suffix}"
                     new_f = target_dir / f"{final_target_qbw.stem}{ext_suffix}"
                     if old_f.exists():
                         try:
-                            old_f.rename(new_f)
+                            if new_f.exists():
+                                new_f.unlink()
+                            shutil.move(str(old_f), str(new_f))
                         except Exception:
                             pass
             set_progress(9)
