@@ -2387,9 +2387,39 @@ class QuickBooksAutomationEngine:
                     skip_transactions=False,
                 )
 
-                # CRITICAL: allow QB to flush all QBFC writes to disk.
                 self._emit(f"QBFC import complete: {sum(import_results.values())} total records", log_fn)
-                # Note: actual flush happens in _close_qb via File → Close Company
+
+                # ---------------------------------------------------------------
+                # MANUAL CLOSE MODE: Do NOT auto-close QB.
+                # Let the user verify data in QB, then do File → Close Company
+                # and exit QB manually.  We poll until the process is gone.
+                # ---------------------------------------------------------------
+                self._emit("", log_fn)
+                self._emit("=" * 60, log_fn)
+                self._emit("IMPORT DONE — WAITING FOR YOU TO CLOSE QB MANUALLY", log_fn)
+                self._emit("  1) Switch to QB 2021 and verify data (Chart of Accounts, etc.)", log_fn)
+                self._emit("  2) File → Close Company  (this flushes data to disk)", log_fn)
+                self._emit("  3) File → Exit  (or just close the window)", log_fn)
+                self._emit("  Script will continue automatically once QB process is gone.", log_fn)
+                self._emit("=" * 60, log_fn)
+
+                import subprocess as _sp
+                while True:
+                    try:
+                        chk = _sp.run(
+                            ["tasklist", "/FI", "IMAGENAME eq QBW32.EXE"],
+                            capture_output=True, timeout=5, text=True, check=False,
+                        )
+                        if "QBW32.EXE" not in (chk.stdout or ""):
+                            self._emit("QB process gone — continuing.", log_fn)
+                            break
+                    except Exception:  # noqa: BLE001
+                        pass
+                    time.sleep(5)
+
+                # QB is gone — skip auto-close
+                qb2021_app = None
+                self._qb2021_app = None
             else:
                 self._emit("Dry-run: skipping QBFC import", log_fn)
 
@@ -2404,11 +2434,12 @@ class QuickBooksAutomationEngine:
                 company_name=job.qbw_path.stem,
             )
 
-            # 9) Close QB 2021
+            # 9) Close QB 2021 — skipped in manual-close mode (already None)
             set_progress(8)
-            self._close_qb(qb2021_app, log_fn)
-            qb2021_app = None
-            self._qb2021_app = None
+            if qb2021_app is not None:
+                self._close_qb(qb2021_app, log_fn)
+                qb2021_app = None
+                self._qb2021_app = None
 
             # Rename the working copy to the final target name
             # (done AFTER closing QB so no file locks)
