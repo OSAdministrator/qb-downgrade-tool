@@ -1382,6 +1382,9 @@ def export_snapshot(
         ("AppendItemQueryRq",          "items"),
         ("AppendTermsQueryRq",         "terms"),
         ("AppendPaymentMethodQueryRq", "payment_methods"),
+        ("AppendToDoQueryRq",          "to_dos"),
+        ("AppendMemorizedTransactionQueryRq", "memorized_txns"),
+        ("AppendPreferencesQueryRq",   "preferences"),
     ]
 
     raw_responses: Dict[str, Any] = {}
@@ -1636,6 +1639,65 @@ def export_snapshot(
             })
     snapshot["items"] = items
     _emit(f"  Snapshot: {len(items)} items", log_fn)
+
+    # --- To-Do list (Reminders -> To Do) ---
+    to_dos = []
+    detail = raw_responses.get("to_dos")
+    if detail:
+        for i in range(detail.Count):
+            t = detail.GetAt(i)
+            to_dos.append({
+                "notes":        _safe_get(t, "Notes") or "",
+                "is_active":    (_safe_get(t, "IsActive") or "true").lower() in ("true", "1", "yes"),
+                "is_done":      (_safe_get(t, "IsDone") or "false").lower() in ("true", "1", "yes"),
+                "reminder_date":_safe_get(t, "ReminderDate") or "",
+                "type":         _safe_get(t, "Type") or "",
+                "priority":     _safe_get(t, "Priority") or "",
+            })
+    snapshot["to_dos"] = to_dos
+    _emit(f"  Snapshot: {len(to_dos)} to-do items", log_fn)
+
+    # --- Memorized Transactions (templates; full re-create not possible via
+    #     QBFC, so we capture metadata for reference + a manual-rebuild hint) ---
+    memorized = []
+    detail = raw_responses.get("memorized_txns")
+    if detail:
+        for i in range(detail.Count):
+            m = detail.GetAt(i)
+            memorized.append({
+                "name":             _safe_get(m, "Name") or _safe_get(m, "FullName") or "",
+                "is_active":        (_safe_get(m, "IsActive") or "true").lower() in ("true", "1", "yes"),
+                "how_often":        _safe_get(m, "Frequency") or "",
+                "next_date":        _safe_get(m, "NextDate") or "",
+                "days_in_advance":  _safe_get(m, "DaysInAdvance") or "",
+                "remaining_times":  _safe_get(m, "RemainingTimes") or "",
+                "txn_type":         _safe_get(m, "TxnType") or "",
+            })
+    snapshot["memorized_txns"] = memorized
+    _emit(f"  Snapshot: {len(memorized)} memorized transactions (captured for reference)", log_fn)
+
+    # --- Preferences (we focus on Reminders block; other prefs included raw) ---
+    prefs: Dict[str, Any] = {}
+    detail = raw_responses.get("preferences")
+    if detail:
+        rp = getattr(detail, "RemindersPreferences", None) or getattr(detail, "Reminders", None)
+        if rp is not None:
+            prefs["reminders"] = {
+                "show_summary":            _safe_get(rp, "IsShowSummary") or "",
+                "show_list":               _safe_get(rp, "IsShowList") or "",
+                "remind_chk_to_print":     _safe_get(rp, "RemindChecksToPrint") or "",
+                "remind_paychks_to_print": _safe_get(rp, "RemindPaychecksToPrint") or "",
+                "remind_invoices_to_send": _safe_get(rp, "RemindInvoicesToSend") or "",
+                "remind_overdue_invoices": _safe_get(rp, "RemindOverdueInvoices") or "",
+                "remind_to_deposit":       _safe_get(rp, "RemindToDeposit") or "",
+                "remind_bills_to_pay":     _safe_get(rp, "RemindBillsToPay") or "",
+                "remind_memorized_txns":   _safe_get(rp, "RemindMemorizedTxns") or "",
+                "remind_to_do":            _safe_get(rp, "RemindToDoNotes") or "",
+                "remind_inventory":        _safe_get(rp, "RemindInventoryToReorder") or "",
+                "remind_purchase_orders":  _safe_get(rp, "RemindOpenPurchaseOrders") or "",
+            }
+    snapshot["preferences"] = prefs
+    _emit(f"  Snapshot: preferences captured ({len(prefs)} sections)", log_fn)
 
     # --- Transactions (per-type queries with full debit/credit line detail) ---
     if include_transactions:

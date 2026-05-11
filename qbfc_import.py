@@ -1248,6 +1248,95 @@ def import_company_info(session: Any, info: Dict[str, Any], log_fn: Optional[Log
 
 
 # ---------------------------------------------------------------------------
+# To-Do items / Memorized Txns / Reminder preferences (Phase 8)
+# ---------------------------------------------------------------------------
+
+def import_to_dos(session: Any, to_dos: List[Dict], log_fn: Optional[LogFn] = None) -> int:
+    """Recreate To-Do reminders via AppendToDoAddRq."""
+    ok = 0
+    for t in to_dos:
+        notes = (t.get("notes") or "").strip()
+        if not notes:
+            continue
+        try:
+            req = _create_request_set(session)
+            add = req.AppendToDoAddRq()
+            _set_if(add, "Notes",        notes)
+            _set_if(add, "ReminderDate", t.get("reminder_date"))
+            _set_if(add, "Type",         t.get("type"))
+            _set_if(add, "Priority",     t.get("priority"))
+            if t.get("is_done"):
+                _set_if(add, "IsDone", "true")
+            if _do_add_request(session, req, f"ToDo: {notes[:40]}", log_fn):
+                ok += 1
+        except Exception as exc:  # noqa: BLE001
+            _emit(f"  ToDo failed: {exc}", log_fn)
+    _emit(f"  To-Dos imported: {ok}/{len(to_dos)}", log_fn)
+    return ok
+
+
+def import_memorized_transactions(memorized: List[Dict], log_fn: Optional[LogFn] = None) -> int:
+    """Memorized transactions can't be recreated directly via QBFC (they're
+    templates bound to existing transactions). We log them so the user can
+    re-memorize manually in QB 2021 by opening the matching txn and choosing
+    Edit -> Memorize <Type>.
+    """
+    if not memorized:
+        return 0
+    _emit(f"  Memorized transactions: {len(memorized)} captured in snapshot; "
+          "QBFC SDK cannot recreate these. Re-memorize manually after import:", log_fn)
+    for m in memorized[:25]:
+        nm = m.get("name") or "(unnamed)"
+        ty = m.get("txn_type") or "?"
+        fq = m.get("how_often") or "?"
+        _emit(f"    - {nm}  [{ty}, every {fq}]", log_fn)
+    if len(memorized) > 25:
+        _emit(f"    ... and {len(memorized) - 25} more (see snapshot JSON)", log_fn)
+    return 0
+
+
+def import_preferences(session: Any, prefs: Dict[str, Any], log_fn: Optional[LogFn] = None) -> int:
+    """Restore Reminders preferences via AppendPreferencesModRq."""
+    rem = (prefs or {}).get("reminders") or {}
+    if not rem:
+        return 0
+    try:
+        req = _create_request_set(session)
+        mod = req.AppendPreferencesModRq()
+        rp = getattr(mod, "RemindersPreferences", None) or getattr(mod, "Reminders", None)
+        if rp is None:
+            _emit("  Preferences: RemindersPreferences block not exposed by SDK", log_fn)
+            return 0
+        _set_if(rp, "IsShowSummary",            rem.get("show_summary"))
+        _set_if(rp, "IsShowList",               rem.get("show_list"))
+        _set_if(rp, "RemindChecksToPrint",      rem.get("remind_chk_to_print"))
+        _set_if(rp, "RemindPaychecksToPrint",   rem.get("remind_paychks_to_print"))
+        _set_if(rp, "RemindInvoicesToSend",     rem.get("remind_invoices_to_send"))
+        _set_if(rp, "RemindOverdueInvoices",    rem.get("remind_overdue_invoices"))
+        _set_if(rp, "RemindToDeposit",          rem.get("remind_to_deposit"))
+        _set_if(rp, "RemindBillsToPay",         rem.get("remind_bills_to_pay"))
+        _set_if(rp, "RemindMemorizedTxns",      rem.get("remind_memorized_txns"))
+        _set_if(rp, "RemindToDoNotes",          rem.get("remind_to_do"))
+        _set_if(rp, "RemindInventoryToReorder", rem.get("remind_inventory"))
+        _set_if(rp, "RemindOpenPurchaseOrders", rem.get("remind_purchase_orders"))
+
+        resp_set = session.session_manager.DoRequests(req)
+        resp = resp_set.ResponseList.GetAt(0)
+        if resp is None:
+            _emit("  Preferences: no response", log_fn)
+            return 0
+        if resp.StatusCode == 0:
+            _emit("  Preferences: Reminders preferences restored", log_fn)
+            return 1
+        else:
+            _emit(f"  Preferences: status={resp.StatusCode} msg={resp.StatusMessage}", log_fn)
+            return 0
+    except Exception as exc:  # noqa: BLE001
+        _emit(f"  Preferences: failed: {exc}", log_fn)
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # High-level orchestrator
 # ---------------------------------------------------------------------------
 
@@ -1330,6 +1419,14 @@ def import_company_via_qbfc(
         _emit("=== QBFC Import: Phase 7 — Company Profile ===", log_fn)
         results['company'] = import_company_info(
             session, snapshot.get('company', {}), log_fn)
+
+        _emit("=== QBFC Import: Phase 8 — Reminders, To-Dos, Preferences ===", log_fn)
+        results['to_dos'] = import_to_dos(
+            session, snapshot.get('to_dos', []), log_fn)
+        results['memorized_txns'] = import_memorized_transactions(
+            snapshot.get('memorized_txns', []), log_fn)
+        results['preferences'] = import_preferences(
+            session, snapshot.get('preferences', {}), log_fn)
 
     finally:
         session.end()
