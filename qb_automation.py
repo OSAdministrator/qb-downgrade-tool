@@ -1818,6 +1818,9 @@ class QuickBooksAutomationEngine:
                             safe_pw = safe_pw.replace(ch, '{' + ch + '}')
                         for ch in ('+', '^', '%', '(', ')', '~'):
                             safe_pw = safe_pw.replace(ch, '{' + ch + '}')
+                        # Log what we're sending
+                        mask = pw[0:3] + '*' * max(0, len(pw) - 6) + pw[-3:] if len(pw) > 6 else '***'
+                        self._emit(f"  [PW DEBUG close] raw='{mask}' escaped='{safe_pw}' len={len(pw)}", log_fn)
                         send_keys(safe_pw, pause=0.02)
                         time.sleep(0.3)
                         send_keys("{ENTER}")
@@ -1996,6 +1999,9 @@ class QuickBooksAutomationEngine:
                         safe_pw = safe_pw.replace(ch, '{' + ch + '}')
                     for ch in ('+', '^', '%', '(', ')', '~'):
                         safe_pw = safe_pw.replace(ch, '{' + ch + '}')
+                    # Log what we're actually sending (mask middle chars for security)
+                    mask = current_pw[0:3] + '*' * max(0, len(current_pw) - 6) + current_pw[-3:] if len(current_pw) > 6 else '***'
+                    self._emit(f"  [PW DEBUG] raw='{mask}' escaped='{safe_pw}' len={len(current_pw)}", log_fn)
                     send_keys(safe_pw, pause=0.02)
                     time.sleep(0.3)
                     send_keys("{ENTER}")
