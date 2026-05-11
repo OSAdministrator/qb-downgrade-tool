@@ -1756,11 +1756,25 @@ class QuickBooksAutomationEngine:
         # -----------------------------------------------------------
         # PHASE 2 — Wait for QB to exit gracefully (up to 90s)
         # QB 2021 is slow — it checks for updates during shutdown.
+        # IMPORTANT: QB may pop a password/login dialog during shutdown
+        # (e.g. for a cached company file). If we don't dismiss it,
+        # QB hangs forever and we time out + force-kill.
         # -----------------------------------------------------------
         if menu_close_done:
             self._emit("  Waiting up to 90s for QB to exit...", log_fn)
+            # Passwords to try if a login dialog appears during close
+            close_passwords = [
+                self.config.install_paths.qb_2021_template_password,
+                "3825You171",
+                "Fl0640098!@!",
+            ]
+            # De-duplicate while preserving order
+            seen = set()
+            close_passwords = [p for p in close_passwords if not (p in seen or seen.add(p))]
+            close_pw_idx = 0
             deadline = time.time() + 90
             while time.time() < deadline:
+                # Check if QB exited
                 try:
                     result = subprocess.run(
                         ["tasklist", "/FI", "IMAGENAME eq QBW32.EXE"],
@@ -1772,6 +1786,52 @@ class QuickBooksAutomationEngine:
                         return  # SUCCESS — no force kill needed
                 except Exception:  # noqa: BLE001
                     pass
+
+                # Check for password/login dialog blocking the close
+                login_dlg = self._find_active_dialog(title_re=r"(?i)(password|login)")
+                if login_dlg is not None and send_keys is not None:
+                    pw = close_passwords[close_pw_idx]
+                    self._emit(f"  Password dialog blocking close — entering password (attempt {close_pw_idx + 1})", log_fn)
+                    # Pause watchdog so it doesn't interfere
+                    if self._watchdog is not None:
+                        self._watchdog.pause()
+                    try:
+                        time.sleep(0.5)
+                        login_dlg.set_focus()
+                        time.sleep(0.3)
+                        # Click the Edit field
+                        try:
+                            edits = [c for c in login_dlg.children()
+                                     if c.friendly_class_name() == "Edit"]
+                            if edits:
+                                edits[0].click_input()
+                                time.sleep(0.2)
+                        except Exception:
+                            pass
+                        # Escape special chars for send_keys
+                        safe_pw = pw
+                        for ch in ('{', '}'):
+                            safe_pw = safe_pw.replace(ch, '{' + ch + '}')
+                        for ch in ('+', '^', '%', '(', ')', '~'):
+                            safe_pw = safe_pw.replace(ch, '{' + ch + '}')
+                        send_keys(safe_pw, pause=0.02)
+                        time.sleep(0.3)
+                        send_keys("{ENTER}")
+                        time.sleep(3)
+                        # Check for wrong-password warning
+                        warning_dlg = self._find_active_dialog(title_re=r"(?i)(warning|error|incorrect)")
+                        if warning_dlg is not None:
+                            self._emit(f"  Password {close_pw_idx + 1} incorrect during close, trying next", log_fn)
+                            self._click_first_button(warning_dlg, ["OK", "Close"])
+                            if close_pw_idx + 1 < len(close_passwords):
+                                close_pw_idx += 1
+                            time.sleep(1)
+                    except Exception as exc:
+                        self._emit(f"  WARN: password entry during close failed: {exc}", log_fn)
+                    finally:
+                        if self._watchdog is not None:
+                            self._watchdog.resume()
+
                 time.sleep(3)
             self._emit("  QB still running after 90s — will force-kill.", log_fn)
 
@@ -1920,7 +1980,14 @@ class QuickBooksAutomationEngine:
                     except Exception:  # noqa: BLE001
                         pass  # Fallback: just type and hope for the best
 
-                    send_keys(current_pw, pause=0.02)
+                    # Escape pywinauto special chars: + ^ % { } ( ) ~
+                    # so passwords with these chars are typed literally.
+                    safe_pw = current_pw
+                    for ch in ('{', '}'):  # must escape braces FIRST
+                        safe_pw = safe_pw.replace(ch, '{' + ch + '}')
+                    for ch in ('+', '^', '%', '(', ')', '~'):
+                        safe_pw = safe_pw.replace(ch, '{' + ch + '}')
+                    send_keys(safe_pw, pause=0.02)
                     time.sleep(0.3)
                     send_keys("{ENTER}")
 
