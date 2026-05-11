@@ -1016,6 +1016,144 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
 
 
 # ---------------------------------------------------------------------------
+# Opening-balance adjustments
+# ---------------------------------------------------------------------------
+
+def import_opening_balances(
+    session: Any,
+    accounts: List[Dict],
+    transactions: List[Dict],
+    log_fn: Optional[LogFn] = None,
+) -> int:
+    """Create JE(s) to adjust for opening balances that QB stores outside
+    of the visible transaction stream.
+
+    For each account, compute the net movement implied by the snapshot
+    transactions, compare to the actual balance recorded by QB 2023, and
+    post the difference against "Opening Bal Equity".
+
+    This must run AFTER import_transactions so we don't double-count.
+    The JE is dated one day before the earliest transaction.
+    """
+    import math
+    from datetime import datetime as _dt, timedelta as _td
+
+    _emit("QBFC Import: Computing opening-balance adjustments...", log_fn)
+
+    # 1. Derive per-account net movement from snapshot txns
+    derived: Dict[str, float] = {}
+    for tx in transactions:
+        for ln in tx.get("lines", []):
+            acct = (ln.get("account") or "").strip()
+            if not acct:
+                continue
+            d = float(ln.get("debit", 0) or 0)
+            c = float(ln.get("credit", 0) or 0)
+            derived[acct] = derived.get(acct, 0.0) + d - c
+
+    # 2. Find the earliest txn date, OB JE goes one day earlier
+    dates = [tx.get("date", "") for tx in transactions if tx.get("date")]
+    if dates:
+        try:
+            earliest = min(d.split(" ")[0] for d in dates if d)
+            ob_date = (_dt.strptime(earliest, "%Y-%m-%d") - _td(days=1)).strftime("%Y-%m-%d")
+        except Exception:
+            ob_date = "2000-01-01"
+    else:
+        ob_date = "2000-01-01"
+
+    # 3. Compare actual vs derived, collect gaps
+    gaps: List[tuple] = []  # (account_name, gap_amount)  positive = debit needed
+    for acct_info in accounts:
+        name = (acct_info.get("name") or "").strip()
+        if not name:
+            continue
+        actual = float(acct_info.get("balance", 0) or 0)
+        txn_derived = derived.get(name, 0.0)
+        gap = actual - txn_derived
+
+        if abs(gap) < 0.005:
+            continue  # close enough
+
+        gap = round(gap, 2)
+        gaps.append((name, gap))
+
+    if not gaps:
+        _emit("  No opening-balance adjustments needed — all accounts match.", log_fn)
+        return 0
+
+    _emit(f"  Found {len(gaps)} accounts needing opening-balance adjustment.", log_fn)
+    for name, gap in sorted(gaps, key=lambda x: -abs(x[1])):
+        _emit(f"    {name}: gap={gap:+.2f}", log_fn)
+
+    # 4. Split into batches of ~20 lines (QBFC JE line limit is ~1000, but
+    #    smaller batches are safer and easier to debug).
+    BATCH = 20
+    created = 0
+
+    for batch_start in range(0, len(gaps), BATCH):
+        batch = gaps[batch_start:batch_start + BATCH]
+        req = _create_request_set(session)
+        je = req.AppendJournalEntryAddRq()
+        _set_if(je, "TxnDate", ob_date)
+        _set_if(je, "RefNumber", "OB-ADJ")
+
+        obe_debit_total = 0.0
+        obe_credit_total = 0.0
+
+        for name, gap in batch:
+            # gap > 0 means account needs more debit (its balance is higher
+            # than what the txns produced). So debit the account, credit OBE.
+            if gap > 0:
+                ol = je.ORJournalLineList.Append()
+                ol.JournalDebitLine.AccountRef.FullName.SetValue(name)
+                ol.JournalDebitLine.Amount.SetValue(abs(gap))
+                try:
+                    ol.JournalDebitLine.Memo.SetValue("TimeWarp: Opening balance adjustment")
+                except Exception:
+                    pass
+                obe_credit_total += abs(gap)
+            else:
+                ol = je.ORJournalLineList.Append()
+                ol.JournalCreditLine.AccountRef.FullName.SetValue(name)
+                ol.JournalCreditLine.Amount.SetValue(abs(gap))
+                try:
+                    ol.JournalCreditLine.Memo.SetValue("TimeWarp: Opening balance adjustment")
+                except Exception:
+                    pass
+                obe_debit_total += abs(gap)
+
+        # Offset everything against "Opening Bal Equity"
+        net_obe = obe_credit_total - obe_debit_total
+        if abs(net_obe) >= 0.005:
+            if net_obe > 0:
+                ol = je.ORJournalLineList.Append()
+                ol.JournalCreditLine.AccountRef.FullName.SetValue("Opening Bal Equity")
+                ol.JournalCreditLine.Amount.SetValue(round(abs(net_obe), 2))
+                try:
+                    ol.JournalCreditLine.Memo.SetValue("TimeWarp: Opening balance offset")
+                except Exception:
+                    pass
+            else:
+                ol = je.ORJournalLineList.Append()
+                ol.JournalDebitLine.AccountRef.FullName.SetValue("Opening Bal Equity")
+                ol.JournalDebitLine.Amount.SetValue(round(abs(net_obe), 2))
+                try:
+                    ol.JournalDebitLine.Memo.SetValue("TimeWarp: Opening balance offset")
+                except Exception:
+                    pass
+
+        label = f"OB-ADJ batch {batch_start//BATCH + 1} ({len(batch)} accounts)"
+        if _do_add_request(session, req, label, log_fn):
+            created += len(batch)
+        else:
+            _emit(f"  ✗ Failed: {label}", log_fn)
+
+    _emit(f"QBFC Import: Opening-balance adjustments complete — {created} accounts adjusted.", log_fn)
+    return created
+
+
+# ---------------------------------------------------------------------------
 # Snapshot file I/O
 # ---------------------------------------------------------------------------
 
@@ -1101,6 +1239,14 @@ def import_company_via_qbfc(
             _emit("=== QBFC Import: Phase 5 — Transactions ===", log_fn)
             results['transactions'] = import_transactions(
                 session, snapshot.get('transactions', []), log_fn)
+
+            _emit("=== QBFC Import: Phase 6 — Opening Balance Adjustments ===", log_fn)
+            results['ob_adjustments'] = import_opening_balances(
+                session,
+                snapshot.get('accounts', []),
+                snapshot.get('transactions', []),
+                log_fn,
+            )
         else:
             _emit("QBFC Import: Skipping transactions (skip_transactions=True)", log_fn)
             results['transactions'] = 0

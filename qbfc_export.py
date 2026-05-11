@@ -992,10 +992,15 @@ def _extract_spending_lines(ret, type_name, txn, item_accts, reverse=False):
         for i in range(el.Count):
             ln = el.GetAt(i)
             acct = _safe_get(ln, "AccountRef.FullName") or ""
-            amt = abs(_safe_get_amount(ln, "Amount") or 0)
-            if acct and amt:
-                lines.append({"account": acct, "debit": amt, "credit": 0.0})
-                line_total += amt
+            amt = _safe_get_amount(ln, "Amount") or 0
+            if acct and amt != 0:
+                if amt >= 0:
+                    lines.append({"account": acct, "debit": amt, "credit": 0.0})
+                    line_total += amt
+                else:
+                    # Negative expense line (discount/refund) → credit
+                    lines.append({"account": acct, "debit": 0.0, "credit": abs(amt)})
+                    line_total -= abs(amt)
 
     # Item lines (need account lookup from items list)
     il = getattr(ret, "ItemLineRetList", None)
@@ -1003,25 +1008,35 @@ def _extract_spending_lines(ret, type_name, txn, item_accts, reverse=False):
         for i in range(il.Count):
             ln = il.GetAt(i)
             item_name = _safe_get(ln, "ItemRef.FullName") or ""
-            amt = abs(_safe_get_amount(ln, "Amount") or 0)
-            if amt:
+            amt = _safe_get_amount(ln, "Amount") or 0
+            if amt != 0:
                 acct = ""
                 if item_name and item_name in item_accts:
                     _, cogs = item_accts[item_name]
                     acct = cogs
                 if not acct:
                     acct = _safe_get(ln, "AccountRef.FullName") or ""
-                lines.append({"account": acct or "Miscellaneous", "debit": amt, "credit": 0.0})
-                line_total += amt
+                if amt >= 0:
+                    lines.append({"account": acct or "Miscellaneous", "debit": amt, "credit": 0.0})
+                    line_total += amt
+                else:
+                    lines.append({"account": acct or "Miscellaneous", "debit": 0.0, "credit": abs(amt)})
+                    line_total -= abs(amt)
 
     # No detail lines? Use total with generic account
     if not lines and total_amt:
         lines.append({"account": "Miscellaneous", "debit": total_amt, "credit": 0.0})
         line_total = total_amt
 
-    # Header account is the balancing credit
+    # Header account is the balancing credit (use abs of line_total in case
+    # discounts made it negative — that would mean more credits than debits,
+    # so the header should be a debit instead).
     if lines and header_acct:
-        lines.append({"account": header_acct, "debit": 0.0, "credit": line_total or total_amt})
+        if line_total >= 0:
+            lines.append({"account": header_acct, "debit": 0.0, "credit": line_total or total_amt})
+        else:
+            # Rare: refund-heavy transaction where credits > debits
+            lines.append({"account": header_acct, "debit": abs(line_total), "credit": 0.0})
 
     # Reverse for CC Credit / VendorCredit
     if reverse:
@@ -1085,16 +1100,21 @@ def _extract_revenue_lines(ret, type_name, txn, item_accts):
                     ln = sub_line
                     break
             item_name = _safe_get(ln, "ItemRef.FullName") or ""
-            amt = abs(_safe_get_amount(ln, "Amount") or 0)
-            if amt:
+            amt = _safe_get_amount(ln, "Amount") or 0
+            if amt != 0:
                 acct = ""
                 if item_name and item_name in item_accts:
                     income, _ = item_accts[item_name]
                     acct = income
                 if not acct:
                     acct = _safe_get(ln, "AccountRef.FullName") or ""
-                lines.append({"account": acct or "Sales", "debit": 0.0, "credit": amt})
-                line_total += amt
+                if amt >= 0:
+                    lines.append({"account": acct or "Sales", "debit": 0.0, "credit": amt})
+                    line_total += amt
+                else:
+                    # Negative revenue line (discount/return) → debit
+                    lines.append({"account": acct or "Sales", "debit": abs(amt), "credit": 0.0})
+                    line_total -= abs(amt)
         if lines:
             break
 
@@ -1103,9 +1123,13 @@ def _extract_revenue_lines(ret, type_name, txn, item_accts):
         lines.append({"account": "Sales", "debit": 0.0, "credit": total_amt})
         line_total = total_amt
 
-    # Header account
+    # Header account (debit AR/bank for normal revenue, credit if refund-heavy)
     if lines and header_acct:
-        lines.append({"account": header_acct, "debit": line_total or total_amt, "credit": 0.0})
+        bal = line_total if line_total != 0 else total_amt
+        if bal >= 0:
+            lines.append({"account": header_acct, "debit": bal, "credit": 0.0})
+        else:
+            lines.append({"account": header_acct, "debit": 0.0, "credit": abs(bal)})
 
     # CreditMemo: reverse everything
     if type_name == "CreditMemo":
@@ -1127,10 +1151,15 @@ def _extract_deposit_lines(ret, txn):
         for i in range(dl.Count):
             ln = dl.GetAt(i)
             acct = _safe_get(ln, "AccountRef.FullName") or _safe_get(ln, "EntityRef.FullName") or ""
-            amt = abs(_safe_get_amount(ln, "Amount") or 0)
-            if amt:
-                lines.append({"account": acct or "Undeposited Funds", "debit": 0.0, "credit": amt})
-                line_total += amt
+            amt = _safe_get_amount(ln, "Amount") or 0
+            if amt != 0:
+                if amt >= 0:
+                    lines.append({"account": acct or "Undeposited Funds", "debit": 0.0, "credit": amt})
+                    line_total += amt
+                else:
+                    # Negative deposit line (cashback, etc.) → debit
+                    lines.append({"account": acct or "Undeposited Funds", "debit": abs(amt), "credit": 0.0})
+                    line_total -= abs(amt)
 
     if not lines and total_amt:
         lines.append({"account": "Undeposited Funds", "debit": 0.0, "credit": total_amt})
@@ -1530,9 +1559,19 @@ def export_snapshot(
                 "item_type": inner_type,
                 "description": _safe_get(inner, "SalesDesc") or "",
                 "purchase_desc": _safe_get(inner, "PurchaseDesc") or "",
-                "income_account": _safe_get(inner, "IncomeAccountRef.FullName") or _safe_get(inner, "AccountRef.FullName") or "",
+                "income_account": (
+                    _safe_get(inner, "IncomeAccountRef.FullName")
+                    or _safe_get(inner, "SalesAndPurchase.IncomeAccountRef.FullName")
+                    or _safe_get(inner, "SalesOrPurchase.AccountRef.FullName")
+                    or _safe_get(inner, "AccountRef.FullName")
+                    or ""
+                ),
                 "asset_account": _safe_get(inner, "AssetAccountRef.FullName") or "",
-                "cogs_account": _safe_get(inner, "COGSAccountRef.FullName") or "",
+                "cogs_account": (
+                    _safe_get(inner, "COGSAccountRef.FullName")
+                    or _safe_get(inner, "SalesAndPurchase.ExpenseAccountRef.FullName")
+                    or ""
+                ),
                 "sales_price": _safe_get_amount(inner, "SalesPrice") or _safe_get_amount(inner, "SalesOrPurchase.Price"),
                 "purchase_cost": _safe_get_amount(inner, "PurchaseCost"),
                 "tax_vendor": _safe_get(inner, "TaxVendorRef.FullName") or "",
