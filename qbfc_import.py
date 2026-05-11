@@ -801,6 +801,20 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
     # ── Pre-flight: ensure all referenced accounts exist (auto-create stubs) ──
     _ensure_referenced_accounts(session, transactions, log_fn)
 
+    # ── Pre-flight: ensure "TimeWarp Migration" vendor exists for A/P lines ──
+    try:
+        req = _create_request_set(session)
+        add = req.AppendVendorAddRq()
+        add.Name.SetValue('TimeWarp Migration')
+        resp_set = session.session_manager.DoRequests(req)
+        resp = resp_set.ResponseList.GetAt(0)
+        if resp.StatusCode == 0:
+            _emit("  + Created fallback vendor 'TimeWarp Migration' for A/P lines", log_fn)
+        elif resp.StatusCode == 3100:
+            pass  # already exists
+    except Exception:
+        pass
+
     ok = 0
     skipped = 0
     failed = 0
@@ -861,6 +875,14 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
 
             try:
                 for acct, debit, credit in valid_lines:
+                    # QB requires entity on A/P and A/R lines
+                    acct_lower = acct.lower()
+                    is_ap = 'accounts payable' in acct_lower or acct_lower.startswith('a/p')
+                    is_ar = 'accounts receivable' in acct_lower or acct_lower.startswith('a/r')
+                    line_entity = entity
+                    if (is_ap or is_ar) and not line_entity:
+                        line_entity = 'TimeWarp Migration' if is_ap else 'TimeWarp Migration'
+
                     if debit > 0:
                         ol = je.ORJournalLineList.Append()
                         ol.JournalDebitLine.AccountRef.FullName.SetValue(acct)
@@ -869,9 +891,9 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                             ol.JournalDebitLine.Memo.SetValue(line_memo[:4095])
                         except Exception:
                             pass
-                        if entity:
+                        if line_entity:
                             try:
-                                ol.JournalDebitLine.EntityRef.FullName.SetValue(entity)
+                                ol.JournalDebitLine.EntityRef.FullName.SetValue(line_entity)
                             except Exception:
                                 pass
                     elif credit > 0:
@@ -882,9 +904,9 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                             ol.JournalCreditLine.Memo.SetValue(line_memo[:4095])
                         except Exception:
                             pass
-                        if entity:
+                        if line_entity:
                             try:
-                                ol.JournalCreditLine.EntityRef.FullName.SetValue(entity)
+                                ol.JournalCreditLine.EntityRef.FullName.SetValue(line_entity)
                             except Exception:
                                 pass
             except Exception as exc:
