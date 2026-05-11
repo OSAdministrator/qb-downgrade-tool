@@ -23,7 +23,7 @@ SOURCE_QBW = Path(r"C:\Users\AbacusAgent\Desktop\joshs gold coast ii 23.qbw")
 SOURCE_PASSWORD = "3825You171"
 
 TEMPLATE = Path(r"C:\QBDowngrade\QB-2021 Template\Blank Template.qbw")
-TEMPLATE_PASSWORD = "01Hello02!@!"
+TEMPLATE_PASSWORD = "3825You171"
 
 OUTPUT_DIR = Path(r"C:\QBDowngrade\Output\joshs gold coast ii 23")
 EXPORTS_DIR = OUTPUT_DIR / "exports"

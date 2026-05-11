@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime as _dt
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -66,6 +67,26 @@ def _set_if(obj: Any, attr: str, value: Optional[str]) -> None:
             field.SetValue(value)
     except Exception as exc:
         logger.debug(f"Could not set {attr}={value}: {exc}")
+
+
+def _set_date_if(obj: Any, attr: str, value: Optional[str]) -> None:
+    """Set a QBFC date field from a string like '2023-10-15' or '2023-10-15 00:00:00'.
+
+    QBFC IQBDateType.SetValue() expects a COM-compatible datetime, not a
+    string.  Passing a raw string causes locale-dependent coercion that
+    can silently shift dates.  We parse to a Python datetime first.
+    """
+    if not value:
+        return
+    try:
+        # Strip any time portion
+        date_part = value.split(' ')[0] if ' ' in value else value
+        dt = _dt.strptime(date_part, "%Y-%m-%d")
+        field = getattr(obj, attr, None)
+        if field is not None and hasattr(field, 'SetValue'):
+            field.SetValue(dt)
+    except Exception as exc:
+        logger.debug(f"Could not set date {attr}={value}: {exc}")
 
 
 def _set_amount_if(obj: Any, attr: str, value) -> None:
@@ -848,7 +869,7 @@ def _import_cc_charge(session, tx, date_str, ref_num, entity, memo, lines, log_f
         req = _create_request_set(session)
         add = req.AppendCreditCardChargeAddRq()
         add.AccountRef.FullName.SetValue(cc_acct)
-        _set_if(add, 'TxnDate', date_str)
+        _set_date_if(add, 'TxnDate', date_str)
         _set_if(add, 'RefNumber', ref_num)
         _set_if(add, 'Memo', memo[:4095] if memo else f"TimeWarp: CreditCardCharge")
         if entity:
@@ -911,7 +932,7 @@ def _import_cc_credit(session, tx, date_str, ref_num, entity, memo, lines, log_f
         req = _create_request_set(session)
         add = req.AppendCreditCardCreditAddRq()
         add.AccountRef.FullName.SetValue(cc_acct)
-        _set_if(add, 'TxnDate', date_str)
+        _set_date_if(add, 'TxnDate', date_str)
         _set_if(add, 'RefNumber', ref_num)
         _set_if(add, 'Memo', memo[:4095] if memo else f"TimeWarp: CreditCardCredit")
         if entity:
@@ -1026,7 +1047,7 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                                        return_txn_id=True)
             if result and result not in (None, -1, 0):
                 ok += 1
-                if cleared.lower() == 'cleared' and isinstance(result, str) and result not in ('OK', 'EXISTS'):
+                if isinstance(result, str) and result not in ('OK', 'EXISTS'):
                     txns_to_clear.append(result)
             elif result == 0 or result is None:
                 skipped += 1
@@ -1038,7 +1059,7 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                                        return_txn_id=True)
             if result and result not in (None, -1, 0):
                 ok += 1
-                if cleared.lower() == 'cleared' and isinstance(result, str) and result not in ('OK', 'EXISTS'):
+                if isinstance(result, str) and result not in ('OK', 'EXISTS'):
                     txns_to_clear.append(result)
             elif result == 0 or result is None:
                 skipped += 1
@@ -1083,7 +1104,7 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
             # Normalize date: strip timezone/time portion if present
             if ' ' in date_str:
                 date_str = date_str.split(' ')[0]
-            _set_if(je, 'TxnDate', date_str)
+            _set_date_if(je, 'TxnDate', date_str)
             _set_if(je, 'RefNumber', ref_num)
             # NOTE: JournalEntryAdd has no top-level Memo. Memo goes on each line.
             line_memo = memo or f"TimeWarp: {tx_type}"
@@ -1142,7 +1163,7 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                                         return_txn_id=True)
             if je_txn_id:
                 ok += 1
-                if cleared.lower() == 'cleared' and isinstance(je_txn_id, str) and je_txn_id not in ('OK', 'EXISTS'):
+                if isinstance(je_txn_id, str) and je_txn_id not in ('OK', 'EXISTS'):
                     txns_to_clear.append(je_txn_id)
             else:
                 failed += 1
@@ -1163,7 +1184,7 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
             je = req.AppendJournalEntryAddRq()
             if ' ' in date_str:
                 date_str = date_str.split(' ')[0]
-            _set_if(je, 'TxnDate', date_str)
+            _set_date_if(je, 'TxnDate', date_str)
             _set_if(je, 'RefNumber', ref_num)
             line_memo = memo or f"TimeWarp: {tx_type}"
 
@@ -1199,7 +1220,7 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                                         log_fn, return_txn_id=True)
             if je_txn_id:
                 ok += 1
-                if cleared.lower() == 'cleared' and isinstance(je_txn_id, str) and je_txn_id not in ('OK', 'EXISTS'):
+                if isinstance(je_txn_id, str) and je_txn_id not in ('OK', 'EXISTS'):
                     txns_to_clear.append(je_txn_id)
             else:
                 failed += 1
@@ -1210,9 +1231,10 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
 
     _emit(f"QBFC Import: Transactions complete — {ok} ok, {failed} failed, {skipped} skipped", log_fn)
 
-    # Post-import: set ClearedStatus for reconciled transactions
+    # Post-import: mark ALL imported transactions as reconciled (cleared)
+    # All files we process are fully reconciled — no open items.
     if txns_to_clear:
-        _emit(f"  Setting reconciled status on {len(txns_to_clear)} transactions...", log_fn)
+        _emit(f"  Marking all {len(txns_to_clear)} transactions as reconciled...", log_fn)
         cleared_ok = 0
         for txn_id in txns_to_clear:
             if _set_cleared_status(session, txn_id, "Cleared", log_fn):
@@ -1318,7 +1340,7 @@ def import_opening_balances(
         batch = gaps[batch_start:batch_start + BATCH]
         req = _create_request_set(session)
         je = req.AppendJournalEntryAddRq()
-        _set_if(je, "TxnDate", ob_date)
+        _set_date_if(je, "TxnDate", ob_date)
         _set_if(je, "RefNumber", "OB-ADJ")
 
         obe_debit_total = 0.0
@@ -1469,7 +1491,7 @@ def import_to_dos(session: Any, to_dos: List[Dict], log_fn: Optional[LogFn] = No
             req = _create_request_set(session)
             add = req.AppendToDoAddRq()
             _set_if(add, "Notes",        notes)
-            _set_if(add, "ReminderDate", t.get("reminder_date"))
+            _set_date_if(add, "ReminderDate", t.get("reminder_date"))
             _set_if(add, "Type",         t.get("type"))
             _set_if(add, "Priority",     t.get("priority"))
             if t.get("is_done"):
