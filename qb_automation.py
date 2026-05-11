@@ -2000,7 +2000,9 @@ class QuickBooksAutomationEngine:
 
     def _create_qb2021_company(self, job: CompanyJob, target_dir: Path, log_fn: Optional[LogFn]) -> Path:
         target_dir.mkdir(parents=True, exist_ok=True)
-        target_name = (job.target_company_name or job.qbw_path.stem).replace("23", "21")
+        # Replace trailing version marker (e.g., "23" -> "21") but only at word boundaries
+        raw_name = job.target_company_name or job.qbw_path.stem
+        target_name = re.sub(r"\b23\b", "21", raw_name) if "23" in raw_name else raw_name
         target_qbw = target_dir / f"{target_name}.qbw"
 
         if self.config.dry_run:
@@ -2029,10 +2031,12 @@ class QuickBooksAutomationEngine:
         time.sleep(1)
 
         # Fill core fields where controls are available.
-        for value in [target_name, "000000000", "Services", "Accrual"]:
-            self._set_edit_value(wizard, value)
+        field_values = [target_name, "000000000", "Services", "Accrual"]
+        for idx, value in enumerate(field_values):
+            self._set_edit_value(wizard, value, edit_index=idx)
             if send_keys is not None:
                 send_keys("{TAB}")
+                time.sleep(0.2)
 
         self._click_first_button(wizard, ["Next", "Continue", "Create Company", "Finish"])
 
