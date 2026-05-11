@@ -520,6 +520,12 @@ def import_items(session: Any, items: List[Dict], accounts: Optional[List[Dict]]
             add = req.AppendItemSubtotalAddRq()
         elif item_type in ('Payment',):
             add = req.AppendItemPaymentAddRq()
+        elif item_type in ('SalesTaxGroup',):
+            add = req.AppendItemSalesTaxGroupAddRq()
+        elif item_type in ('Group',):
+            add = req.AppendItemGroupAddRq()
+        elif item_type in ('FixedAsset',):
+            add = req.AppendItemFixedAssetAddRq()
         else:
             # Default to service for unknown types
             add = req.AppendItemServiceAddRq()
@@ -621,9 +627,15 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
     type (Invoice, Bill, etc.) has nuances we haven't mapped yet.
     """
     _emit(f"QBFC Import: Importing {len(transactions)} transactions...", log_fn)
+    if transactions:
+        _emit(f"  Sample tx[0] keys: {list(transactions[0].keys())}", log_fn)
+        _emit(f"  Sample tx[0]: {transactions[0]}", log_fn)
 
     ok = 0
-    skipped = 0
+    skipped_no_date = 0
+    skipped_no_account = 0
+    skipped_bad_amount = 0
+    skipped_zero = 0
     failed = 0
 
     for i, tx in enumerate(transactions):
@@ -635,18 +647,21 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
         name = tx.get('name', '')
         ref_num = tx.get('ref_number', '') or tx.get('num', '')
 
-        if not date_str or not account:
-            skipped += 1
+        if not date_str:
+            skipped_no_date += 1
+            continue
+        if not account:
+            skipped_no_account += 1
             continue
 
         try:
             amount = float(amount_str) if amount_str else 0.0
         except (ValueError, TypeError):
-            skipped += 1
+            skipped_bad_amount += 1
             continue
 
         if amount == 0.0:
-            skipped += 1
+            skipped_zero += 1
             continue
 
         # Use JournalEntry as universal import format
@@ -709,9 +724,12 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
 
         # Progress update every 500 transactions
         if (i + 1) % 500 == 0:
-            _emit(f"  Progress: {i+1}/{len(transactions)} ({ok} ok, {failed} failed, {skipped} skipped)", log_fn)
+            sk = skipped_no_date + skipped_no_account + skipped_bad_amount + skipped_zero
+            _emit(f"  Progress: {i+1}/{len(transactions)} ({ok} ok, {failed} failed, {sk} skipped)", log_fn)
 
-    _emit(f"QBFC Import: Transactions complete — {ok} ok, {failed} failed, {skipped} skipped", log_fn)
+    skipped_total = skipped_no_date + skipped_no_account + skipped_bad_amount + skipped_zero
+    _emit(f"QBFC Import: Transactions complete — {ok} ok, {failed} failed, {skipped_total} skipped", log_fn)
+    _emit(f"  Skip breakdown: no_date={skipped_no_date}, no_account={skipped_no_account}, bad_amount={skipped_bad_amount}, zero_amount={skipped_zero}", log_fn)
     return ok
 
 
