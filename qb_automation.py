@@ -713,18 +713,33 @@ class QuickBooksAutomationEngine:
 
         self._emit("  [Password] Password dialog closed. Resuming automation.", log_fn)
 
-    def _wait_for_company_ready(self, main_window, timeout_s: int, log_fn: Optional[LogFn]) -> None:
+    def _wait_for_company_ready(
+        self,
+        main_window,
+        timeout_s: int,
+        log_fn: Optional[LogFn],
+        company_hint: Optional[str] = None,
+    ) -> None:
         """Wait for the company to finish loading by checking the window title.
 
-        The company is considered loaded when the main QB window title no
-        longer contains "No Company Open".  A positive company name in the
-        title is the definitive signal.
+        If *company_hint* is given (e.g. "Blank Template"), the title must
+        contain that substring — which only appears AFTER the user has entered
+        the password and the file has fully opened.  Without a hint we fall
+        back to the old heuristic ("No Company Open" absent), which can
+        false-positive when QB shows its product name before a company is
+        actually loaded (e.g. while a password dialog is displayed).
 
         NOTE: This method does NOT dismiss dialogs during the wait loop.
         Popup/dialog dismissal should happen AFTER this method returns,
         ensuring the company is fully loaded first.
         """
-        self._emit(f"[STEP 5] Waiting for company to finish loading (timeout={timeout_s}s)...", log_fn)
+        if company_hint:
+            self._emit(
+                f"[STEP 5] Waiting for '{company_hint}' to appear in title (timeout={timeout_s}s)...",
+                log_fn,
+            )
+        else:
+            self._emit(f"[STEP 5] Waiting for company to finish loading (timeout={timeout_s}s)...", log_fn)
         self._emit("  [Load] Polling window title every 1s for company name...", log_fn)
 
         poll_count = 0
@@ -746,10 +761,16 @@ class QuickBooksAutomationEngine:
             elif poll_count % 10 == 0:
                 self._emit(f"  [Load] Poll #{poll_count}: Still waiting (title='{title}')...", log_fn)
 
-            has_company = "No Company Open" not in title
-            if has_company:
+            if company_hint:
+                # Positive match: the file name must appear in the title
+                found = company_hint.lower() in title.lower()
+            else:
+                # Negative match: "No Company Open" must be absent
+                found = "No Company Open" not in title
+
+            if found:
                 self._emit(f"  [Load] ✓ Company detected in title on poll #{poll_count}: '{title}'", log_fn)
-            return has_company
+            return found
 
         if not self._wait_until(_cond, timeout_s, 1.0):
             try:
@@ -2237,7 +2258,14 @@ class QuickBooksAutomationEngine:
                 self._emit("=" * 60, log_fn)
                 self._emit("", log_fn)
                 qb2021_main = self._find_qb_main_window(qb2021_app, "2021", self.config.timeouts.launch_qb_seconds)
-                self._wait_for_company_ready(qb2021_main, timeout_s=300, log_fn=log_fn)
+                # Use the template filename as a positive hint so the poller
+                # waits until the user enters the password and the company
+                # actually opens (title shows "Blank Template - QuickBooks …").
+                template_hint = template_path.stem  # e.g. "Blank Template"
+                self._wait_for_company_ready(
+                    qb2021_main, timeout_s=300, log_fn=log_fn,
+                    company_hint=template_hint,
+                )
                 self._dismiss_common_dialogs(log_fn)
                 self._close_popup_windows(qb2021_main, log_fn)
                 self._emit("QB 2021 template is open and ready for QBFC import.", log_fn)
