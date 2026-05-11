@@ -148,7 +148,7 @@ class FinishDialog(tk.Toplevel):
                  bg="#1e293b", fg="#fbbf24",
                  font=("Segoe UI", 9, "bold")).pack(anchor="w")
         tk.Label(pw_note,
-                 text="The converted file's admin password is:  01Hello02!@!\n"
+                 text="The converted file's admin password is:  Fl0640098!@!\n"
                       "To change it: Open in QuickBooks 2021 → Company → "
                       "Set Up Users and Passwords → Change Your Password",
                  bg="#1e293b", fg="#94a3b8",
