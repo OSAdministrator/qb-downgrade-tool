@@ -2311,8 +2311,16 @@ class QuickBooksAutomationEngine:
             export_dir   = working_root / "Export"
             output_dir   = job.output_dir   # already points to Final Output\<Company>
 
-            # Wipe stale working dirs so a previous failed run never pollutes
-            for stale_dir in (export_dir, output_dir):
+            # Wipe stale working dirs so a previous failed run never pollutes.
+            # source_dir MUST be cleaned too — a stale template .qbw from a
+            # previous failed run may still be locked by a residual QB process.
+            # Kill any QB processes first, then wipe all three directories.
+            import subprocess as _sp
+            for img in ("QBW32PremierAccountant.exe", "QBWPremierAccountant.exe",
+                        "qbw32.exe", "qbw.exe"):
+                _sp.run(["taskkill", "/F", "/IM", img], capture_output=True)
+            time.sleep(2)
+            for stale_dir in (source_dir, export_dir, output_dir):
                 if stale_dir.exists():
                     self._emit(f"Cleaning stale directory: {stale_dir}", log_fn)
                     try:
