@@ -72,6 +72,7 @@ class QuickBooksAutomationEngine:
         self.validator = ValidationReportBuilder()
         self._qb2023_app: Optional[object] = None
         self._qb2021_app: Optional[object] = None
+        self._watchdog: Optional[object] = None  # DialogWatchdog reference for pause/resume
         # Tracks whether password was already entered during QB startup dialogs.
         # Used to prevent redundant _open_company_file() call in _export_from_qb2023().
         # See bug note in _export_from_qb2023() for details.
@@ -1859,7 +1860,8 @@ class QuickBooksAutomationEngine:
             pass
         return False
 
-    def _handle_startup_dialogs(self, password: str, timeout_s: int, log_fn: Optional[LogFn]) -> None:
+    def _handle_startup_dialogs(self, password: str, timeout_s: int, log_fn: Optional[LogFn],
+                                alt_password: Optional[str] = None) -> None:
         """Handle dialogs that appear when QB starts up.
 
         =====================================================================
@@ -1872,19 +1874,33 @@ class QuickBooksAutomationEngine:
           2. Wait a moment for it to render
           3. Type the password and press Enter
         See _handle_password_prompt() docstring for full explanation.
+
+        2026-05-11: Added watchdog pause/resume around password entry to
+        prevent the watchdog from dismissing "wrong password" warnings
+        before the main thread can detect them.  Also added alt_password
+        parameter — if the primary password fails, we retry with the
+        alternate password before giving up.
         =====================================================================
         """
+        passwords_to_try = [password]
+        if alt_password and alt_password != password:
+            passwords_to_try.append(alt_password)
+        password_attempt_idx = 0
         password_entered = False
         start = time.time()
         while time.time() - start < timeout_s:
             # Check for password/login dialog first
             login_dlg = self._find_active_dialog(title_re=r"(?i)(password|login)")
             if login_dlg is not None and not password_entered:
-                self._emit("Found startup login dialog, entering password", log_fn)
+                current_pw = passwords_to_try[password_attempt_idx]
+                self._emit(f"Found startup login dialog, entering password (attempt {password_attempt_idx + 1}/{len(passwords_to_try)})", log_fn)
+
+                # PAUSE the watchdog so it doesn't dismiss "wrong password"
+                # warnings before we can detect them.
+                if self._watchdog is not None:
+                    self._watchdog.pause()
 
                 # Focus the dialog, click the password field, then type.
-                # send_keys types into the *focused* window, so we must
-                # bring the login dialog to the foreground first.
                 if send_keys is not None:
                     time.sleep(1)  # Let dialog fully render
                     try:
@@ -1904,7 +1920,7 @@ class QuickBooksAutomationEngine:
                     except Exception:  # noqa: BLE001
                         pass  # Fallback: just type and hope for the best
 
-                    send_keys(password, pause=0.02)
+                    send_keys(current_pw, pause=0.02)
                     time.sleep(0.3)
                     send_keys("{ENTER}")
 
@@ -1913,17 +1929,30 @@ class QuickBooksAutomationEngine:
                     self._emit("Password entered at startup (type + Enter)", log_fn)
                     time.sleep(5)  # Wait for QB to process login
 
-                    # Check if a "wrong password" warning appeared
+                    # Check if a "wrong password" warning appeared.
+                    # Watchdog is PAUSED so the warning is still visible.
                     warning_dlg = self._find_active_dialog(title_re=r"(?i)(warning|error|incorrect)")
                     if warning_dlg is not None:
-                        self._emit("Password may have been incorrect, dismissing warning", log_fn)
+                        self._emit(f"Password attempt {password_attempt_idx + 1} was incorrect, dismissing warning", log_fn)
                         self._click_first_button(warning_dlg, ["OK", "Close"])
-                        password_entered = False  # Allow retry
-                        self._startup_password_handled = False  # Reset — password was wrong
+                        password_entered = False
+                        self._startup_password_handled = False
                         time.sleep(1)
+                        # Move to next password if available
+                        if password_attempt_idx + 1 < len(passwords_to_try):
+                            password_attempt_idx += 1
+                            self._emit(f"Will try alternate password next...", log_fn)
+                        else:
+                            self._emit("All passwords exhausted — will keep retrying last one", log_fn)
+
+                    # RESUME the watchdog now that we've handled the password
+                    if self._watchdog is not None:
+                        self._watchdog.resume()
                     continue
                 else:
                     self._emit("WARNING: send_keys unavailable, cannot enter password", log_fn)
+                    if self._watchdog is not None:
+                        self._watchdog.resume()
 
             elif login_dlg is not None and password_entered:
                 # Password was already entered but dialog is still showing - wait
@@ -2297,9 +2326,11 @@ class QuickBooksAutomationEngine:
             from dialog_watchdog import DialogWatchdog
             watchdog = DialogWatchdog(log_fn=lambda m: self._emit(m, log_fn), hide_qb=True)
             watchdog.start()
+            self._watchdog = watchdog
         except Exception as _wd_exc:  # noqa: BLE001
             self._emit(f"[Watchdog] failed to start: {_wd_exc}", log_fn)
             watchdog = None
+            self._watchdog = None
 
         try:
             # --- Directory layout ---
@@ -2475,9 +2506,15 @@ class QuickBooksAutomationEngine:
                 # dismisses any other startup popups.
                 # -------------------------------------------------------
                 template_password = self.config.install_paths.qb_2021_template_password
+                # The template's internal company may be "Blank Template" with
+                # a different password than the Tax-Man-Mike template.  Try the
+                # configured password first, then fall back to the generic
+                # blank-template password.
+                alt_pw = "Fl0640098!@!" if template_password != "Fl0640098!@!" else "3825You171"
                 self._emit("Auto-entering template password in QB 2021...", log_fn)
                 self._handle_startup_dialogs(
                     password=template_password,
+                    alt_password=alt_pw,
                     timeout_s=120,     # generous — QB 2021 can be slow to launch
                     log_fn=log_fn,
                 )

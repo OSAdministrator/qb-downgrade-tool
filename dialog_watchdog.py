@@ -149,6 +149,7 @@ class DialogWatchdog:
         self._log_fn = log_fn or (lambda m: None)
         self._hide_qb = hide_qb
         self._stop = threading.Event()
+        self._paused = threading.Event()      # when SET → watchdog is paused
         self._thread: Optional[threading.Thread] = None
         self._dismissed_titles: set = set()  # de-dup logging
         self._unknown_titles: set = set()    # de-dup unknown-dialog logging
@@ -170,24 +171,34 @@ class DialogWatchdog:
 
     def stop(self) -> None:
         self._stop.set()
+        self._paused.clear()  # un-pause so thread can exit
         if self._thread is not None:
             self._thread.join(timeout=2)
         self._thread = None
         self._log_fn("[Watchdog] stopped")
+
+    def pause(self) -> None:
+        """Temporarily pause the watchdog so the main thread can handle dialogs."""
+        self._paused.set()
+
+    def resume(self) -> None:
+        """Resume the watchdog after a pause."""
+        self._paused.clear()
 
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
     def _run(self) -> None:
         while not self._stop.is_set():
-            try:
-                self._tick()
-            except Exception as exc:  # noqa: BLE001 - never crash on stray errors
-                # Only log once per error message to avoid spam
-                msg = f"[Watchdog] tick error: {exc}"
-                if msg not in self._dismissed_titles:
-                    self._dismissed_titles.add(msg)
-                    self._log_fn(msg)
+            if not self._paused.is_set():
+                try:
+                    self._tick()
+                except Exception as exc:  # noqa: BLE001 - never crash on stray errors
+                    # Only log once per error message to avoid spam
+                    msg = f"[Watchdog] tick error: {exc}"
+                    if msg not in self._dismissed_titles:
+                        self._dismissed_titles.add(msg)
+                        self._log_fn(msg)
             self._stop.wait(self.POLL_SEC)
 
     def _tick(self) -> None:
