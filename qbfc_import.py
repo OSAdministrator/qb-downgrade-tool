@@ -777,7 +777,7 @@ def _ensure_referenced_accounts(session: Any, transactions: List[Dict], log_fn: 
     _ACCOUNT_TYPE_CACHE.clear()
     _ACCOUNT_TYPE_CACHE.update(types)
     # Debug: show accounts detected as AP(5) or AR(1)
-    ap_ar = {k: v for k, v in _ACCOUNT_TYPE_CACHE.items() if v in (1, 5)}
+    ap_ar = {k: v for k, v in _ACCOUNT_TYPE_CACHE.items() if v in (0, 1)}
     _emit(f"  Account type cache: {len(_ACCOUNT_TYPE_CACHE)} entries, {len(ap_ar)} are AP/AR:", log_fn)
     for k, v in sorted(ap_ar.items()):
         _emit(f"    type={v} -> '{k}'", log_fn)
@@ -907,10 +907,10 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                     if acct_type is None:
                         acct_lower = acct.lower()
                         if 'accounts payable' in acct_lower or acct_lower.startswith('a/p'):
-                            acct_type = 5
+                            acct_type = 0  # QBFC enum: 0=AP
                         elif 'accounts receivable' in acct_lower or acct_lower.startswith('a/r'):
-                            acct_type = 1
-                    needs_entity = acct_type in (1, 5)
+                            acct_type = 1  # QBFC enum: 1=AR
+                    needs_entity = acct_type in (0, 1)
                     line_entity = entity
                     if needs_entity and not line_entity:
                         line_entity = 'TimeWarp Migration'
