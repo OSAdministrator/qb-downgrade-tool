@@ -131,7 +131,7 @@ class SettingsDialog(tk.Toplevel):
 class QuickBooksDowngradeGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("QuickBooks TimeWarp\u00ae by Our System Administrator")
+        self.root.title("QuickBooks TimeWarp\u00ae \u2014 Matt Mike Tax Build")
         self.root.geometry("1100x430")
 
         self.config_manager = ConfigManager()
@@ -344,7 +344,7 @@ class QuickBooksDowngradeGUI:
             file_path, status, _ = self.tree.item(row, "values")
             if not file_path:
                 continue
-            items.append((row, QueueItem(qbw_path=Path(file_path), password="")))
+            items.append((row, QueueItem(qbw_path=Path(file_path), password="3825You171")))
         return items
 
     def _start_processing(self) -> None:
