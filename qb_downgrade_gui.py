@@ -132,7 +132,7 @@ class QuickBooksDowngradeGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("QuickBooks TimeWarp\u00ae by Our System Administrator")
-        self.root.geometry("1100x650")
+        self.root.geometry("1100x430")
 
         self.config_manager = ConfigManager()
         self.config = self.config_manager.load()
@@ -181,7 +181,7 @@ class QuickBooksDowngradeGUI:
             self.drop_frame,
             text="📂  Drag .QBW files onto Launch TimeWarp  —  or click Add QBW Files above",
             bg="#2a3a4a", fg="#8ab4d8", font=("Segoe UI", 10),
-            padx=20, pady=10, cursor="hand2",
+            padx=20, pady=6, cursor="hand2",
         )
         self.drop_label.pack(fill=tk.X)
         self.drop_label.bind("<Button-1>", lambda e: self._add_files())
@@ -190,8 +190,8 @@ class QuickBooksDowngradeGUI:
         self._setup_dnd()
 
         columns = ("file", "status", "message")
-        self.tree = ttk.Treeview(self.root, columns=columns, show="headings", height=8)
-        self.tree.pack(fill=BOTH, expand=False, padx=10, pady=8)
+        self.tree = ttk.Treeview(self.root, columns=columns, show="headings", height=2)
+        self.tree.pack(fill=BOTH, expand=False, padx=10, pady=4)
 
         self.tree.heading("file", text="QBW File")
         self.tree.heading("status", text="Status")
@@ -216,9 +216,9 @@ class QuickBooksDowngradeGUI:
         self._heartbeat_after_id: str | None = None
 
         log_frame = ttk.LabelFrame(self.root, text="Status Log", padding=8)
-        log_frame.pack(fill=BOTH, expand=True, padx=10, pady=8)
+        log_frame.pack(fill=BOTH, expand=True, padx=10, pady=4)
 
-        self.log_text = tk.Text(log_frame, height=10, wrap="word")
+        self.log_text = tk.Text(log_frame, height=6, wrap="word")
         self.log_text.pack(side=LEFT, fill=BOTH, expand=True)
 
         scroll = ttk.Scrollbar(log_frame, orient=VERTICAL, command=self.log_text.yview)
