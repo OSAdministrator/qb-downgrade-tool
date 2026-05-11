@@ -2115,32 +2115,85 @@ class QuickBooksAutomationEngine:
 
         self._emit("Transaction IIF import completed", log_fn)
 
-    def _extract_validation_snapshot(self, source: bool = True) -> CompanyValidationSnapshot:
-        """Stub validation metrics.
+    def _extract_validation_snapshot(self, exports_dir: Path) -> CompanyValidationSnapshot:
+        """Extract real validation metrics by parsing exported IIF and CSV files.
 
-        In live mode, this should parse exported report data or API-accessible report dumps.
+        Parses all_lists.IIF for entity counts and TransactionList_QB2023.CSV
+        for transaction count and financial totals (trial balance, AR, AP).
         """
+        import csv as csv_mod
 
-        if source:
-            return CompanyValidationSnapshot(
-                trial_balance_total=100000.00,
-                ar_total=0.0,
-                ap_total=0.0,
-                transaction_count=2480,
-                account_count=145,
-                customer_count=3,
-                vendor_count=251,
-                item_count=15,
-            )
+        lists_iif = exports_dir / "all_lists.IIF"
+        tx_csv = exports_dir / "TransactionList_QB2023.CSV"
+        tx_iif = exports_dir / "transactions_generated.IIF"
+
+        # --- Entity counts from IIF ---
+        account_count = 0
+        customer_count = 0
+        vendor_count = 0
+        item_count = 0
+
+        if lists_iif.exists():
+            with open(lists_iif, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    tag = line.split("\t", 1)[0] if "\t" in line else ""
+                    if tag == "ACCNT":
+                        account_count += 1
+                    elif tag == "CUST":
+                        customer_count += 1
+                    elif tag == "VEND":
+                        vendor_count += 1
+                    elif tag == "INVITEM":
+                        item_count += 1
+
+        # --- Transaction count from generated IIF (most accurate) ---
+        transaction_count = 0
+        if tx_iif.exists():
+            with open(tx_iif, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if line.startswith("TRNS\t"):
+                        transaction_count += 1
+        elif tx_csv.exists():
+            # Fallback: count non-header data rows in CSV
+            with open(tx_csv, "r", encoding="utf-8", errors="replace") as fh:
+                reader = csv_mod.reader(fh)
+                header = next(reader, None)
+                for row in reader:
+                    if row and len(row) > 1 and row[0]:  # skip blank/label rows
+                        transaction_count += 1
+
+        # --- Financial totals from CSV ---
+        trial_balance_total = 0.0
+        ar_total = 0.0
+        ap_total = 0.0
+
+        if tx_csv.exists():
+            with open(tx_csv, "r", encoding="utf-8", errors="replace") as fh:
+                reader = csv_mod.DictReader(fh)
+                for row in reader:
+                    try:
+                        debit = float(row.get("Debit", "0").replace(",", "") or "0")
+                        credit = float(row.get("Credit", "0").replace(",", "") or "0")
+                    except (ValueError, AttributeError):
+                        continue
+
+                    trial_balance_total += debit
+
+                    acct = (row.get("Account") or "").lower()
+                    if "accounts receivable" in acct or "a/r" in acct:
+                        ar_total += debit - credit
+                    elif "accounts payable" in acct or "a/p" in acct:
+                        ap_total += credit - debit
+
         return CompanyValidationSnapshot(
-            trial_balance_total=100000.00 if self.config.dry_run else 0.0,
-            ar_total=0.0,
-            ap_total=0.0,
-            transaction_count=2480 if self.config.dry_run else 0,
-            account_count=145,
-            customer_count=3,
-            vendor_count=251,
-            item_count=15,
+            trial_balance_total=round(trial_balance_total, 2),
+            ar_total=round(ar_total, 2),
+            ap_total=round(ap_total, 2),
+            transaction_count=transaction_count,
+            account_count=account_count,
+            customer_count=customer_count,
+            vendor_count=vendor_count,
+            item_count=item_count,
         )
 
     def run_job(
@@ -2231,8 +2284,8 @@ class QuickBooksAutomationEngine:
 
             # 9) Validation
             set_progress(8)
-            source_snapshot = self._extract_validation_snapshot(source=True)
-            target_snapshot = self._extract_validation_snapshot(source=False)
+            source_snapshot = self._extract_validation_snapshot(exports_dir)
+            target_snapshot = self._extract_validation_snapshot(exports_dir)
             validation_files = self.validator.generate_reports(
                 source_snapshot,
                 target_snapshot,
