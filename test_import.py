@@ -26,14 +26,29 @@ def log(msg):
     print(f"[{ts}] {msg}")
 
 def kill_qb():
-    """Kill all QB-related processes."""
-    for proc in ["QBW32PremierAccountant.exe", "QBWPremierAccountant.exe",
-                 "qbupdate.exe", "qbmapi64.exe"]:
+    """Kill ALL QB-related processes including the DB manager that holds locks."""
+    procs = [
+        "QBW32PremierAccountant.exe", "QBWPremierAccountant.exe",
+        "QBW32.exe", "QBW.exe",
+        "QBDBMgrN.exe", "QBDBMgr.exe",          # ← DB manager holds .qbw lock
+        "QBCFMonitorService.exe",                # ← CF monitor holds file
+        "qbupdate.exe", "qbmapi64.exe",
+        "QBServerUtilityMgr.exe",
+        "QuickBooksMessaging.exe",
+    ]
+    for proc in procs:
         subprocess.run(["taskkill", "/f", "/im", proc], capture_output=True)
-    # Also kill CefSharp/Intuit background processes
-    for pattern in ["CefSharp*", "Intuit*"]:
+    for pattern in ["CefSharp*", "Intuit*", "QB*"]:
         subprocess.run(f'taskkill /f /im "{pattern}"', shell=True, capture_output=True)
-    time.sleep(3)
+    # Verify they're really dead
+    for _ in range(10):
+        result = subprocess.run('tasklist /fi "imagename eq QBDBMgrN.exe"',
+                                shell=True, capture_output=True, text=True)
+        if "QBDBMgrN.exe" not in result.stdout:
+            break
+        subprocess.run(["taskkill", "/f", "/im", "QBDBMgrN.exe"], capture_output=True)
+        time.sleep(1)
+    time.sleep(2)
 
 def main():
     # Verify prerequisites
@@ -130,19 +145,40 @@ def main():
         log("  WARN: file still locked after 30s, attempting rename anyway")
 
     log(f"Renaming {WORKING_QBW.name} -> {FINAL_QBW.name}")
-    try:
-        WORKING_QBW.rename(FINAL_QBW)
+    import os
+    renamed = False
+    for attempt in range(5):
+        try:
+            os.replace(str(WORKING_QBW), str(FINAL_QBW))
+            renamed = True
+            break
+        except (PermissionError, OSError) as exc:
+            log(f"  rename attempt {attempt+1}/5 failed: {exc}; killing QB again...")
+            kill_qb()
+            time.sleep(2)
+    if not renamed:
+        # Last resort: copy + try delete
+        try:
+            shutil.copy2(str(WORKING_QBW), str(FINAL_QBW))
+            try:
+                WORKING_QBW.unlink()
+            except Exception:
+                pass
+            renamed = True
+            log("  fallback copy succeeded.")
+        except Exception as exc:
+            log(f"WARN: Rename failed: {exc} — file is still 'Blank Template.qbw'")
+
+    if renamed:
         for ext in (".qbw.ND", ".qbw.DSN", ".qbw.tlg"):
             src = TARGET_DIR / f"Blank Template{ext}"
             dst = TARGET_DIR / f"joshs gold coast ii 21{ext}"
             if src.exists():
                 try:
-                    src.rename(dst)
+                    os.replace(str(src), str(dst))
                 except Exception:
                     pass
         log("Rename complete.")
-    except Exception as exc:
-        log(f"WARN: Rename failed: {exc} — file is still 'Blank Template.qbw'")
 
     log("Done!")
 
