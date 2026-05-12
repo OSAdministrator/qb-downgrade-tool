@@ -2701,7 +2701,6 @@ class QuickBooksAutomationEngine:
                         "Place a blank QB 2021 .qbw file there first."
                     )
                 # Remove stale destination first (previous failed run may leave a locked copy)
-                # Remove stale destination first (previous failed run may leave a locked copy)
                 if working_qbw.exists():
                     deleted = False
                     for attempt in range(3):
@@ -2732,15 +2731,20 @@ class QuickBooksAutomationEngine:
                                 "Close all QuickBooks instances and try again."
                             ) from e2
 
-                # Also copy companion files (.tlg, .nd, .DSN) if they exist
-                for ext_suffix in (".qbw.ND", ".qbw.DSN", ".tlg"):
-                    src = template_path.parent / f"{template_path.stem}{ext_suffix}"
-                    if src.exists():
-                        dst = source_dir / f"{working_qbw.stem}{ext_suffix}"
+                shutil.copy2(template_path, working_qbw)
+                self._emit(f"Copied QB 2021 template to {working_qbw} (keeping name for QBFC auth)", log_fn)
+
+                # Delete any stale companion files (.ND, .DSN, .TLG) in
+                # the working directory. These may be left over from a
+                # previous run and contain wrong path references that cause
+                # error 80070057 ("The parameter is incorrect").
+                for ext_s in (".qbw.ND", ".qbw.DSN", ".tlg", ".TLG"):
+                    stale_f = source_dir / f"{working_qbw.stem}{ext_s}"
+                    if stale_f.exists():
                         try:
-                            shutil.copy2(src, dst)
+                            stale_f.unlink()
                         except Exception:
-                            pass  # QB will recreate these
+                            pass
             else:
                 working_qbw = final_target_qbw
                 working_qbw.parent.mkdir(parents=True, exist_ok=True)
