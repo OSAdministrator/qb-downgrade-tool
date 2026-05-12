@@ -101,6 +101,35 @@ def _set_amount_if(obj: Any, attr: str, value) -> None:
         logger.debug(f"Could not set amount {attr}={value}: {exc}")
 
 
+def _safe_get(obj: Any, attr: str) -> Optional[str]:
+    """Safely read a QBFC field value, returning None if missing/empty."""
+    try:
+        field = getattr(obj, attr, None)
+        if field is None:
+            return None
+        val = field.GetValue() if hasattr(field, 'GetValue') else None
+        return str(val) if val is not None else None
+    except Exception:
+        return None
+
+
+def _set_bool_if(obj: Any, attr: str, value) -> None:
+    """Set a QBFC boolean field from a string like 'True'/'False' or a bool."""
+    if value is None or value == '':
+        return
+    try:
+        field = getattr(obj, attr, None)
+        if field is not None and hasattr(field, 'SetValue'):
+            # Convert string "True"/"False" to actual bool
+            if isinstance(value, str):
+                bool_val = value.lower() in ('true', '1', 'yes')
+            else:
+                bool_val = bool(value)
+            field.SetValue(bool_val)
+    except Exception as exc:
+        logger.debug(f"Could not set bool {attr}={value}: {exc}")
+
+
 def _set_ref_if(obj: Any, ref_attr: str, value: Optional[str]) -> None:
     """Set a QBFC Ref.FullName if value is not None/empty."""
     if not value:
@@ -1430,50 +1459,81 @@ def _apply_address_block(addr_obj: Any, src: Dict[str, str]) -> None:
 
 
 def import_company_info(session: Any, info: Dict[str, Any], log_fn: Optional[LogFn] = None) -> int:
-    """Restore company profile via AppendCompanyActivityModRq.
+    """Restore company profile fields.
 
-    Writes back every field captured by _extract_company_info on the export side.
-    Empty fields are skipped (so we never clobber a value with an empty string).
-    Returns 1 on success, 0 on no-op/failure.
+    Tries multiple QBFC method names because the Mod request varies across
+    SDK versions and QB years.  Empty fields are skipped so we never clobber
+    a value with an empty string.  Returns 1 on success, 0 on failure.
     """
     if not info:
         _emit("  Company: no company info in snapshot, skipping", log_fn)
         return 0
+
+    # Try each known Mod appender name until one works
+    mod_method_names = [
+        "AppendCompanyModRq",
+        "AppendCompanyActivityModRq",
+    ]
+
+    def _try_company_mod(method_name: str) -> int:
+        try:
+            req = _create_request_set(session)
+            appender = getattr(req, method_name, None)
+            if appender is None:
+                _emit(f"  Company: {method_name} not available on this SDK", log_fn)
+                return -1  # method not found, try next
+            mod = appender()
+
+            _set_if(mod, "CompanyName",                info.get("company_name"))
+            _set_if(mod, "LegalCompanyName",           info.get("legal_name"))
+            _apply_address_block(getattr(mod, "Address", None),       info.get("address") or {})
+            _apply_address_block(getattr(mod, "LegalAddress", None),  info.get("legal_address") or {})
+            _set_if(mod, "Phone",                      info.get("phone"))
+            _set_if(mod, "Fax",                        info.get("fax"))
+            _set_if(mod, "Email",                      info.get("email"))
+            _set_if(mod, "CompanyWebSite",             info.get("website"))
+            _set_if(mod, "EIN",                        info.get("ein"))
+            _set_if(mod, "SSN",                        info.get("ssn"))
+            _set_if(mod, "TaxForm",                    info.get("tax_form"))
+            _set_if(mod, "FirstMonthInFiscalYear",     info.get("first_month_fiscal_year"))
+            _set_if(mod, "FirstMonthInIncomeTaxYear",  info.get("first_month_income_tax_year"))
+            _set_if(mod, "CompanyType",                info.get("company_type"))
+
+            resp_set = session.session_manager.DoRequests(req)
+            resp = resp_set.ResponseList.GetAt(0)
+            if resp is None:
+                _emit(f"  Company: {method_name} — no response", log_fn)
+                return 0
+            if resp.StatusCode == 0:
+                cn = info.get("company_name") or "(no name)"
+                ln = info.get("legal_name") or "(no legal name)"
+                _emit(f"  Company: restored '{cn}' / legal '{ln}' via {method_name}", log_fn)
+                return 1
+            else:
+                _emit(f"  Company: {method_name} status={resp.StatusCode} msg={resp.StatusMessage}", log_fn)
+                return 0
+        except Exception as exc:  # noqa: BLE001
+            _emit(f"  Company: {method_name} failed: {exc}", log_fn)
+            return -1  # exception = try next method
+
+    for mname in mod_method_names:
+        result = _try_company_mod(mname)
+        if result >= 0:
+            return result
+    _emit("  Company: no working Mod method found — enumerating available methods", log_fn)
+    # Last resort: enumerate all Append*Mod* methods on the request set
     try:
         req = _create_request_set(session)
-        mod = req.AppendCompanyActivityModRq()
-
-        _set_if(mod, "CompanyName",                info.get("company_name"))
-        _set_if(mod, "LegalCompanyName",           info.get("legal_name"))
-        _apply_address_block(getattr(mod, "Address", None),       info.get("address") or {})
-        _apply_address_block(getattr(mod, "LegalAddress", None),  info.get("legal_address") or {})
-        _set_if(mod, "Phone",                      info.get("phone"))
-        _set_if(mod, "Fax",                        info.get("fax"))
-        _set_if(mod, "Email",                      info.get("email"))
-        _set_if(mod, "CompanyWebSite",             info.get("website"))
-        _set_if(mod, "EIN",                        info.get("ein"))
-        _set_if(mod, "SSN",                        info.get("ssn"))
-        _set_if(mod, "TaxForm",                    info.get("tax_form"))
-        _set_if(mod, "FirstMonthInFiscalYear",     info.get("first_month_fiscal_year"))
-        _set_if(mod, "FirstMonthInIncomeTaxYear",  info.get("first_month_income_tax_year"))
-        _set_if(mod, "CompanyType",                info.get("company_type"))
-
-        resp_set = session.session_manager.DoRequests(req)
-        resp = resp_set.ResponseList.GetAt(0)
-        if resp is None:
-            _emit("  Company: no response", log_fn)
-            return 0
-        if resp.StatusCode == 0:
-            cn = info.get("company_name") or "(no name)"
-            ln = info.get("legal_name") or "(no legal name)"
-            _emit(f"  Company: restored '{cn}' / legal '{ln}'", log_fn)
-            return 1
-        else:
-            _emit(f"  Company: CompanyActivityMod status={resp.StatusCode} msg={resp.StatusMessage}", log_fn)
-            return 0
-    except Exception as exc:  # noqa: BLE001
-        _emit(f"  Company: import_company_info failed: {exc}", log_fn)
-        return 0
+        candidates = [m for m in dir(req) if 'company' in m.lower() and 'mod' in m.lower()]
+        _emit(f"  Company: candidate methods = {candidates}", log_fn)
+        for cand in candidates:
+            result = _try_company_mod(cand)
+            if result >= 0:
+                return result
+    except Exception as exc:
+        _emit(f"  Company: enumeration failed: {exc}", log_fn)
+    _emit("  Company: could not restore company info — no compatible SDK method found", log_fn)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1542,11 +1602,11 @@ def import_accounting_preferences(session: Any, prefs: Dict[str, Any], log_fn: O
             _emit("  Preferences: AccountingPreferences block not exposed by SDK", log_fn)
             return 0
 
-        _set_if(ap, "IsUsingAccountNumbers",         acct_prefs.get("is_using_account_numbers"))
-        _set_if(ap, "IsRequiringAccounts",            acct_prefs.get("is_requiring_accounts"))
-        _set_if(ap, "IsUsingClassTracking",           acct_prefs.get("is_using_class_tracking"))
-        _set_if(ap, "IsUsingAuditTrail",              acct_prefs.get("is_using_audit_trail"))
-        _set_if(ap, "IsAssigningJournalEntryNumbers", acct_prefs.get("is_assigning_journal_no"))
+        _set_bool_if(ap, "IsUsingAccountNumbers",         acct_prefs.get("is_using_account_numbers"))
+        _set_bool_if(ap, "IsRequiringAccounts",            acct_prefs.get("is_requiring_accounts"))
+        _set_bool_if(ap, "IsUsingClassTracking",           acct_prefs.get("is_using_class_tracking"))
+        _set_bool_if(ap, "IsUsingAuditTrail",              acct_prefs.get("is_using_audit_trail"))
+        _set_bool_if(ap, "IsAssigningJournalEntryNumbers", acct_prefs.get("is_assigning_journal_no"))
         # ClosingDate is read-only via PreferencesMod in most QB versions — skip
 
         resp_set = session.session_manager.DoRequests(req)
@@ -1577,17 +1637,17 @@ def import_preferences(session: Any, prefs: Dict[str, Any], log_fn: Optional[Log
         if rp is None:
             _emit("  Preferences: RemindersPreferences block not exposed by SDK", log_fn)
             return 0
-        _set_if(rp, "IsShowSummary",            rem.get("show_summary"))
-        _set_if(rp, "IsShowList",               rem.get("show_list"))
-        _set_if(rp, "RemindChecksToPrint",      rem.get("remind_chk_to_print"))
-        _set_if(rp, "RemindPaychecksToPrint",   rem.get("remind_paychks_to_print"))
-        _set_if(rp, "RemindInvoicesToSend",     rem.get("remind_invoices_to_send"))
-        _set_if(rp, "RemindOverdueInvoices",    rem.get("remind_overdue_invoices"))
-        _set_if(rp, "RemindToDeposit",          rem.get("remind_to_deposit"))
-        _set_if(rp, "RemindBillsToPay",         rem.get("remind_bills_to_pay"))
-        _set_if(rp, "RemindMemorizedTxns",      rem.get("remind_memorized_txns"))
-        _set_if(rp, "RemindToDoNotes",          rem.get("remind_to_do"))
-        _set_if(rp, "RemindInventoryToReorder", rem.get("remind_inventory"))
+        _set_bool_if(rp, "IsShowSummary",            rem.get("show_summary"))
+        _set_bool_if(rp, "IsShowList",               rem.get("show_list"))
+        _set_bool_if(rp, "RemindChecksToPrint",      rem.get("remind_chk_to_print"))
+        _set_bool_if(rp, "RemindPaychecksToPrint",   rem.get("remind_paychks_to_print"))
+        _set_bool_if(rp, "RemindInvoicesToSend",     rem.get("remind_invoices_to_send"))
+        _set_bool_if(rp, "RemindOverdueInvoices",    rem.get("remind_overdue_invoices"))
+        _set_bool_if(rp, "RemindToDeposit",          rem.get("remind_to_deposit"))
+        _set_bool_if(rp, "RemindBillsToPay",         rem.get("remind_bills_to_pay"))
+        _set_bool_if(rp, "RemindMemorizedTxns",      rem.get("remind_memorized_txns"))
+        _set_bool_if(rp, "RemindToDoNotes",          rem.get("remind_to_do"))
+        _set_bool_if(rp, "RemindInventoryToReorder", rem.get("remind_inventory"))
         _set_if(rp, "RemindOpenPurchaseOrders", rem.get("remind_purchase_orders"))
 
         resp_set = session.session_manager.DoRequests(req)
