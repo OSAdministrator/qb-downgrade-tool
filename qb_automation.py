@@ -2157,40 +2157,48 @@ class QuickBooksAutomationEngine:
                 self._emit(f"  [Startup] waiting for password dialog... {int(elapsed_now)}s elapsed", log_fn)
 
             # ---------------------------------------------------------------
-            # BLIND PASSWORD ENTRY FALLBACK (after 45s of failing to detect)
-            # QB 2021's login dialog is often invisible to ALL win32/pywinauto
-            # enumeration APIs (Desktop().windows(), FindWindow, EnumWindows).
-            # But we KNOW it appears and has focus. So after 45s of searching
-            # in vain, just type the password + Enter into whatever window
-            # has focus. We've visually confirmed the login dialog IS the
-            # foreground window at this point.
+            # BLIND PASSWORD ENTRY FALLBACK (after 90s of failing to detect)
+            # QB 2021's login dialog can take 60-80s to appear (splash screen,
+            # "Updating QuickBooks..." etc). The regular FindWindow detection
+            # should catch it given enough time. Only fall to blind entry as
+            # a last resort after 90s.
             # ---------------------------------------------------------------
-            if not password_entered and elapsed_now >= 45 and send_keys is not None:
+            if not password_entered and elapsed_now >= 90 and send_keys is not None:
                 current_pw = passwords_to_try[password_attempt_idx]
                 self._emit(f"  [BLIND ENTRY] Dialog not found after {int(elapsed_now)}s — typing password blind (attempt {password_attempt_idx + 1})", log_fn)
 
-                # Focus the QB window before typing. With the watchdog paused
-                # the main QB window should be visible. Find it via win32gui
-                # and bring it to the foreground so send_keys goes there.
+                # Focus the LOGIN DIALOG specifically, not the main QB window.
+                # The login dialog title is "QuickBooks Desktop Login".
+                # If we can't find it, fall back to any QB window.
                 try:
                     import win32gui, win32con  # type: ignore[import-untyped]
-                    qb_hwnd = None
+                    login_hwnd = None
+                    fallback_hwnd = None
                     def _enum_focus(hwnd, _):
-                        nonlocal qb_hwnd
+                        nonlocal login_hwnd, fallback_hwnd
                         t = win32gui.GetWindowText(hwnd)
-                        if t and "quickbooks" in t.lower() and "timewarp" not in t.lower():
-                            qb_hwnd = hwnd
-                            return False  # stop enumeration
+                        if not t:
+                            return True
+                        tl = t.lower()
+                        if "timewarp" in tl:
+                            return True  # skip our own GUI
+                        if "login" in tl and "quickbooks" in tl:
+                            login_hwnd = hwnd
+                            return False  # found it — stop
+                        if "quickbooks" in tl and fallback_hwnd is None:
+                            fallback_hwnd = hwnd
                         return True
                     win32gui.EnumWindows(_enum_focus, None)
-                    if qb_hwnd:
-                        self._emit(f"  [BLIND ENTRY] Focusing QB window hwnd={qb_hwnd}: '{win32gui.GetWindowText(qb_hwnd)}'", log_fn)
-                        win32gui.ShowWindow(qb_hwnd, win32con.SW_RESTORE)
+                    target_hwnd = login_hwnd or fallback_hwnd
+                    if target_hwnd:
+                        target_title = win32gui.GetWindowText(target_hwnd)
+                        self._emit(f"  [BLIND ENTRY] Focusing hwnd={target_hwnd}: '{target_title}'", log_fn)
+                        win32gui.ShowWindow(target_hwnd, win32con.SW_RESTORE)
                         time.sleep(0.3)
-                        win32gui.SetForegroundWindow(qb_hwnd)
+                        win32gui.SetForegroundWindow(target_hwnd)
                         time.sleep(0.5)
                     else:
-                        self._emit("  [BLIND ENTRY] WARNING: Could not find QB window to focus!", log_fn)
+                        self._emit("  [BLIND ENTRY] WARNING: Could not find any QB window to focus!", log_fn)
                 except Exception as focus_err:
                     self._emit(f"  [BLIND ENTRY] WARNING: Focus attempt failed: {focus_err}", log_fn)
 
@@ -2201,8 +2209,10 @@ class QuickBooksAutomationEngine:
                     safe_pw = safe_pw.replace(ch, '{' + ch + '}')
                 mask = current_pw[0:3] + '*' * max(0, len(current_pw) - 6) + current_pw[-3:] if len(current_pw) > 6 else '***'
                 self._emit(f"  [PW DEBUG] raw='{mask}' escaped='{safe_pw}' len={len(current_pw)}", log_fn)
-                # Tab to make sure focus is in the password field, then type
-                send_keys("{TAB}", pause=0.1)
+                # Clear any existing text and type password directly.
+                # Do NOT send Tab — the password field should already have
+                # focus in the login dialog. Tab would move to OK button.
+                send_keys("^a", pause=0.02)  # select all (clear stale text)
                 time.sleep(0.1)
                 send_keys(safe_pw, pause=0.02)
                 time.sleep(0.3)
@@ -2210,6 +2220,14 @@ class QuickBooksAutomationEngine:
                 password_entered = True
                 self._startup_password_handled = True
                 self._emit("  [BLIND ENTRY] Password + Enter sent", log_fn)
+                time.sleep(8)  # Wait for QB to process login
+
+                # Check for wrong-password warning
+                warning_dlg = self._find_active_dialog(title_re=r"(?i)(warning|error|incorrect)")
+                if warning_dlg is not None:
+                    self._emit(f"  [BLIND ENTRY] Wrong password detected, dismissing", log_fn)
+                    self._click_first_button(warning_dlg, ["OK", "Close"])
+                    password_entered = False
                 time.sleep(8)  # Wait for QB to process login
 
                 # Check for wrong-password warning
