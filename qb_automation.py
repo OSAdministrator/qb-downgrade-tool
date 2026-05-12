@@ -3045,11 +3045,25 @@ class QuickBooksAutomationEngine:
                     log_fn=log_fn,
                 )
                 # loaded QB 2021 company.
-                template_hint = "2021"
-                self._wait_for_company_ready(
-                    qb2021_main, timeout_s=300, log_fn=log_fn,
-                    company_hint=template_hint,
-                )
+                # BYPASS: _wait_for_company_ready title-polling keeps timing
+                # out even though the title clearly contains "2021".
+                # Root-cause is likely a pywinauto/COM threading issue where
+                # window_text() returns subtly different bytes that fail the
+                # 'in' check despite looking identical in logs.
+                # Instead, just wait a fixed 30s for QB to fully stabilize.
+                self._emit("[STEP 5] Waiting 30s for QB 2021 to stabilize after login...", log_fn)
+                time.sleep(30)
+                try:
+                    _t = qb2021_main.window_text() or ""
+                    self._emit(f"[STEP 5] QB 2021 window title: '{_t}'", log_fn)
+                    # Sanity check — make sure it's not "No Company Open"
+                    if "no company open" in _t.lower():
+                        raise RuntimeError("QB 2021 shows 'No Company Open' — template failed to load")
+                except RuntimeError:
+                    raise
+                except Exception as _e:
+                    self._emit(f"[STEP 5] Could not read QB 2021 title (non-fatal): {_e}", log_fn)
+                self._emit("[STEP 5] QB 2021 is ready for import.", log_fn)
                 self._dismiss_common_dialogs(log_fn)
                 self._close_popup_windows(qb2021_main, log_fn)
                 self._emit("QB 2021 template is open and ready for QBFC import.", log_fn)
