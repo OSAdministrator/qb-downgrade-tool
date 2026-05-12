@@ -1979,57 +1979,50 @@ class QuickBooksAutomationEngine:
         start = time.time()
         while time.time() - start < timeout_s:
             # Check for password/login dialog first.
-            # NOTE: We search BOTH desktop windows AND the QB app's windows
-            # because QB's login dialog is an owned child of the main window
-            # and may not appear in Desktop().windows() enumeration.
-            login_dlg = self._find_active_dialog(title_re=r"(?i)(password|login)")
-            if login_dlg is None:
-                # Fallback: search via win32gui which sees ALL windows
-                try:
-                    import win32gui
-                    def _find_login(hwnd, results):
-                        try:
-                            if not win32gui.IsWindowVisible(hwnd):
-                                return True
-                            title = win32gui.GetWindowText(hwnd) or ""
-                            if re.search(r"(?i)(password|login)", title):
-                                # Found it — wrap with pywinauto for interaction
-                                from pywinauto import Desktop
-                                for w in Desktop(backend="uia").windows():
-                                    try:
-                                        if w.handle == hwnd:
-                                            results.append(w)
-                                            return False  # stop enumerating
-                                    except Exception:
-                                        pass
-                                # If pywinauto can't wrap it, try via app
-                                if hasattr(self, '_qb2021_app') and self._qb2021_app:
-                                    for w in self._qb2021_app.windows():
-                                        try:
-                                            if re.search(r"(?i)(password|login)", w.window_text() or ""):
-                                                results.append(w)
-                                                return False
-                                        except Exception:
-                                            pass
-                        except Exception:
-                            pass
-                        return True
-                    results = []
-                    win32gui.EnumWindows(_find_login, results)
-                    if results:
-                        login_dlg = results[0]
-                        self._emit(f"  Found login dialog via win32gui fallback: '{login_dlg.window_text()}'", log_fn)
-                except Exception as e:
-                    self._emit(f"  win32gui fallback error: {e}", log_fn)
-            if login_dlg is not None and not password_entered:
+            # Strategy: Use win32gui.FindWindow to look for the exact QB
+            # login dialog title. This is MORE RELIABLE than
+            # Desktop().windows() or EnumWindows + pywinauto wrapping,
+            # because QB 2021's 32-bit dialogs are often invisible to
+            # pywinauto's UIA backend.
+            login_dlg = None
+            login_hwnd = None
+            try:
+                import win32gui
+                # FindWindow scans ALL top-level windows — class=None means any class
+                hwnd = win32gui.FindWindow(None, "QuickBooks Desktop Login")
+                if hwnd and win32gui.IsWindowVisible(hwnd):
+                    login_hwnd = hwnd
+                    # Try to wrap with pywinauto for .children()/.click_input()
+                    try:
+                        from pywinauto.controls.hwndwrapper import HwndWrapper
+                        login_dlg = HwndWrapper(hwnd)
+                    except Exception:
+                        pass
+                    if login_dlg is None:
+                        self._emit(f"  Found login hwnd={hwnd} but could not wrap with pywinauto", log_fn)
+            except Exception as e:
+                self._emit(f"  win32gui.FindWindow error: {e}", log_fn)
+
+            # Fallback: pywinauto desktop search
+            if login_dlg is None and login_hwnd is None:
+                login_dlg = self._find_active_dialog(title_re=r"(?i)(password|login)")
+
+            if (login_dlg is not None or login_hwnd is not None) and not password_entered:
                 current_pw = passwords_to_try[password_attempt_idx]
                 self._emit(f"Found startup login dialog, entering password (attempt {password_attempt_idx + 1}/{len(passwords_to_try)})", log_fn)
 
                 # Focus the dialog, click the password field, then type.
                 if send_keys is not None:
                     time.sleep(1)  # Let dialog fully render
+
+                    # Bring dialog to foreground — try pywinauto first,
+                    # then fall back to win32gui.
                     try:
-                        login_dlg.set_focus()
+                        if login_dlg is not None:
+                            login_dlg.set_focus()
+                        elif login_hwnd:
+                            import win32gui
+                            win32gui.SetForegroundWindow(login_hwnd)
                     except Exception:  # noqa: BLE001
                         pass
                     time.sleep(0.3)
@@ -2037,11 +2030,12 @@ class QuickBooksAutomationEngine:
                     # Try to click the password Edit field so the cursor
                     # is definitely there (QB may default focus elsewhere).
                     try:
-                        edits = [c for c in login_dlg.children()
-                                 if c.friendly_class_name() == "Edit"]
-                        if edits:
-                            edits[0].click_input()
-                            time.sleep(0.2)
+                        if login_dlg is not None:
+                            edits = [c for c in login_dlg.children()
+                                     if c.friendly_class_name() == "Edit"]
+                            if edits:
+                                edits[0].click_input()
+                                time.sleep(0.2)
                     except Exception:  # noqa: BLE001
                         pass  # Fallback: just type and hope for the best
 
@@ -2090,7 +2084,7 @@ class QuickBooksAutomationEngine:
                 else:
                     self._emit("WARNING: send_keys unavailable, cannot enter password", log_fn)
 
-            elif login_dlg is not None and password_entered:
+            elif (login_dlg is not None or login_hwnd is not None) and password_entered:
                 # Password was already entered but dialog is still showing - wait
                 time.sleep(2)
                 continue
