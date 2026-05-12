@@ -2778,6 +2778,19 @@ class QuickBooksAutomationEngine:
                 # configured password first, then fall back to the generic
                 # blank-template password.
                 alt_pw = "Fl0640098!@!" if template_password != "Fl0640098!@!" else "3825You171"
+
+                # PAUSE the watchdog BEFORE touching QB 2021.
+                # If the watchdog is running during _handle_startup_dialogs(),
+                # it hides the QB main window (SW_HIDE) as soon as it appears.
+                # Hidden windows cascade: child dialogs (like the password
+                # dialog) also become invisible, so dialog detection fails
+                # and the blind-entry keystroke goes to OUR GUI instead of QB.
+                # Keep the watchdog paused until AFTER the QBFC import
+                # completes and we close QB 2021.
+                if self._watchdog is not None:
+                    self._watchdog.pause()
+                    self._emit("[Watchdog] paused for QB 2021 phase", log_fn)
+
                 self._emit("Auto-entering template password in QB 2021...", log_fn)
                 self._handle_startup_dialogs(
                     password=template_password,
@@ -2786,15 +2799,12 @@ class QuickBooksAutomationEngine:
                     log_fn=log_fn,
                 )
 
-                # PAUSE the watchdog for the rest of the QB 2021 phase.
-                # _handle_startup_dialogs() resumed it at exit, but the
-                # watchdog immediately hides the QB main window (SW_HIDE).
-                # SW_HIDE windows are invisible even to pywinauto with
-                # visible_only=False, so _find_qb_main_window() fails.
-                # Keep the watchdog paused until AFTER the QBFC import
-                # completes and we close QB 2021.
+                # _handle_startup_dialogs() resumes the watchdog at exit.
+                # Re-pause it immediately — QB 2021 must stay visible for
+                # _find_qb_main_window and the QBFC import that follows.
                 if self._watchdog is not None:
                     self._watchdog.pause()
+                    self._emit("[Watchdog] re-paused after startup dialogs", log_fn)
 
                 qb2021_main = self._find_qb_main_window(
                     qb2021_app, "2021",
@@ -2802,9 +2812,6 @@ class QuickBooksAutomationEngine:
                     include_hidden=True,
                     log_fn=log_fn,
                 )
-                # The template's internal company name may differ from the
-                # filename (e.g. "Tax-Man-Mike-Template.qbw" opens as
-                # "Blank Template").  Use a broad hint that matches ANY
                 # loaded QB 2021 company.
                 template_hint = "QuickBooks Accountant Desktop 2021"
                 self._wait_for_company_ready(
