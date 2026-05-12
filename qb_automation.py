@@ -2098,6 +2098,50 @@ class QuickBooksAutomationEngine:
             if int(elapsed_now) % 10 == 0 and int(elapsed_now) > 0:
                 self._emit(f"  [Startup] waiting for password dialog... {int(elapsed_now)}s elapsed", log_fn)
 
+            # ---------------------------------------------------------------
+            # BLIND PASSWORD ENTRY FALLBACK (after 45s of failing to detect)
+            # QB 2021's login dialog is often invisible to ALL win32/pywinauto
+            # enumeration APIs (Desktop().windows(), FindWindow, EnumWindows).
+            # But we KNOW it appears and has focus. So after 45s of searching
+            # in vain, just type the password + Enter into whatever window
+            # has focus. We've visually confirmed the login dialog IS the
+            # foreground window at this point.
+            # ---------------------------------------------------------------
+            if not password_entered and elapsed_now >= 45 and send_keys is not None:
+                current_pw = passwords_to_try[password_attempt_idx]
+                self._emit(f"  [BLIND ENTRY] Dialog not found after {int(elapsed_now)}s — typing password blind (attempt {password_attempt_idx + 1})", log_fn)
+                safe_pw = current_pw
+                for ch in ('{', '}'):
+                    safe_pw = safe_pw.replace(ch, '{' + ch + '}')
+                for ch in ('+', '^', '%', '(', ')', '~'):
+                    safe_pw = safe_pw.replace(ch, '{' + ch + '}')
+                mask = current_pw[0:3] + '*' * max(0, len(current_pw) - 6) + current_pw[-3:] if len(current_pw) > 6 else '***'
+                self._emit(f"  [PW DEBUG] raw='{mask}' escaped='{safe_pw}' len={len(current_pw)}", log_fn)
+                # Tab to make sure focus is in the password field, then type
+                send_keys("{TAB}", pause=0.1)
+                time.sleep(0.2)
+                send_keys("^a", pause=0.02)  # select all (clear any stale text)
+                time.sleep(0.1)
+                send_keys(safe_pw, pause=0.02)
+                time.sleep(0.3)
+                send_keys("{ENTER}")
+                password_entered = True
+                self._startup_password_handled = True
+                self._emit("  [BLIND ENTRY] Password + Enter sent", log_fn)
+                time.sleep(8)  # Wait for QB to process login
+
+                # Check for wrong-password warning
+                warning_dlg = self._find_active_dialog(title_re=r"(?i)(warning|error|incorrect)")
+                if warning_dlg is not None:
+                    self._emit(f"  [BLIND ENTRY] Wrong password detected, dismissing", log_fn)
+                    self._click_first_button(warning_dlg, ["OK", "Close"])
+                    password_entered = False
+                    self._startup_password_handled = False
+                    time.sleep(1)
+                    if password_attempt_idx + 1 < len(passwords_to_try):
+                        password_attempt_idx += 1
+                continue
+
             # Check if we're past all startup dialogs
             desktop = self._get_desktop()
             blocking_dialogs = False
