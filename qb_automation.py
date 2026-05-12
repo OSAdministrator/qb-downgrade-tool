@@ -1977,13 +1977,18 @@ class QuickBooksAutomationEngine:
             close_pw_idx = 0
             deadline = time.time() + 90
             while time.time() < deadline:
-                # Check if QB exited
+                # Check if QB exited (check BOTH QB 2021 = QBW32.EXE and QB 2023 = qbw.exe)
                 try:
-                    result = subprocess.run(
-                        ["tasklist", "/FI", "IMAGENAME eq QBW32.EXE"],
-                        capture_output=True, timeout=5, text=True, check=False,
-                    )
-                    if "QBW32.EXE" not in (result.stdout or ""):
+                    still_running = False
+                    for proc_name in ("QBW32.EXE", "qbw.exe"):
+                        result = subprocess.run(
+                            ["tasklist", "/FI", f"IMAGENAME eq {proc_name}"],
+                            capture_output=True, timeout=5, text=True, check=False,
+                        )
+                        if proc_name.upper() in (result.stdout or "").upper():
+                            still_running = True
+                            break
+                    if not still_running:
                         self._emit("  QuickBooks exited cleanly!", log_fn)
                         time.sleep(3)  # let Windows release file locks
                         return  # SUCCESS — no force kill needed
@@ -3096,12 +3101,26 @@ class QuickBooksAutomationEngine:
                 try:
                     _sp.run(
                         ["powershell", "-NoProfile", "-Command",
-                         "Get-Process | Where-Object {$_.Name -like 'QBW32*' -or $_.Name -like 'qbupdate*' -or $_.Name -like 'QBDBMgr*' -or $_.Name -like 'QBCFMonitor*'} | Stop-Process -Force -ErrorAction SilentlyContinue"],
+                         "Get-Process | Where-Object {$_.Name -like 'QBW32*' -or $_.Name -like 'qbw*' -or $_.Name -like 'qbupdate*' -or $_.Name -like 'QBDBMgr*' -or $_.Name -like 'QBCFMonitor*'} | Stop-Process -Force -ErrorAction SilentlyContinue"],
                         timeout=15, capture_output=True,
                     )
                 except Exception:
                     pass
-                time.sleep(5)
+                # CRITICAL: Stop the QBDBMgrN Windows SERVICE — killing the
+                # process alone is not enough because the service auto-restarts
+                # and holds exclusive locks on .qbw files.
+                self._emit("Stopping QBDBMgrN service to release file locks...", log_fn)
+                try:
+                    _sp.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         "Stop-Service QBDBMgrN -Force -ErrorAction SilentlyContinue; "
+                         "Stop-Service QBDBMgr -Force -ErrorAction SilentlyContinue; "
+                         "Stop-Service QuickBooksDB* -Force -ErrorAction SilentlyContinue"],
+                        timeout=20, capture_output=True,
+                    )
+                except Exception:
+                    pass
+                time.sleep(8)  # extra time for service to fully release locks
 
                 self._emit(f"Renaming {working_qbw.name} -> {final_target_qbw.name}", log_fn)
                 # Retry the actual move with backoff (file lock can linger on Windows)
