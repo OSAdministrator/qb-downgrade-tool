@@ -2168,6 +2168,32 @@ class QuickBooksAutomationEngine:
             if not password_entered and elapsed_now >= 45 and send_keys is not None:
                 current_pw = passwords_to_try[password_attempt_idx]
                 self._emit(f"  [BLIND ENTRY] Dialog not found after {int(elapsed_now)}s — typing password blind (attempt {password_attempt_idx + 1})", log_fn)
+
+                # Focus the QB window before typing. With the watchdog paused
+                # the main QB window should be visible. Find it via win32gui
+                # and bring it to the foreground so send_keys goes there.
+                try:
+                    import win32gui, win32con  # type: ignore[import-untyped]
+                    qb_hwnd = None
+                    def _enum_focus(hwnd, _):
+                        nonlocal qb_hwnd
+                        t = win32gui.GetWindowText(hwnd)
+                        if t and "quickbooks" in t.lower() and "timewarp" not in t.lower():
+                            qb_hwnd = hwnd
+                            return False  # stop enumeration
+                        return True
+                    win32gui.EnumWindows(_enum_focus, None)
+                    if qb_hwnd:
+                        self._emit(f"  [BLIND ENTRY] Focusing QB window hwnd={qb_hwnd}: '{win32gui.GetWindowText(qb_hwnd)}'", log_fn)
+                        win32gui.ShowWindow(qb_hwnd, win32con.SW_RESTORE)
+                        time.sleep(0.3)
+                        win32gui.SetForegroundWindow(qb_hwnd)
+                        time.sleep(0.5)
+                    else:
+                        self._emit("  [BLIND ENTRY] WARNING: Could not find QB window to focus!", log_fn)
+                except Exception as focus_err:
+                    self._emit(f"  [BLIND ENTRY] WARNING: Focus attempt failed: {focus_err}", log_fn)
+
                 safe_pw = current_pw
                 for ch in ('{', '}'):
                     safe_pw = safe_pw.replace(ch, '{' + ch + '}')
@@ -2177,8 +2203,6 @@ class QuickBooksAutomationEngine:
                 self._emit(f"  [PW DEBUG] raw='{mask}' escaped='{safe_pw}' len={len(current_pw)}", log_fn)
                 # Tab to make sure focus is in the password field, then type
                 send_keys("{TAB}", pause=0.1)
-                time.sleep(0.2)
-                send_keys("^a", pause=0.02)  # select all (clear any stale text)
                 time.sleep(0.1)
                 send_keys(safe_pw, pause=0.02)
                 time.sleep(0.3)
