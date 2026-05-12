@@ -2796,16 +2796,19 @@ class QuickBooksAutomationEngine:
                         "QBDBMgrN.exe", "QBDBMgr.exe",
                         "QBCFMonitorService.exe"):
                 _sp.run(["taskkill", "/F", "/IM", img], capture_output=True)
-            # CRITICAL: Stop QBDBMgrN Windows SERVICE — killing the process
-            # alone is insufficient because the service auto-restarts and
-            # holds exclusive locks on .qbw files in the working directory.
+            # CRITICAL: Stop the QuickBooks Database Manager service.
+            # The actual service name is "QuickBooksDB33" (not QBDBMgrN).
+            # Use `sc stop` (doesn't require elevated PS) + taskkill as backup.
+            try:
+                _sp.run(["sc", "stop", "QuickBooksDB33"],
+                        timeout=15, capture_output=True)
+            except Exception:
+                pass
             try:
                 _sp.run(
                     ["powershell", "-NoProfile", "-Command",
-                     "Stop-Service QBDBMgrN -Force -ErrorAction SilentlyContinue; "
-                     "Stop-Service QBDBMgr -Force -ErrorAction SilentlyContinue; "
                      "Stop-Service QuickBooksDB* -Force -ErrorAction SilentlyContinue"],
-                    timeout=20, capture_output=True,
+                    timeout=15, capture_output=True,
                 )
             except Exception:
                 pass
@@ -3120,17 +3123,19 @@ class QuickBooksAutomationEngine:
                     )
                 except Exception:
                     pass
-                # CRITICAL: Stop the QBDBMgrN Windows SERVICE — killing the
-                # process alone is not enough because the service auto-restarts
-                # and holds exclusive locks on .qbw files.
-                self._emit("Stopping QBDBMgrN service to release file locks...", log_fn)
+                # CRITICAL: Stop the QuickBooks Database Manager service.
+                # The actual service name is "QuickBooksDB33" (not QBDBMgrN).
+                self._emit("Stopping QuickBooksDB33 service to release file locks...", log_fn)
+                try:
+                    _sp.run(["sc", "stop", "QuickBooksDB33"],
+                            timeout=15, capture_output=True)
+                except Exception:
+                    pass
                 try:
                     _sp.run(
                         ["powershell", "-NoProfile", "-Command",
-                         "Stop-Service QBDBMgrN -Force -ErrorAction SilentlyContinue; "
-                         "Stop-Service QBDBMgr -Force -ErrorAction SilentlyContinue; "
                          "Stop-Service QuickBooksDB* -Force -ErrorAction SilentlyContinue"],
-                        timeout=20, capture_output=True,
+                        timeout=15, capture_output=True,
                     )
                 except Exception:
                     pass
