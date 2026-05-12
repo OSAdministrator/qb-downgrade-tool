@@ -2728,10 +2728,11 @@ class QuickBooksAutomationEngine:
                     self.config.timeouts.launch_qb_seconds,
                     include_hidden=True,
                 )
-                # Use the template filename as a positive hint so the poller
-                # waits until the password is accepted and the company
-                # actually opens (title shows "Blank Template - QuickBooks …").
-                template_hint = template_path.stem  # e.g. "Blank Template"
+                # The template's internal company name may differ from the
+                # filename (e.g. "Tax-Man-Mike-Template.qbw" opens as
+                # "Blank Template").  Use a broad hint that matches ANY
+                # loaded QB 2021 company.
+                template_hint = "QuickBooks Accountant Desktop 2021"
                 self._wait_for_company_ready(
                     qb2021_main, timeout_s=300, log_fn=log_fn,
                     company_hint=template_hint,
