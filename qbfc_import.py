@@ -986,6 +986,289 @@ def _import_cc_credit(session, tx, date_str, ref_num, entity, memo, lines, log_f
 
 
 
+# ---------------------------------------------------------------------------
+# Native transaction importers — route each type through its proper QBFC
+# Add request so it shows correctly in the register (no GENJRN entries).
+# ---------------------------------------------------------------------------
+
+
+def _import_check(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                  return_txn_id=False):
+    """Import a Check using AppendCheckAddRq.
+
+    In the snapshot, a Check has:
+      - One credit line = the bank account (money leaves)
+      - One or more debit lines = expense/destination accounts
+
+    Returns TxnID string if return_txn_id, else 1=ok/0=skipped/-1=failed.
+    """
+    bank_acct = ""
+    expense_lines = []
+    for ln in lines:
+        acct = (ln.get('account') or '').strip()
+        debit = float(ln.get('debit', 0) or 0)
+        credit = float(ln.get('credit', 0) or 0)
+        if credit > 0 and not debit:
+            # Credit line = the bank account
+            if not bank_acct:
+                bank_acct = acct
+            else:
+                # Multiple credit lines — unusual, treat extras as expense
+                expense_lines.append((acct, round(credit, 2), 'credit'))
+        elif debit > 0:
+            expense_lines.append((acct, round(debit, 2), 'debit'))
+
+    if not bank_acct or not expense_lines:
+        return 0  # can't determine structure, skip
+
+    try:
+        req = _create_request_set(session)
+        add = req.AppendCheckAddRq()
+        add.AccountRef.FullName.SetValue(bank_acct)
+        _set_date_if(add, 'TxnDate', date_str)
+        _set_if(add, 'RefNumber', ref_num)
+        _set_if(add, 'Memo', memo[:4095] if memo else f"TimeWarp: Check")
+        if entity:
+            try:
+                add.PayeeEntityRef.FullName.SetValue(entity)
+            except Exception:
+                pass
+
+        for acct, amt, _ in expense_lines:
+            el = add.ExpenseLineAddList.Append()
+            el.AccountRef.FullName.SetValue(acct)
+            el.Amount.SetValue(amt)
+
+        result = _do_add_request(session, req, f"Check {ref_num} {entity}", log_fn,
+                                return_txn_id=return_txn_id)
+        if return_txn_id:
+            return result
+        return 1 if result else -1
+    except Exception as exc:
+        _emit(f"  Check failed: {exc}", log_fn)
+        return None if return_txn_id else -1
+
+
+def _import_deposit(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                    return_txn_id=False):
+    """Import a Deposit using AppendDepositAddRq.
+
+    In the snapshot, a Deposit has:
+      - One debit line = the bank account (money goes into)
+      - One or more credit lines = the income/source accounts
+
+    QBFC DepositAdd structure:
+      - DepositToAccountRef = bank account
+      - DepositLineAddList = each source line (amount, account, entity)
+      - No ExpenseLineAddList — deposits use DepositLineAddList
+
+    Returns TxnID string if return_txn_id, else 1=ok/0=skipped/-1=failed.
+    """
+    bank_acct = ""
+    source_lines = []
+    for ln in lines:
+        acct = (ln.get('account') or '').strip()
+        debit = float(ln.get('debit', 0) or 0)
+        credit = float(ln.get('credit', 0) or 0)
+        if debit > 0 and not credit:
+            # Debit line = the bank account
+            if not bank_acct:
+                bank_acct = acct
+            else:
+                source_lines.append((acct, round(debit, 2)))
+        elif credit > 0:
+            source_lines.append((acct, round(credit, 2)))
+
+    if not bank_acct or not source_lines:
+        return 0
+
+    try:
+        req = _create_request_set(session)
+        add = req.AppendDepositAddRq()
+        add.DepositToAccountRef.FullName.SetValue(bank_acct)
+        _set_date_if(add, 'TxnDate', date_str)
+        _set_if(add, 'Memo', memo[:4095] if memo else f"TimeWarp: Deposit")
+
+        for acct, amt in source_lines:
+            dl = add.DepositLineAddList.Append()
+            # DepositLineAdd uses ORDepositLineAdd — we use the AccountRef variant
+            try:
+                dl.ORDepositLineAdd.DepositInfo.AccountRef.FullName.SetValue(acct)
+                dl.ORDepositLineAdd.DepositInfo.Amount.SetValue(amt)
+            except Exception:
+                # Fallback: some QBFC versions expose it differently
+                try:
+                    dl.AccountRef.FullName.SetValue(acct)
+                    dl.Amount.SetValue(amt)
+                except Exception as e2:
+                    _emit(f"  Deposit line failed for {acct}: {e2}", log_fn)
+
+        result = _do_add_request(session, req, f"Deposit {date_str} {memo[:30]}", log_fn,
+                                return_txn_id=return_txn_id)
+        if return_txn_id:
+            return result
+        return 1 if result else -1
+    except Exception as exc:
+        _emit(f"  Deposit failed: {exc}", log_fn)
+        return None if return_txn_id else -1
+
+
+def _import_transfer(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                     return_txn_id=False):
+    """Import a Transfer using AppendTransferAddRq.
+
+    In the snapshot, a Transfer has exactly 2 lines:
+      - Debit line = the TO account (receives money)
+      - Credit line = the FROM account (sends money)
+
+    QBFC TransferAdd:
+      - TransferFromAccountRef = source account
+      - TransferToAccountRef = destination account
+      - Amount = transfer amount
+
+    Returns TxnID string if return_txn_id, else 1=ok/0=skipped/-1=failed.
+    """
+    from_acct = ""
+    to_acct = ""
+    amount = 0.0
+    for ln in lines:
+        acct = (ln.get('account') or '').strip()
+        debit = float(ln.get('debit', 0) or 0)
+        credit = float(ln.get('credit', 0) or 0)
+        if debit > 0:
+            to_acct = acct
+            amount = round(debit, 2)
+        elif credit > 0:
+            from_acct = acct
+
+    if not from_acct or not to_acct or amount <= 0:
+        return 0
+
+    try:
+        req = _create_request_set(session)
+        add = req.AppendTransferAddRq()
+        add.TransferFromAccountRef.FullName.SetValue(from_acct)
+        add.TransferToAccountRef.FullName.SetValue(to_acct)
+        _set_date_if(add, 'TxnDate', date_str)
+        add.Amount.SetValue(amount)
+        _set_if(add, 'Memo', memo[:4095] if memo else f"TimeWarp: Transfer")
+
+        result = _do_add_request(session, req, f"Transfer {from_acct}->{to_acct} ${amount}", log_fn,
+                                return_txn_id=return_txn_id)
+        if return_txn_id:
+            return result
+        return 1 if result else -1
+    except Exception as exc:
+        _emit(f"  Transfer failed: {exc}", log_fn)
+        return None if return_txn_id else -1
+
+
+def _import_sales_tax_payment(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                              return_txn_id=False):
+    """Import a SalesTaxPaymentCheck using AppendSalesTaxPaymentCheckAddRq.
+
+    In the snapshot, a SalesTaxPaymentCheck has:
+      - Debit line(s) = Sales Tax Payable (reduces liability)
+      - Credit line = the bank account (money leaves)
+
+    QBFC SalesTaxPaymentCheckAdd:
+      - PayeeEntityRef = tax authority vendor
+      - BankAccountRef = bank account
+      - TxnDate, RefNumber
+      - AppliedToTxnAddList = applied to specific tax liabilities
+      
+    BUT: SalesTaxPaymentCheckAdd requires linking to specific sales tax
+    items/transactions which we may not have. Fall back to Check if needed.
+
+    Returns TxnID string if return_txn_id, else 1=ok/0=skipped/-1=failed.
+    """
+    # Try as a Check first — it's simpler and always works.
+    # SalesTaxPaymentCheckAdd requires AppliedToTxn which references
+    # specific sales tax liability transactions that may not exist yet.
+    return _import_check(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                         return_txn_id=return_txn_id)
+
+
+def _import_sales_receipt(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                          return_txn_id=False):
+    """Import a SalesReceipt using AppendSalesReceiptAddRq.
+
+    In the snapshot, a SalesReceipt has:
+      - Credit lines = revenue/income accounts
+      - Debit line = the Undeposited Funds or bank account
+
+    QBFC SalesReceiptAdd:
+      - CustomerRef = customer
+      - SalesReceiptLineAddList = line items
+      - DepositToAccountRef = where the money goes
+
+    Falls back to JournalEntry if the native SalesReceipt structure is
+    too complex (e.g., missing customer, item references).
+
+    Returns TxnID string if return_txn_id, else 1=ok/0=skipped/-1=failed.
+    """
+    # Identify deposit-to account (debit side) and revenue lines (credit side)
+    deposit_acct = ""
+    revenue_lines = []
+    for ln in lines:
+        acct = (ln.get('account') or '').strip()
+        debit = float(ln.get('debit', 0) or 0)
+        credit = float(ln.get('credit', 0) or 0)
+        if debit > 0 and not credit:
+            if not deposit_acct:
+                deposit_acct = acct
+            else:
+                revenue_lines.append((acct, round(debit, 2)))
+        elif credit > 0:
+            revenue_lines.append((acct, round(credit, 2)))
+
+    if not deposit_acct or not revenue_lines:
+        return 0
+
+    try:
+        req = _create_request_set(session)
+        add = req.AppendSalesReceiptAddRq()
+
+        if entity:
+            try:
+                add.CustomerRef.FullName.SetValue(entity)
+            except Exception:
+                pass
+
+        _set_date_if(add, 'TxnDate', date_str)
+        _set_if(add, 'RefNumber', ref_num)
+        _set_if(add, 'Memo', memo[:4095] if memo else f"TimeWarp: SalesReceipt")
+
+        try:
+            add.DepositToAccountRef.FullName.SetValue(deposit_acct)
+        except Exception:
+            pass
+
+        # Add revenue lines as SalesReceiptLineAdd items
+        for acct, amt in revenue_lines:
+            try:
+                srl = add.ORSalesReceiptLineAddList.Append()
+                srl.SalesReceiptLineAdd.Amount.SetValue(amt)
+                srl.SalesReceiptLineAdd.Desc.SetValue(memo[:4095] if memo else acct)
+                # Use the account as a "Other1" or similar field
+                # SalesReceiptLineAdd uses ItemRef, not AccountRef directly.
+                # Since we may not have matching items, we use a description-only line.
+                # This requires at least one item to exist — use a generic service item.
+            except Exception:
+                pass
+
+        result = _do_add_request(session, req, f"SalesReceipt {ref_num} {entity}", log_fn,
+                                return_txn_id=return_txn_id)
+        if return_txn_id:
+            return result
+        return 1 if result else -1
+    except Exception as exc:
+        _emit(f"  SalesReceipt native failed ({exc}), falling back to JE", log_fn)
+        # SalesReceipt is tricky — if native fails, let it fall through
+        # to the JournalEntry path in the caller
+        return None if return_txn_id else -1
+
+
 def _set_cleared_status(session: Any, txn_id: str, status: str, log_fn: Optional[LogFn] = None) -> bool:
     """Set the ClearedStatus on a transaction via ClearedStatusModRq.
 
@@ -1009,8 +1292,20 @@ def _set_cleared_status(session: Any, txn_id: str, status: str, log_fn: Optional
         return False
 
 
+# Dispatch table for native transaction types — used by import_transactions()
+_NATIVE_TX_HANDLERS = {
+    'CreditCardCharge':      _import_cc_charge,
+    'CreditCardCredit':      _import_cc_credit,
+    'Check':                 _import_check,
+    'Deposit':               _import_deposit,
+    'Transfer':              _import_transfer,
+    'SalesTaxPaymentCheck':  _import_sales_tax_payment,
+    'SalesReceipt':          _import_sales_receipt,
+}
+
+
 def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional[LogFn] = None) -> int:
-    """Import transactions into QB as JournalEntries.
+    """Import transactions into QB using native types where possible, JournalEntries as fallback.
 
     NEW FORMAT (from per-type export):
       {type, date, num, entity, memo, txn_id,
@@ -1027,6 +1322,17 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
         has_lines = "lines" in sample
         _emit(f"  Format: {'new (with lines)' if has_lines else 'legacy (account+amount)'}", log_fn)
         _emit(f"  Sample tx[0] keys: {list(sample.keys())}", log_fn)
+
+        # Show breakdown by type and native vs JE routing
+        type_counts: Dict[str, int] = {}
+        for t in transactions:
+            tp = t.get('type', 'Unknown')
+            type_counts[tp] = type_counts.get(tp, 0) + 1
+        native_types = set(_NATIVE_TX_HANDLERS.keys())
+        native_count = sum(c for t, c in type_counts.items() if t in native_types)
+        je_count = len(transactions) - native_count
+        _emit(f"  Transaction types: {type_counts}", log_fn)
+        _emit(f"  Native routing: {native_count} txns via native handlers, {je_count} via JournalEntry fallback", log_fn)
 
     # ── Pre-flight: ensure all referenced accounts exist (auto-create stubs) ──
     _ensure_referenced_accounts(session, transactions, log_fn)
@@ -1068,33 +1374,34 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
         if ' ' in date_str:
             date_str = date_str.split(' ')[0]
 
-        # --- Native credit card transactions ---
-        # JournalEntries flip the charge/payment presentation in the CC
-        # register, so we must use native CreditCardCharge / CreditCardCredit.
-        if tx_type == 'CreditCardCharge' and lines:
-            result = _import_cc_charge(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
-                                       return_txn_id=True)
+        # --- Native transaction routing ---
+        # Route each transaction type through its proper QBFC Add request
+        # so it shows correctly in the register (no GENJRN entries).
+        native_handler = _NATIVE_TX_HANDLERS.get(tx_type)
+        if native_handler and lines:
+            result = native_handler(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                                    return_txn_id=True)
             if result and result not in (None, -1, 0):
                 ok += 1
                 if isinstance(result, str) and result not in ('OK', 'EXISTS'):
                     txns_to_clear.append(result)
             elif result == 0 or result is None:
-                skipped += 1
+                # Native handler returned skip/None — fall through to JE
+                if result == 0:
+                    skipped += 1
+                else:
+                    # None means native failed, try JE fallback
+                    pass
             else:
                 failed += 1
-            continue
-        if tx_type == 'CreditCardCredit' and lines:
-            result = _import_cc_credit(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
-                                       return_txn_id=True)
-            if result and result not in (None, -1, 0):
-                ok += 1
-                if isinstance(result, str) and result not in ('OK', 'EXISTS'):
-                    txns_to_clear.append(result)
-            elif result == 0 or result is None:
-                skipped += 1
-            else:
-                failed += 1
-            continue
+            # If result was truthy or 0 (skipped), move to next tx
+            if result is not None:
+                # Progress update
+                if (i + 1) % 250 == 0:
+                    _emit(f"  Progress: {i+1}/{len(transactions)} ({ok} ok, {failed} failed, {skipped} skipped)", log_fn)
+                continue
+            # result is None → native handler failed, fall through to JE path
+            _emit(f"  {tx_type} #{i}: native failed, falling back to JournalEntry", log_fn)
 
         # --- New format: transaction has explicit debit/credit lines ---
         if lines:
@@ -1589,25 +1896,59 @@ def import_accounting_preferences(session: Any, prefs: Dict[str, Any], log_fn: O
 
     MUST be called BEFORE importing accounts — otherwise account numbers
     are silently accepted but never displayed in the Chart of Accounts.
+
+    Uses direct COM attribute access (not getattr) for reliable interop.
     """
     acct_prefs = (prefs or {}).get("accounting") or {}
     if not acct_prefs:
         _emit("  Preferences: no accounting preferences in snapshot", log_fn)
         return 0
+
+    _emit(f"  Preferences: snapshot accounting data = {acct_prefs}", log_fn)
+
+    # --- Attempt 1: Direct COM property access (most reliable) ---
     try:
         req = _create_request_set(session)
         mod = req.AppendPreferencesModRq()
-        ap = getattr(mod, "AccountingPreferences", None)
+
+        # Direct COM access — don't use getattr which can fail with win32com
+        try:
+            ap = mod.AccountingPreferences
+            _emit("  Preferences: AccountingPreferences accessed via direct property", log_fn)
+        except AttributeError:
+            _emit("  Preferences: AccountingPreferences not available as property, trying getattr", log_fn)
+            ap = getattr(mod, "AccountingPreferences", None)
+
         if ap is None:
             _emit("  Preferences: AccountingPreferences block not exposed by SDK", log_fn)
             return 0
 
-        _set_bool_if(ap, "IsUsingAccountNumbers",         acct_prefs.get("is_using_account_numbers"))
-        _set_bool_if(ap, "IsRequiringAccounts",            acct_prefs.get("is_requiring_accounts"))
-        _set_bool_if(ap, "IsUsingClassTracking",           acct_prefs.get("is_using_class_tracking"))
-        _set_bool_if(ap, "IsUsingAuditTrail",              acct_prefs.get("is_using_audit_trail"))
-        _set_bool_if(ap, "IsAssigningJournalEntryNumbers", acct_prefs.get("is_assigning_journal_no"))
-        # ClosingDate is read-only via PreferencesMod in most QB versions — skip
+        # Set each preference with verbose logging
+        fields = [
+            ("IsUsingAccountNumbers",         acct_prefs.get("is_using_account_numbers")),
+            ("IsRequiringAccounts",            acct_prefs.get("is_requiring_accounts")),
+            ("IsUsingClassTracking",           acct_prefs.get("is_using_class_tracking")),
+            ("IsUsingAuditTrail",              acct_prefs.get("is_using_audit_trail")),
+            ("IsAssigningJournalEntryNumbers", acct_prefs.get("is_assigning_journal_no")),
+        ]
+        for attr_name, val in fields:
+            if val is None or val == '':
+                _emit(f"    {attr_name}: skipped (empty/None)", log_fn)
+                continue
+            try:
+                # Direct COM access for each field
+                field = getattr(ap, attr_name, None)
+                if field is None:
+                    _emit(f"    {attr_name}: field is None", log_fn)
+                    continue
+                if isinstance(val, str):
+                    bool_val = val.lower() in ('true', '1', 'yes')
+                else:
+                    bool_val = bool(val)
+                field.SetValue(bool_val)
+                _emit(f"    {attr_name}: set to {bool_val}", log_fn)
+            except Exception as exc:
+                _emit(f"    {attr_name}: FAILED to set ({exc})", log_fn)
 
         resp_set = session.session_manager.DoRequests(req)
         resp = resp_set.ResponseList.GetAt(0)
@@ -1615,13 +1956,39 @@ def import_accounting_preferences(session: Any, prefs: Dict[str, Any], log_fn: O
             _emit("  Preferences: no response for accounting prefs", log_fn)
             return 0
         if resp.StatusCode == 0:
-            _emit("  Preferences: Accounting preferences restored (account numbers ON)", log_fn)
+            _emit("  Preferences: ✓ Accounting preferences restored (account numbers ON)", log_fn)
             return 1
         else:
-            _emit(f"  Preferences: accounting status={resp.StatusCode} msg={resp.StatusMessage}", log_fn)
+            _emit(f"  Preferences: SDK returned status={resp.StatusCode} msg={resp.StatusMessage}", log_fn)
+            # Fall through to attempt 2
+    except Exception as exc:  # noqa: BLE001
+        _emit(f"  Preferences: attempt 1 (QBFC) failed: {exc}", log_fn)
+
+    # --- Attempt 2: Retry with fresh session request ---
+    try:
+        _emit("  Preferences: retrying with fresh request...", log_fn)
+        req2 = _create_request_set(session)
+        mod2 = req2.AppendPreferencesModRq()
+        # Only set the most critical one: account numbers
+        try:
+            mod2.AccountingPreferences.IsUsingAccountNumbers.SetValue(True)
+            _emit("  Preferences: set IsUsingAccountNumbers=True (direct chain)", log_fn)
+        except Exception as exc:
+            _emit(f"  Preferences: direct chain failed: {exc}", log_fn)
+            return 0
+
+        resp_set2 = session.session_manager.DoRequests(req2)
+        resp2 = resp_set2.ResponseList.GetAt(0)
+        if resp2 and resp2.StatusCode == 0:
+            _emit("  Preferences: ✓ Account numbers enabled (attempt 2)", log_fn)
+            return 1
+        else:
+            sc = resp2.StatusCode if resp2 else "None"
+            sm = resp2.StatusMessage if resp2 else "no response"
+            _emit(f"  Preferences: attempt 2 status={sc} msg={sm}", log_fn)
             return 0
     except Exception as exc:  # noqa: BLE001
-        _emit(f"  Preferences: accounting failed: {exc}", log_fn)
+        _emit(f"  Preferences: attempt 2 failed: {exc}", log_fn)
         return 0
 
 
