@@ -3092,10 +3092,13 @@ class QuickBooksAutomationEngine:
                 # fails. This must run BEFORE the rename so no file lock.
                 # ---------------------------------------------------------------
                 self._emit("Import done — auto-closing QB 2021 (menu-driven)...", log_fn)
-                # Resume watchdog before close so it can handle any
-                # dialogs that appear during QB's shutdown sequence.
+                # CRITICAL: Keep watchdog PAUSED so _close_qb can see and
+                # interact with the QB window.  If the watchdog is running
+                # it immediately hides the window, making Ctrl+W / Alt+F4
+                # hit nothing → force-kill → data never flushed to disk.
+                # This was the root cause of empty .qbw files in Runs 9-11.
                 if self._watchdog is not None:
-                    self._watchdog.resume()
+                    self._watchdog.pause()
                 self._close_qb(qb2021_app, log_fn)
                 qb2021_app = None
                 self._qb2021_app = None
