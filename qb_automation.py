@@ -6,6 +6,7 @@ Uses pywinauto/pyautogui when available, with a dry-run fallback for testing.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -1745,6 +1746,149 @@ class QuickBooksAutomationEngine:
         app = Application(backend="uia").start(exe_path)
         return app
 
+    def _set_company_info_via_ui(self, qb_app, info: Dict[str, Any], log_fn: Optional[LogFn] = None) -> bool:
+        """Set company profile via Company → My Company (UI automation).
+
+        QBFC has no CompanyMod method, so we navigate the QB 2021 UI:
+          1. Company menu → My Company
+          2. Tab through edit fields and type values
+          3. OK to save
+
+        Returns True on success.
+        """
+        if not info:
+            self._emit("  CompanyUI: no company info, skipping", log_fn)
+            return False
+
+        company_name = info.get("company_name", "")
+        if not company_name:
+            self._emit("  CompanyUI: no company_name in snapshot, skipping", log_fn)
+            return False
+
+        try:
+            main_win = self._find_qb_main_window(qb_app, "2021", timeout_s=15)
+            self._emit(f"  CompanyUI: Opening Company → My Company...", log_fn)
+
+            # Navigate: Company menu → My Company
+            # Alt+P is the Company menu accelerator in some QB versions,
+            # but the safe way is to try menu_select or keyboard nav.
+            try:
+                main_win.menu_select("Company->My Company")
+            except Exception:
+                self._emit("  CompanyUI: menu_select failed, trying keyboard...", log_fn)
+                if send_keys:
+                    send_keys("%p")  # Alt+P = Company menu (QB 2021)
+                    time.sleep(0.5)
+                    send_keys("m")   # 'M' = My Company
+                    time.sleep(0.5)
+
+            time.sleep(2)
+
+            # Find the Company Information dialog
+            dialog = self._find_active_dialog(
+                title_re=r"(?i)(company\s+information|my\s+company)",
+                parent_window=main_win,
+            )
+            if dialog is None:
+                # Try desktop level
+                from pywinauto import Desktop
+                for w in Desktop(backend="uia").windows():
+                    t = w.window_text() or ""
+                    if "company information" in t.lower() or "my company" in t.lower():
+                        dialog = w
+                        break
+
+            if dialog is None:
+                self._emit("  CompanyUI: Company Information dialog not found", log_fn)
+                return False
+
+            self._emit("  CompanyUI: Found Company Information dialog", log_fn)
+            dialog.set_focus()
+            time.sleep(0.5)
+
+            # The Company Information dialog has these fields (typical order):
+            #   Company Name, Legal Name, Address, City, State, Zip, Country,
+            #   Phone, Fax, Email, Website, Legal Address, Legal City, ...
+            #   EIN, SSN, Tax Form
+            # We use Tab to move between fields and Ctrl+A to select existing text.
+
+            edits = dialog.descendants(control_type="Edit")
+            self._emit(f"  CompanyUI: Found {len(edits)} edit fields", log_fn)
+
+            # Build a mapping of field values to set.
+            # We'll log what we find and set company name at minimum.
+            addr = info.get("address") or {}
+            legal_addr = info.get("legal_address") or {}
+
+            # Strategy: Set focus to the first edit (Company Name), then
+            # Tab through all fields setting values in order.
+            # The exact field order depends on QB version, so we'll set
+            # the first field (Company Name) directly, then use Tab for the rest.
+
+            field_sequence = [
+                ("Company Name", company_name),
+                ("Legal Name", info.get("legal_name", "")),
+                # Address block
+                ("Address Line 1", addr.get("addr1", "")),
+                ("Address Line 2", addr.get("addr2", "")),
+                ("Address Line 3", addr.get("addr3", "")),
+                ("City", addr.get("city", "")),
+                ("State", addr.get("state", "")),
+                ("Zip", addr.get("postalcode", "")),
+                ("Country", addr.get("country", "")),
+                # Contact
+                ("Phone", info.get("phone", "")),
+                ("Fax", info.get("fax", "")),
+                ("Email", info.get("email", "")),
+                ("Website", info.get("website", "")),
+                # Legal address
+                ("Legal Address Line 1", legal_addr.get("addr1", "")),
+                ("Legal City", legal_addr.get("city", "")),
+                ("Legal State", legal_addr.get("state", "")),
+                ("Legal Zip", legal_addr.get("postalcode", "")),
+            ]
+
+            # Set each edit field by index
+            set_count = 0
+            for idx, (label, value) in enumerate(field_sequence):
+                if idx >= len(edits):
+                    break
+                if not value:
+                    # Skip empty values but still Tab past the field
+                    continue
+                try:
+                    edit = edits[idx]
+                    edit.set_focus()
+                    time.sleep(0.1)
+                    if send_keys:
+                        send_keys("^a")  # Select all
+                        time.sleep(0.05)
+                    try:
+                        edit.set_edit_text(str(value))
+                    except Exception:
+                        if send_keys:
+                            send_keys("{DELETE}")
+                            time.sleep(0.05)
+                            edit.type_keys(str(value), with_spaces=True, pause=0.02)
+                    set_count += 1
+                    self._emit(f"    Set {label} = '{value}'", log_fn)
+                except Exception as exc:
+                    self._emit(f"    Could not set {label}: {exc}", log_fn)
+
+            # Click OK to save
+            time.sleep(0.3)
+            ok_clicked = self._click_first_button(dialog, ["OK", "Save", "Close"])
+            if not ok_clicked and send_keys:
+                send_keys("{ENTER}")
+            time.sleep(1)
+
+            self._emit(f"  CompanyUI: Set {set_count} fields for '{company_name}'", log_fn)
+            return set_count > 0
+
+        except Exception as exc:
+            self._emit(f"  CompanyUI: _set_company_info_via_ui failed: {exc}", log_fn)
+            return False
+
     def _close_qb(self, app: Optional[object], log_fn: Optional[LogFn]) -> None:
         """Close QuickBooks using menu navigation (File → Close Company, then
         File → Exit) so QB flushes all in-memory data to the .qbw file.
@@ -2888,6 +3032,22 @@ class QuickBooksAutomationEngine:
                 )
 
                 self._emit(f"QBFC import complete: {sum(import_results.values())} total records", log_fn)
+
+                # ---------------------------------------------------------------
+                # COMPANY INFO via UI automation (QBFC has no CompanyMod method)
+                # Must happen BEFORE close so QB 2021 is still open.
+                # ---------------------------------------------------------------
+                try:
+                    snapshot_data = json.loads(Path(str(snapshot_path)).read_text(encoding="utf-8"))
+                    company_info = snapshot_data.get("company", {})
+                    if company_info:
+                        self._emit("=== Setting company info via UI automation ===", log_fn)
+                        # Make sure the QB window is visible for UI automation
+                        if self._watchdog is not None:
+                            self._watchdog.pause()
+                        self._set_company_info_via_ui(qb2021_app, company_info, log_fn)
+                except Exception as exc:
+                    self._emit(f"  CompanyUI: non-fatal error: {exc}", log_fn)
 
                 # ---------------------------------------------------------------
                 # AUTOMATED CLOSE: drive QB through its own File menu so the
