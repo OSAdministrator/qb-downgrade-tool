@@ -2713,8 +2713,16 @@ class QuickBooksAutomationEngine:
                     log_fn=log_fn,
                 )
 
-                # The watchdog hides QB main windows, so use
-                # include_hidden=True to find the (hidden) main window.
+                # PAUSE the watchdog for the rest of the QB 2021 phase.
+                # _handle_startup_dialogs() resumed it at exit, but the
+                # watchdog immediately hides the QB main window (SW_HIDE).
+                # SW_HIDE windows are invisible even to pywinauto with
+                # visible_only=False, so _find_qb_main_window() fails.
+                # Keep the watchdog paused until AFTER the QBFC import
+                # completes and we close QB 2021.
+                if self._watchdog is not None:
+                    self._watchdog.pause()
+
                 qb2021_main = self._find_qb_main_window(
                     qb2021_app, "2021",
                     self.config.timeouts.launch_qb_seconds,
@@ -2761,6 +2769,10 @@ class QuickBooksAutomationEngine:
                 # fails. This must run BEFORE the rename so no file lock.
                 # ---------------------------------------------------------------
                 self._emit("Import done — auto-closing QB 2021 (menu-driven)...", log_fn)
+                # Resume watchdog before close so it can handle any
+                # dialogs that appear during QB's shutdown sequence.
+                if self._watchdog is not None:
+                    self._watchdog.resume()
                 self._close_qb(qb2021_app, log_fn)
                 qb2021_app = None
                 self._qb2021_app = None
