@@ -135,7 +135,7 @@ class QuickBooksAutomationEngine:
         self._ensure_automation_ready()
         return Desktop(backend="uia")
 
-    def _find_qb_main_window(self, app: Optional[object], version_hint: Optional[str], timeout_s: int, include_hidden: bool = False):
+    def _find_qb_main_window(self, app: Optional[object], version_hint: Optional[str], timeout_s: int, include_hidden: bool = False, log_fn: Optional[LogFn] = None):
         """Find the QB main window.
 
         When *include_hidden* is True the visibility check is skipped so
@@ -192,20 +192,78 @@ class QuickBooksAutomationEngine:
                 return None
             candidates.sort(key=lambda x: x[0], reverse=True)
             return candidates[0][1]
-
         box: Dict[str, object] = {}
+        poll_count = 0
 
         def _cond() -> bool:
+            nonlocal poll_count
+            poll_count += 1
             win = _pick_window()
             if win is not None:
                 box["window"] = win
                 return True
+            # Log a window census every 30 polls to aid debugging
+            if poll_count % 30 == 0:
+                try:
+                    import win32gui  # type: ignore[import-untyped]
+                    titles = []
+                    def _enum_cb(hwnd, _):
+                        if win32gui.IsWindowVisible(hwnd):
+                            t = win32gui.GetWindowText(hwnd)
+                            if t:
+                                titles.append(t)
+                        return True
+                    win32gui.EnumWindows(_enum_cb, None)
+                    if log_fn:
+                        log_fn(f"  [WindowCensus] Poll #{poll_count}: {len(titles)} visible windows")
+                        for t in titles:
+                            if "quickbooks" in t.lower() or "qb" in t.lower() or "intuit" in t.lower():
+                                log_fn(f"    QB-related: '{t}'")
+                except Exception:
+                    pass
             return False
 
         if not self._wait_until(_cond, timeout_s, 1.0):
+            # Last-ditch: try win32gui.FindWindow for any QB window
+            try:
+                import win32gui  # type: ignore[import-untyped]
+                all_qb = []
+                def _enum_all(hwnd, _):
+                    t = win32gui.GetWindowText(hwnd)
+                    if t and "quickbooks" in t.lower():
+                        all_qb.append((hwnd, t, win32gui.IsWindowVisible(hwnd)))
+                    return True
+                win32gui.EnumWindows(_enum_all, None)
+                if all_qb and log_fn:
+                    log_fn(f"  [win32gui] Found {len(all_qb)} QB windows after timeout:")
+                    for hwnd, t, vis in all_qb:
+                        log_fn(f"    hwnd={hwnd} vis={vis} title='{t}'")
+                    # If we found a matching window, try to wrap it
+                    for hwnd, t, vis in all_qb:
+                        if version_hint and version_hint in t:
+                            if not vis:
+                                import win32con  # type: ignore[import-untyped]
+                                win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+                            try:
+                                desktop = self._get_desktop()
+                                for w in desktop.windows(visible_only=False):
+                                    try:
+                                        if w.handle == hwnd:
+                                            box["window"] = w
+                                            if log_fn:
+                                                log_fn(f"  [win32gui] Recovered QB window via hwnd={hwnd}")
+                                            return box["window"]
+                                    except Exception:
+                                        continue
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
             hint_text = f" ({version_hint})" if version_hint else ""
             raise RuntimeError(f"Could not find QuickBooks main window{hint_text} within {timeout_s}s")
 
+        return box["window"]
         return box["window"]
 
     def _focus_window(self, window) -> None:
@@ -2742,6 +2800,7 @@ class QuickBooksAutomationEngine:
                     qb2021_app, "2021",
                     self.config.timeouts.launch_qb_seconds,
                     include_hidden=True,
+                    log_fn=log_fn,
                 )
                 # The template's internal company name may differ from the
                 # filename (e.g. "Tax-Man-Mike-Template.qbw" opens as
