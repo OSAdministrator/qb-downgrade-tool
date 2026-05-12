@@ -2792,10 +2792,24 @@ class QuickBooksAutomationEngine:
             import subprocess as _sp
             for img in ("QBW32.exe", "QBW32PremierAccountant.exe",
                         "QBWPremierAccountant.exe", "qbupdate.exe",
+                        "qbw.exe",   # QB 2023 process name
                         "QBDBMgrN.exe", "QBDBMgr.exe",
                         "QBCFMonitorService.exe"):
                 _sp.run(["taskkill", "/F", "/IM", img], capture_output=True)
-            time.sleep(3)  # Give Windows time to release file locks
+            # CRITICAL: Stop QBDBMgrN Windows SERVICE — killing the process
+            # alone is insufficient because the service auto-restarts and
+            # holds exclusive locks on .qbw files in the working directory.
+            try:
+                _sp.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Stop-Service QBDBMgrN -Force -ErrorAction SilentlyContinue; "
+                     "Stop-Service QBDBMgr -Force -ErrorAction SilentlyContinue; "
+                     "Stop-Service QuickBooksDB* -Force -ErrorAction SilentlyContinue"],
+                    timeout=20, capture_output=True,
+                )
+            except Exception:
+                pass
+            time.sleep(5)  # Give Windows time to release file locks after service stop
             # Retry rmtree with backoff — Windows file locks can linger after taskkill
             for stale_dir in (source_dir, export_dir, output_dir):
                 if stale_dir.exists():
