@@ -845,7 +845,14 @@ class QuickBooksAutomationEngine:
 
             if company_hint:
                 # Positive match: the file name must appear in the title
-                found = company_hint.lower() in title.lower()
+                # Normalize: strip non-ASCII, collapse whitespace
+                import re as _re
+                norm_title = _re.sub(r'\s+', ' ', title.strip()).lower()
+                norm_hint = company_hint.strip().lower()
+                found = norm_hint in norm_title
+                if not found and poll_count <= 3:
+                    self._emit(f"  [Load] DEBUG: norm_hint={repr(norm_hint)} norm_title={repr(norm_title)}", log_fn)
+                    self._emit(f"  [Load] DEBUG: title hex={title.encode('utf-8', errors='replace').hex()}", log_fn)
             else:
                 # Negative match: "No Company Open" must be absent
                 found = "No Company Open" not in title
@@ -3038,7 +3045,7 @@ class QuickBooksAutomationEngine:
                     log_fn=log_fn,
                 )
                 # loaded QB 2021 company.
-                template_hint = "QuickBooks Accountant Desktop 2021"
+                template_hint = "2021"
                 self._wait_for_company_ready(
                     qb2021_main, timeout_s=300, log_fn=log_fn,
                     company_hint=template_hint,
