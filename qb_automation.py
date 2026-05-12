@@ -1978,8 +1978,49 @@ class QuickBooksAutomationEngine:
 
         start = time.time()
         while time.time() - start < timeout_s:
-            # Check for password/login dialog first
+            # Check for password/login dialog first.
+            # NOTE: We search BOTH desktop windows AND the QB app's windows
+            # because QB's login dialog is an owned child of the main window
+            # and may not appear in Desktop().windows() enumeration.
             login_dlg = self._find_active_dialog(title_re=r"(?i)(password|login)")
+            if login_dlg is None:
+                # Fallback: search via win32gui which sees ALL windows
+                try:
+                    import win32gui
+                    def _find_login(hwnd, results):
+                        try:
+                            if not win32gui.IsWindowVisible(hwnd):
+                                return True
+                            title = win32gui.GetWindowText(hwnd) or ""
+                            if re.search(r"(?i)(password|login)", title):
+                                # Found it — wrap with pywinauto for interaction
+                                from pywinauto import Desktop
+                                for w in Desktop(backend="uia").windows():
+                                    try:
+                                        if w.handle == hwnd:
+                                            results.append(w)
+                                            return False  # stop enumerating
+                                    except Exception:
+                                        pass
+                                # If pywinauto can't wrap it, try via app
+                                if hasattr(self, '_qb2021_app') and self._qb2021_app:
+                                    for w in self._qb2021_app.windows():
+                                        try:
+                                            if re.search(r"(?i)(password|login)", w.window_text() or ""):
+                                                results.append(w)
+                                                return False
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            pass
+                        return True
+                    results = []
+                    win32gui.EnumWindows(_find_login, results)
+                    if results:
+                        login_dlg = results[0]
+                        self._emit(f"  Found login dialog via win32gui fallback: '{login_dlg.window_text()}'", log_fn)
+                except Exception as e:
+                    self._emit(f"  win32gui fallback error: {e}", log_fn)
             if login_dlg is not None and not password_entered:
                 current_pw = passwords_to_try[password_attempt_idx]
                 self._emit(f"Found startup login dialog, entering password (attempt {password_attempt_idx + 1}/{len(passwords_to_try)})", log_fn)
