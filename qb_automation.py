@@ -2541,10 +2541,12 @@ class QuickBooksAutomationEngine:
             # previous failed run may still be locked by a residual QB process.
             # Kill any QB processes first, wait for locks to release, then wipe.
             import subprocess as _sp
-            for img in ("QBW32PremierAccountant.exe", "QBWPremierAccountant.exe",
-                        "qbw32.exe", "qbw.exe"):
+            for img in ("QBW32.exe", "QBW32PremierAccountant.exe",
+                        "QBWPremierAccountant.exe", "qbupdate.exe",
+                        "QBDBMgrN.exe", "QBDBMgr.exe",
+                        "QBCFMonitorService.exe"):
                 _sp.run(["taskkill", "/F", "/IM", img], capture_output=True)
-
+            time.sleep(3)  # Give Windows time to release file locks
             # Retry rmtree with backoff — Windows file locks can linger after taskkill
             for stale_dir in (source_dir, export_dir, output_dir):
                 if stale_dir.exists():
@@ -2641,23 +2643,36 @@ class QuickBooksAutomationEngine:
                         "Place a blank QB 2021 .qbw file there first."
                     )
                 # Remove stale destination first (previous failed run may leave a locked copy)
+                # Remove stale destination first (previous failed run may leave a locked copy)
                 if working_qbw.exists():
-                    try:
-                        working_qbw.unlink()
-                    except PermissionError:
-                        # File is locked — kill any stale QB 2021 processes and retry
-                        self._emit("Stale template file is locked — killing residual QB processes...", log_fn)
-                        import subprocess as _sp
-                        for img in ("QBW32PremierAccountant.exe", "QBWPremierAccountant.exe",
-                                    "qbw32.exe", "qbw.exe"):
-                            _sp.run(["taskkill", "/F", "/IM", img], capture_output=True)
-                        time.sleep(3)
+                    deleted = False
+                    for attempt in range(3):
                         try:
                             working_qbw.unlink()
+                            deleted = True
+                            break
+                        except PermissionError:
+                            if attempt == 0:
+                                self._emit("Stale template file is locked — killing residual QB processes...", log_fn)
+                                import subprocess as _sp
+                                for img in ("QBW32.exe", "QBW32PremierAccountant.exe",
+                                            "QBWPremierAccountant.exe", "qbupdate.exe",
+                                            "QBDBMgrN.exe", "QBDBMgr.exe",
+                                            "QBCFMonitorService.exe"):
+                                    _sp.run(["taskkill", "/F", "/IM", img], capture_output=True)
+                            self._emit(f"  Retry {attempt+1}/3 — waiting 5s for lock release...", log_fn)
+                            time.sleep(5)
+                    if not deleted:
+                        # Last resort: rename and leave behind
+                        stale_name = working_qbw.with_suffix(".qbw.stale")
+                        try:
+                            working_qbw.rename(stale_name)
+                            self._emit(f"WARN: Could not delete stale template, renamed to {stale_name.name}", log_fn)
                         except Exception as e2:
-                            self._emit(f"WARN: Could not delete stale template: {e2}", log_fn)
-                shutil.copy2(template_path, working_qbw)
-                self._emit(f"Copied QB 2021 template to {working_qbw} (keeping name for QBFC auth)", log_fn)
+                            raise PermissionError(
+                                f"Cannot remove locked template {working_qbw}: {e2}. "
+                                "Close all QuickBooks instances and try again."
+                            ) from e2
 
                 # Also copy companion files (.tlg, .nd, .DSN) if they exist
                 for ext_suffix in (".qbw.ND", ".qbw.DSN", ".tlg"):
