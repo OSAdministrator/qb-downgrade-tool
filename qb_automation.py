@@ -1912,13 +1912,26 @@ class QuickBooksAutomationEngine:
         # -----------------------------------------------------------
         menu_close_done = False
 
-        # Try to find the QB window and use it
+        # Try to find the QB window and use it.
+        # CRITICAL: pass include_hidden=True because the watchdog may
+        # have hidden the QB window.  After finding it, restore it so
+        # keyboard shortcuts (Ctrl+W, Alt+F4) actually reach it.
         try:
-            main_window = self._find_qb_main_window(app, None, timeout_s=10)
+            main_window = self._find_qb_main_window(app, None, timeout_s=10, include_hidden=True)
             if main_window is not None:
                 try:
+                    # Un-hide the window if the watchdog hid it (SW_RESTORE)
+                    hwnd = main_window.handle
+                    if hwnd:
+                        import win32gui   # type: ignore[import-untyped]
+                        import win32con   # type: ignore[import-untyped]
+                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                        time.sleep(0.3)
+                        win32gui.SetForegroundWindow(hwnd)
+                        time.sleep(0.3)
                     main_window.set_focus()
                     time.sleep(0.5)
+                    self._emit("  QB window found and restored to foreground.", log_fn)
                 except Exception:  # noqa: BLE001
                     pass
 
