@@ -282,6 +282,25 @@ class QuickBooksAutomationEngine:
                     return True
             except Exception:  # noqa: BLE001
                 continue
+        # Fallback: try without control_type filter (some buttons are custom controls)
+        for label in labels:
+            try:
+                btn = dialog.child_window(title_re=fr"(?i){re.escape(label)}")
+                if btn.exists(timeout=0.5):
+                    try:
+                        btn.wrapper_object().click_input()
+                    except Exception:
+                        # Last resort: focus and send Enter
+                        try:
+                            btn.set_focus()
+                            time.sleep(0.1)
+                            if send_keys is not None:
+                                send_keys("{ENTER}")
+                        except Exception:
+                            continue
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
         return False
 
     def _set_edit_value(self, parent, value: str, edit_index: int = 0) -> bool:
@@ -3311,11 +3330,14 @@ class QuickBooksAutomationEngine:
                                             dismissed = True
                                             time.sleep(1)
                                         else:
-                                            # Keyboard fallback: Enter to click default button
+                                            # Keyboard fallback: Tab to "Continue" then Enter
+                                            # (Cancel is default-focused, so Tab moves to Continue)
                                             if send_keys is not None:
+                                                send_keys("{TAB}")
+                                                time.sleep(0.2)
                                                 send_keys("{ENTER}")
                                                 time.sleep(0.5)
-                                            self._emit(f"  [sweep {sweep}] Dismissed via ENTER: '{wt}'", log_fn)
+                                            self._emit(f"  [sweep {sweep}] Dismissed via TAB+ENTER: '{wt}'", log_fn)
                                             dismissed = True
                                             time.sleep(1)
                                 except Exception:
@@ -3347,6 +3369,8 @@ class QuickBooksAutomationEngine:
                                                 win.set_focus()
                                                 time.sleep(0.2)
                                                 if send_keys is not None:
+                                                    send_keys("{TAB}")
+                                                    time.sleep(0.2)
                                                     send_keys("{ENTER}")
                                                     time.sleep(0.5)
                                             except Exception:
