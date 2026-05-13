@@ -1778,12 +1778,41 @@ def import_opening_balances(
         ob_date = "2000-01-01"
 
     # 3. Compare actual vs derived, collect gaps
+    # CRITICAL: QB reports balances in "natural" sign — positive for all types.
+    # But our `derived` uses debit-positive convention (debit - credit).
+    # For credit-normal accounts (Liability, Equity, Income), the QB balance
+    # represents a CREDIT, so we must negate it before comparing to `derived`.
+    # Credit-normal QBFC account type enums:
+    CREDIT_NORMAL_TYPES = {
+        3,   # AccountsPayable
+        6,   # CreditCard
+        7,   # OtherCurrentLiability
+        8,   # LongTermLiability
+        10,  # Income
+        12,  # OtherIncome
+        14,  # Equity
+    }
+    # Build name→type map from account list (type field from snapshot = QBFC enum)
+    acct_type_map: Dict[str, int] = {}
+    for ai in accounts:
+        n = (ai.get("name") or "").strip()
+        t = ai.get("type")
+        if n and t is not None:
+            try:
+                acct_type_map[n] = int(t)
+            except (ValueError, TypeError):
+                pass
+
     gaps: List[tuple] = []  # (account_name, gap_amount)  positive = debit needed
     for acct_info in accounts:
         name = (acct_info.get("name") or "").strip()
         if not name:
             continue
         actual = float(acct_info.get("balance", 0) or 0)
+        # Convert actual to debit-positive convention
+        acct_type = acct_type_map.get(name)
+        if acct_type is not None and acct_type in CREDIT_NORMAL_TYPES:
+            actual = -actual  # Credit-normal: QB's positive balance = credit
         txn_derived = derived.get(name, 0.0)
         gap = actual - txn_derived
 
