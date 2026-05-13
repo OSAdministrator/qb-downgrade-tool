@@ -471,6 +471,11 @@ class QuickBooksAutomationEngine:
             "coach",
             "did you know",
             "quickbooks desktop",  # generic splash / promo windows
+            "usage",
+            "analytics",
+            "study",
+            "have a question",
+            "faq",
         ]
 
         closed_any = False
@@ -493,7 +498,7 @@ class QuickBooksAutomationEngine:
                 if any(hint in title_l for hint in popup_hints):
                     # Try clicking common close/dismiss buttons first
                     clicked = self._click_first_button(
-                        win, ["Close", "OK", "No", "Cancel", "Skip", "Later", "X"]
+                        win, ["Continue", "Close", "OK", "No", "Skip", "Later", "X", "Cancel"]
                     )
                     if not clicked:
                         # Fall back to closing the window directly
