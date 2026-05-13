@@ -1823,6 +1823,53 @@ class QuickBooksAutomationEngine:
                     pass
             time.sleep(1)
 
+            # ── Dismiss popups/dialogs BEFORE trying Edit → Preferences ──
+            # The Enterprise upgrade popup ("Get the latest QuickBooks Desktop
+            # Enterprise") steals focus and intercepts keystrokes.
+            self._emit("  AcctPrefsUI: dismissing popups before opening Preferences...", log_fn)
+            try:
+                self._dismiss_common_dialogs(log_fn)
+            except Exception:
+                pass
+            time.sleep(0.5)
+            try:
+                if main:
+                    self._close_popup_windows(main, log_fn)
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+            # Close any remaining "Enterprise" / "upgrade" / "Get the latest" windows
+            desktop = self._get_desktop()
+            for win in desktop.windows():
+                try:
+                    t = (win.window_text() or "").lower()
+                    if not win.is_visible():
+                        continue
+                    if any(kw in t for kw in ('enterprise', 'upgrade', 'get the latest',
+                                               'update', 'new feature', 'what\'s new')):
+                        self._emit(f"  AcctPrefsUI: closing popup '{win.window_text()}'", log_fn)
+                        try:
+                            win.close()
+                        except Exception:
+                            try:
+                                _sk("{ESC}")
+                            except Exception:
+                                pass
+                        time.sleep(0.5)
+                except Exception:
+                    continue
+
+            # Re-focus the main window after popup dismissal
+            try:
+                main.set_focus()
+            except Exception:
+                try:
+                    qb_app.top_window().set_focus()
+                except Exception:
+                    pass
+            time.sleep(0.5)
+
             # Open Edit → Preferences via keyboard
             # Method 1: Alt+E → r (preferences mnemonic)
             _sk("%e")
@@ -2080,6 +2127,11 @@ class QuickBooksAutomationEngine:
                 if not value:
                     # Skip empty values but still Tab past the field
                     continue
+                # Sanitize non-ASCII characters (e.g. → arrow, ® symbols)
+                # to prevent encoding errors in type_keys/set_edit_text
+                value = ''.join(c if ord(c) < 128 else ' ' for c in str(value))
+                if not value.strip():
+                    continue
                 try:
                     edit = edits[idx]
                     edit.set_focus()
@@ -2088,12 +2140,12 @@ class QuickBooksAutomationEngine:
                         send_keys("^a")  # Select all
                         time.sleep(0.05)
                     try:
-                        edit.set_edit_text(str(value))
+                        edit.set_edit_text(value)
                     except Exception:
                         if send_keys:
                             send_keys("{DELETE}")
                             time.sleep(0.05)
-                            edit.type_keys(str(value), with_spaces=True, pause=0.02)
+                            edit.type_keys(value, with_spaces=True, pause=0.02)
                     set_count += 1
                     self._emit(f"    Set {label} = '{value}'", log_fn)
                 except Exception as exc:

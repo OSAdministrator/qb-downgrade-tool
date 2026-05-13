@@ -247,23 +247,25 @@ def import_classes(session: Any, classes: List[Dict], log_fn: Optional[LogFn] = 
 
 # QBFC account type enum mapping
 ACCOUNT_TYPE_MAP = {
-    # Friendly name -> QBFC enum value
-    'Bank': 0,
+    # Friendly name -> correct QBFC ENAccountType enum value
+    # These MUST match the values returned by AccountType.GetValue() in
+    # QBFC responses and used by AccountType.SetValue() in QBFC requests.
+    'AccountsPayable': 0,
     'AccountsReceivable': 1,
-    'OtherCurrentAsset': 2,
-    'FixedAsset': 3,
-    'OtherAsset': 4,
-    'AccountsPayable': 5,
-    'CreditCard': 6,
-    'OtherCurrentLiability': 7,
-    'LongTermLiability': 8,
-    'Equity': 9,
-    'Income': 10,
-    'CostOfGoodsSold': 11,
-    'Expense': 12,
-    'OtherIncome': 13,
+    'Bank': 2,
+    'CostOfGoodsSold': 3,
+    'CreditCard': 4,
+    'Equity': 5,
+    'Expense': 6,
+    'FixedAsset': 7,
+    'Income': 8,
+    'LongTermLiability': 9,
+    'NonPosting': 10,
+    'OtherAsset': 11,
+    'OtherCurrentAsset': 12,
+    'OtherCurrentLiability': 13,
     'OtherExpense': 14,
-    'NonPosting': 15,
+    'OtherIncome': 15,
 }
 # QBFC export returns enum integers (as strings), so also accept those
 ACCOUNT_TYPE_MAP.update({str(v): v for v in ACCOUNT_TYPE_MAP.values()})
@@ -550,9 +552,9 @@ def import_items(session: Any, items: List[Dict], accounts: Optional[List[Dict]]
     have different Add request types. We handle the main ones.
     """
     accounts = accounts or []
-    default_income = _find_default_account(accounts, [10, 13])  # Income, OtherIncome
-    default_expense = _find_default_account(accounts, [12, 11, 14])  # Expense, COGS, OtherExpense
-    default_asset = _find_default_account(accounts, [2, 4])  # OtherCurrentAsset, OtherAsset
+    default_income = _find_default_account(accounts, [8, 15])  # Income(8), OtherIncome(15)
+    default_expense = _find_default_account(accounts, [6, 3, 14])  # Expense(6), COGS(3), OtherExpense(14)
+    default_asset = _find_default_account(accounts, [12, 11])  # OtherCurrentAsset(12), OtherAsset(11)
     _emit(f"QBFC Import: Item defaults — income='{default_income}' expense='{default_expense}' asset='{default_asset}'", log_fn)
     ok = 0
     for it in items:
@@ -681,42 +683,46 @@ def import_items(session: Any, items: List[Dict], accounts: Optional[List[Dict]]
 def _guess_account_type(name: str) -> int:
     """Best-effort type guess from account name. Default = Bank.
 
-    Returns a QBFC AccountType enum int.
+    Returns a correct QBFC ENAccountType enum int:
+      0=AP, 1=AR, 2=Bank, 3=COGS, 4=CreditCard, 5=Equity,
+      6=Expense, 7=FixedAsset, 8=Income, 9=LongTermLiability,
+      10=NonPosting, 11=OtherAsset, 12=OtherCurrentAsset,
+      13=OtherCurrentLiability, 14=OtherExpense, 15=OtherIncome
     """
     n = name.lower()
     # Bank / cash
     if any(k in n for k in ('bank', 'checking', 'savings', 'cash', 'petty', 'money market', 'mm acct', 'bk acct')):
-        return 0  # Bank
+        return 2  # Bank
     # Credit card
     if any(k in n for k in ('credit card', 'visa', 'mastercard', 'amex', 'discover', 'cc ')):
-        return 6  # CreditCard
+        return 4  # CreditCard
     # A/R, A/P
     if 'accounts receivable' in n or n.startswith('a/r'):
-        return 1
+        return 1   # AccountsReceivable
     if 'accounts payable' in n or n.startswith('a/p'):
-        return 5
+        return 0   # AccountsPayable
     # Equity hints
     if any(k in n for k in ('equity', 'retained', 'opening balance')):
-        return 9
+        return 5   # Equity
     # Income hints
     if any(k in n for k in ('income', 'revenue', 'sales')):
-        return 10
+        return 8   # Income
     # COGS
     if 'cost of goods' in n or 'cogs' in n:
-        return 11
+        return 3   # CostOfGoodsSold
     # Liability hints
     if any(k in n for k in ('loan', 'payable', 'liability', 'note payable', 'mortgage')):
-        return 8 if 'long' in n or 'mortgage' in n else 7
+        return 9 if 'long' in n or 'mortgage' in n else 13  # LTL or OtherCurrentLiability
     # Asset hints
     if any(k in n for k in ('depreciation', 'fixed asset', 'equipment', 'building', 'vehicle', 'furniture')):
-        return 3  # FixedAsset
+        return 7   # FixedAsset
     if any(k in n for k in ('asset', 'prepaid', 'deposit', 'receivable')):
-        return 2  # OtherCurrentAsset
+        return 12  # OtherCurrentAsset
     # Expense (default for unrecognized)
     if any(k in n for k in ('expense', 'fee', 'cost', 'tax', 'utilities', 'rent', 'insurance', 'supplies', 'payroll', 'wages', 'meals')):
-        return 12
+        return 6   # Expense
     # Final fallback: Bank (safe for transfers/checks which is what triggers missing refs)
-    return 0
+    return 2  # Bank
 
 
 def _list_existing_accounts(session: Any, log_fn: Optional[LogFn] = None) -> set:
@@ -884,12 +890,12 @@ def _fix_account_types_for_native_txns(
     # Build a map: account_name -> required_type for the PRIMARY account of each tx
     # (the "bank" account for a Check, the "credit card" for a CC charge, etc.)
     REQUIRED_TYPES = {
-        'Check':             0,   # Bank
-        'Deposit':           0,   # Bank
-        'Transfer':          0,   # Bank (both sides)
-        'CreditCardCharge':  6,   # CreditCard
-        'CreditCardCredit':  6,   # CreditCard
-        'SalesTaxPaymentCheck': 0, # Bank (routed through Check)
+        'Check':             2,   # Bank (QBFC enum 2)
+        'Deposit':           2,   # Bank
+        'Transfer':          2,   # Bank (both sides)
+        'CreditCardCharge':  4,   # CreditCard (QBFC enum 4)
+        'CreditCardCredit':  4,   # CreditCard
+        'SalesTaxPaymentCheck': 2, # Bank (routed through Check)
     }
 
     # Collect account names that MUST be a certain type
@@ -1087,7 +1093,7 @@ def _import_cc_credit(session, tx, date_str, ref_num, entity, memo, lines, log_f
             # But could also be an expense line... need to distinguish.
             acct_key = acct.strip().lower()
             acct_type = _ACCOUNT_TYPE_CACHE.get(acct_key)
-            if acct_type == 6:  # CreditCard
+            if acct_type == 4:  # CreditCard (QBFC enum 4)
                 cc_acct = acct
             else:
                 # Check by name heuristic
@@ -1597,7 +1603,7 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
 
             try:
                 for acct, debit, credit in valid_lines:
-                    # QB requires entity on A/P (type=5) and A/R (type=1) lines.
+                    # QB requires entity on A/P (type=0) and A/R (type=1) lines.
                     # Use the cached account type, falling back to name heuristic.
                     acct_key = acct.strip().lower()
                     acct_type = _ACCOUNT_TYPE_CACHE.get(acct_key)
@@ -1807,15 +1813,16 @@ def import_opening_balances(
     # So we can compare them DIRECTLY without sign conversion.
     # The gap in QB's native sign tells us what adjustment is needed.
 
-    # Credit-normal QBFC account type enums (for building the JE correctly):
+    # Credit-normal QBFC ENAccountType enum values (for building the JE correctly):
+    # These accounts naturally carry credit balances; positive QB balance = credit.
     CREDIT_NORMAL_TYPES = {
-        3,   # AccountsPayable
-        6,   # CreditCard
-        7,   # OtherCurrentLiability
-        8,   # LongTermLiability
-        10,  # Income
-        12,  # OtherIncome
-        14,  # Equity
+        0,   # AccountsPayable
+        4,   # CreditCard
+        5,   # Equity
+        8,   # Income
+        9,   # LongTermLiability
+        13,  # OtherCurrentLiability
+        15,  # OtherIncome
     }
     # Build name→type map from account list
     acct_type_map: Dict[str, int] = {}
@@ -1878,7 +1885,7 @@ def import_opening_balances(
         req = _create_request_set(session)
         add = req.AppendAccountAddRq()
         add.Name.SetValue("Opening Balance Equity")
-        add.AccountType.SetValue(14)  # Equity
+        add.AccountType.SetValue(5)  # Equity (QBFC enum 5)
         resp_set = session.session_manager.DoRequests(req)
         resp = resp_set.ResponseList.GetAt(0)
         if resp.StatusCode == 0:
