@@ -1753,6 +1753,171 @@ class QuickBooksAutomationEngine:
         app = Application(backend="uia").start(exe_path)
         return app
 
+    def _set_accounting_preferences_via_ui(
+        self,
+        qb_app,
+        prefs: Dict[str, Any],
+        log_fn: Optional[LogFn] = None,
+    ) -> bool:
+        """Enable 'Use account numbers' and other accounting preferences via UI.
+
+        QBFC PreferencesModRq is unsupported in some QB versions.
+        Fallback: Edit → Preferences → Accounting → Company Preferences → check boxes → OK.
+        """
+        from pywinauto.keyboard import send_keys
+        acct_prefs = (prefs or {}).get("accounting") or {}
+        use_acct_numbers = str(acct_prefs.get("is_using_account_numbers", "")).lower() in ("true", "1", "yes")
+        use_class_tracking = str(acct_prefs.get("is_using_class_tracking", "")).lower() in ("true", "1", "yes")
+
+        if not use_acct_numbers and not use_class_tracking:
+            self._emit("  AcctPrefsUI: nothing to set (both disabled in source)", log_fn)
+            return True
+
+        self._emit(f"  AcctPrefsUI: need account_numbers={use_acct_numbers}, class_tracking={use_class_tracking}", log_fn)
+
+        try:
+            # Ensure QB window is visible and focused
+            main = self._find_qb_main_window(qb_app, "2021", self.config.timeouts.launch_qb_seconds,
+                                              include_hidden=True, log_fn=log_fn)
+            try:
+                main.restore()
+                main.set_focus()
+            except Exception:
+                pass
+            time.sleep(1)
+
+            # Open Edit → Preferences via keyboard
+            send_keys("%e")   # Alt+E → Edit menu
+            time.sleep(0.5)
+            # Preferences is usually the last item — use 'r' or navigate
+            # In QB 2021: Edit menu → Preferences (mnemonic varies)
+            # Safest: press Up to reach Preferences at bottom, then Enter
+            send_keys("r")   # 'r' for p[R]eferences in some QB versions
+            time.sleep(2)
+
+            # Look for the Preferences dialog
+            prefs_dlg = None
+            for attempt in range(10):
+                try:
+                    prefs_dlg = qb_app.window(title_re="(?i)preferences", visible_only=True)
+                    if prefs_dlg.exists(timeout=1):
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+
+            if not prefs_dlg or not prefs_dlg.exists(timeout=2):
+                # Try alternative: Alt+E then send 'Preferences' text
+                self._emit("  AcctPrefsUI: Preferences dialog not found, retrying...", log_fn)
+                send_keys("{ESC}")
+                time.sleep(0.5)
+                send_keys("%e")
+                time.sleep(0.5)
+                # Navigate to bottom of menu
+                for _ in range(15):
+                    send_keys("{DOWN}")
+                    time.sleep(0.1)
+                send_keys("{ENTER}")
+                time.sleep(2)
+                try:
+                    prefs_dlg = qb_app.window(title_re="(?i)preferences", visible_only=True)
+                except Exception:
+                    self._emit("  AcctPrefsUI: FAILED — could not open Preferences", log_fn)
+                    return False
+
+            self._emit("  AcctPrefsUI: Preferences dialog is open", log_fn)
+
+            # Click "Accounting" in the left sidebar list
+            # The sidebar is a ListBox with items like "Accounting", "Bills", etc.
+            try:
+                # Try to find and click the "Accounting" item in the list
+                acct_item = prefs_dlg.child_window(title="Accounting", control_type="ListItem")
+                if acct_item.exists(timeout=2):
+                    acct_item.click_input()
+                    time.sleep(0.5)
+                else:
+                    # Fallback: just click near top-left of the dialog (Accounting is first item)
+                    rect = prefs_dlg.rectangle()
+                    from pywinauto import mouse
+                    mouse.click(coords=(rect.left + 60, rect.top + 85))
+                    time.sleep(0.5)
+            except Exception:
+                # Click position fallback
+                rect = prefs_dlg.rectangle()
+                from pywinauto import mouse
+                mouse.click(coords=(rect.left + 60, rect.top + 85))
+                time.sleep(0.5)
+
+            self._emit("  AcctPrefsUI: clicked Accounting category", log_fn)
+
+            # Click "Company Preferences" tab
+            try:
+                co_tab = prefs_dlg.child_window(title_re="(?i)company.*pref", control_type="TabItem")
+                if co_tab.exists(timeout=2):
+                    co_tab.click_input()
+                    time.sleep(0.5)
+                else:
+                    # Tab is usually at top-right of the dialog — click it
+                    rect = prefs_dlg.rectangle()
+                    from pywinauto import mouse
+                    mouse.click(coords=(rect.left + 420, rect.top + 80))
+                    time.sleep(0.5)
+            except Exception:
+                rect = prefs_dlg.rectangle()
+                from pywinauto import mouse
+                mouse.click(coords=(rect.left + 420, rect.top + 80))
+                time.sleep(0.5)
+
+            self._emit("  AcctPrefsUI: on Company Preferences tab", log_fn)
+
+            # Find and check the checkboxes
+            checkboxes_to_set = []
+            if use_acct_numbers:
+                checkboxes_to_set.append(("Use account numbers", "account.number"))
+            if use_class_tracking:
+                checkboxes_to_set.append(("Use class tracking", "class.track"))
+
+            for label, tag in checkboxes_to_set:
+                try:
+                    cb = prefs_dlg.child_window(title_re=f"(?i){label}", control_type="CheckBox")
+                    if cb.exists(timeout=2):
+                        state = cb.get_toggle_state()
+                        if state == 0:  # unchecked
+                            cb.click_input()
+                            self._emit(f"  AcctPrefsUI: ✓ checked '{label}'", log_fn)
+                            time.sleep(0.3)
+                        else:
+                            self._emit(f"  AcctPrefsUI: '{label}' already checked", log_fn)
+                    else:
+                        self._emit(f"  AcctPrefsUI: '{label}' checkbox not found", log_fn)
+                except Exception as exc:
+                    self._emit(f"  AcctPrefsUI: '{label}' failed: {exc}", log_fn)
+
+            # Click OK to save
+            try:
+                ok_btn = prefs_dlg.child_window(title="OK", control_type="Button")
+                if ok_btn.exists(timeout=2):
+                    ok_btn.click_input()
+                else:
+                    send_keys("{ENTER}")
+            except Exception:
+                send_keys("{ENTER}")
+            time.sleep(2)
+
+            self._emit("  AcctPrefsUI: ✓ Preferences saved", log_fn)
+            return True
+
+        except Exception as exc:
+            self._emit(f"  AcctPrefsUI: FAILED — {exc}", log_fn)
+            # Try to dismiss any open dialog
+            try:
+                send_keys("{ESC}")
+                time.sleep(0.5)
+                send_keys("{ESC}")
+            except Exception:
+                pass
+            return False
+
     def _set_company_info_via_ui(self, qb_app, info: Dict[str, Any], log_fn: Optional[LogFn] = None) -> bool:
         """Set company profile via Company → My Company (UI automation).
 
@@ -3088,6 +3253,23 @@ class QuickBooksAutomationEngine:
                 )
 
                 self._emit(f"QBFC import complete: {sum(import_results.values())} total records", log_fn)
+
+                # ---------------------------------------------------------------
+                # ACCOUNTING PREFERENCES via UI automation
+                # QBFC PreferencesModRq is unsupported in QB 2021 — use UI instead
+                # Must happen AFTER QBFC import (accounts need to exist first)
+                # and BEFORE close so QB 2021 is still open.
+                # ---------------------------------------------------------------
+                try:
+                    snapshot_data_prefs = json.loads(Path(str(snapshot_path)).read_text(encoding="utf-8"))
+                    snap_prefs = snapshot_data_prefs.get("preferences", {})
+                    if snap_prefs:
+                        self._emit("=== Setting accounting preferences via UI automation ===", log_fn)
+                        if self._watchdog is not None:
+                            self._watchdog.pause()
+                        self._set_accounting_preferences_via_ui(qb2021_app, snap_prefs, log_fn)
+                except Exception as exc:
+                    self._emit(f"  AcctPrefsUI: non-fatal error: {exc}", log_fn)
 
                 # ---------------------------------------------------------------
                 # COMPANY INFO via UI automation (QBFC has no CompanyMod method)

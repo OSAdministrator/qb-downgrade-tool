@@ -864,6 +864,151 @@ def _ensure_referenced_accounts(session: Any, transactions: List[Dict], log_fn: 
     return created
 
 
+def _fix_account_types_for_native_txns(
+    session: Any,
+    transactions: List[Dict],
+    log_fn: Optional[LogFn] = None,
+) -> int:
+    """Detect and fix accounts whose QB type conflicts with native transaction needs.
+
+    Check/Transfer/Deposit/CreditCardCharge each require their primary account
+    to be a specific type (Bank, CreditCard, etc.).  If the template pre-loaded
+    an account with the wrong type, QBFC native handlers will fail (status 3140).
+
+    Fix strategy: delete the wrong-type account via ListDelRq, then recreate it
+    with the correct type.  This works because the template's account has zero
+    transactions at this point (we haven't imported any yet).
+
+    Returns the number of accounts fixed.
+    """
+    # Build a map: account_name -> required_type for the PRIMARY account of each tx
+    # (the "bank" account for a Check, the "credit card" for a CC charge, etc.)
+    REQUIRED_TYPES = {
+        'Check':             0,   # Bank
+        'Deposit':           0,   # Bank
+        'Transfer':          0,   # Bank (both sides)
+        'CreditCardCharge':  6,   # CreditCard
+        'CreditCardCredit':  6,   # CreditCard
+        'SalesTaxPaymentCheck': 0, # Bank (routed through Check)
+    }
+
+    # Collect account names that MUST be a certain type
+    needed: Dict[str, int] = {}  # name -> required QBFC type enum
+    for tx in transactions:
+        tx_type = tx.get('type', '')
+        req_type = REQUIRED_TYPES.get(tx_type)
+        if req_type is None:
+            continue
+        lines = tx.get('lines') or []
+        if not lines:
+            continue
+
+        if tx_type in ('Check', 'SalesTaxPaymentCheck'):
+            # Credit line = bank account (money FROM)
+            for ln in lines:
+                if ln.get('credit', 0) and not ln.get('debit', 0):
+                    acct = (ln.get('account') or '').strip()
+                    if acct:
+                        needed[acct] = req_type
+        elif tx_type == 'Deposit':
+            # Debit line = bank account (money INTO)
+            for ln in lines:
+                if ln.get('debit', 0) and not ln.get('credit', 0):
+                    acct = (ln.get('account') or '').strip()
+                    if acct:
+                        needed[acct] = req_type
+        elif tx_type == 'Transfer':
+            # Both lines are bank accounts
+            for ln in lines:
+                acct = (ln.get('account') or '').strip()
+                if acct:
+                    needed[acct] = req_type
+        elif tx_type in ('CreditCardCharge', 'CreditCardCredit'):
+            # Debit line = credit card account
+            for ln in lines:
+                if ln.get('debit', 0) and not ln.get('credit', 0):
+                    acct = (ln.get('account') or '').strip()
+                    if acct:
+                        needed[acct] = req_type
+
+    if not needed:
+        return 0
+
+    _emit(f"QBFC Import: Checking {len(needed)} accounts for type compatibility...", log_fn)
+
+    # Query current types from QB
+    _, existing_types = _list_accounts_with_types(session, log_fn)
+
+    fixed = 0
+    for acct_name, req_type in needed.items():
+        key = acct_name.strip().lower()
+        current_type = existing_types.get(key)
+        if current_type is None:
+            continue  # doesn't exist yet — will be created by pre-flight
+        if current_type == req_type:
+            continue  # correct type
+
+        _emit(f"  Account '{acct_name}': type {current_type} but need {req_type} — fixing...", log_fn)
+
+        # Step 1: Get the ListID so we can delete
+        try:
+            req = _create_request_set(session)
+            q = req.AppendAccountQueryRq()
+            q.ORAccountListQuery.FullNameList.Add(acct_name)
+            resp_set = session.session_manager.DoRequests(req)
+            resp = resp_set.ResponseList.GetAt(0)
+            if resp.StatusCode != 0 or resp.Detail is None:
+                _emit(f"    Could not query '{acct_name}': {resp.StatusCode}", log_fn)
+                continue
+            list_id = resp.Detail.AccountRetList.GetAt(0).ListID.GetValue()
+        except Exception as exc:
+            _emit(f"    Query failed for '{acct_name}': {exc}", log_fn)
+            continue
+
+        # Step 2: Delete the wrong-type account
+        try:
+            req = _create_request_set(session)
+            d = req.AppendListDelRq()
+            d.ListDelType.SetValue(1)  # 1 = Account
+            d.ListID.SetValue(list_id)
+            resp_set = session.session_manager.DoRequests(req)
+            resp = resp_set.ResponseList.GetAt(0)
+            if resp.StatusCode != 0:
+                _emit(f"    Delete failed for '{acct_name}': {resp.StatusCode} {resp.StatusMessage}", log_fn)
+                continue
+            _emit(f"    Deleted '{acct_name}' (was type {current_type})", log_fn)
+        except Exception as exc:
+            _emit(f"    Delete exception for '{acct_name}': {exc}", log_fn)
+            continue
+
+        # Step 3: Recreate with correct type
+        try:
+            req = _create_request_set(session)
+            add = req.AppendAccountAddRq()
+            add.Name.SetValue(acct_name)
+            add.AccountType.SetValue(req_type)
+            try:
+                add.Desc.SetValue('Recreated by TimeWarp (type fix)')
+            except Exception:
+                pass
+            resp_set = session.session_manager.DoRequests(req)
+            resp = resp_set.ResponseList.GetAt(0)
+            if resp.StatusCode == 0:
+                _emit(f"    ✓ Recreated '{acct_name}' as type {req_type}", log_fn)
+                _ACCOUNT_TYPE_CACHE[key] = req_type
+                fixed += 1
+            else:
+                _emit(f"    Recreate failed: {resp.StatusCode} {resp.StatusMessage}", log_fn)
+        except Exception as exc:
+            _emit(f"    Recreate exception for '{acct_name}': {exc}", log_fn)
+
+    if fixed:
+        _emit(f"QBFC Import: Fixed {fixed} account type(s).", log_fn)
+    else:
+        _emit("QBFC Import: All account types are compatible.", log_fn)
+    return fixed
+
+
 # ---------------------------------------------------------------------------
 # Native Credit Card transaction import
 # ---------------------------------------------------------------------------
@@ -1333,6 +1478,11 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
         je_count = len(transactions) - native_count
         _emit(f"  Transaction types: {type_counts}", log_fn)
         _emit(f"  Native routing: {native_count} txns via native handlers, {je_count} via JournalEntry fallback", log_fn)
+
+    # ── Pre-flight: fix accounts with wrong types for native handlers ──
+    # Must run BEFORE _ensure_referenced_accounts so deleted accounts get
+    # properly recreated.
+    _fix_account_types_for_native_txns(session, transactions, log_fn)
 
     # ── Pre-flight: ensure all referenced accounts exist (auto-create stubs) ──
     _ensure_referenced_accounts(session, transactions, log_fn)
