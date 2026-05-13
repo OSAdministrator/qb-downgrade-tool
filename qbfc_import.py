@@ -924,15 +924,19 @@ def _fix_account_types_for_native_txns(
                     if acct:
                         needed[acct] = req_type
         elif tx_type == 'Transfer':
-            # Both lines are bank accounts
+            # Transfers can be between various account types (bank-to-bank,
+            # bank-to-CC, bank-to-loan, etc.)  —  only the "from" account
+            # (credit side) truly needs to be Bank for QBFC TransferAdd.
             for ln in lines:
-                acct = (ln.get('account') or '').strip()
-                if acct:
-                    needed[acct] = req_type
+                if ln.get('credit', 0) and not ln.get('debit', 0):
+                    acct = (ln.get('account') or '').strip()
+                    if acct:
+                        needed[acct] = req_type
         elif tx_type in ('CreditCardCharge', 'CreditCardCredit'):
-            # Debit line = credit card account
+            # Credit line = credit card account (liability increases)
+            # Debit lines are expense/COGS accounts — do NOT mark them!
             for ln in lines:
-                if ln.get('debit', 0) and not ln.get('credit', 0):
+                if ln.get('credit', 0) and not ln.get('debit', 0):
                     acct = (ln.get('account') or '').strip()
                     if acct:
                         needed[acct] = req_type

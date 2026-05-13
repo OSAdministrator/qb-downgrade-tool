@@ -2031,6 +2031,14 @@ class QuickBooksAutomationEngine:
             self._emit("  CompanyUI: no company info, skipping", log_fn)
             return False
 
+        # Sanitise all values to ASCII – Windows console encoding chokes on
+        # characters like \u2192 (→) that can appear in QB company names.
+        def _ascii_safe(v):
+            if isinstance(v, str):
+                return v.encode('ascii', 'replace').decode('ascii')
+            return v
+        info = {k: _ascii_safe(v) for k, v in info.items()}
+
         company_name = info.get("company_name", "")
         if not company_name:
             self._emit("  CompanyUI: no company_name in snapshot, skipping", log_fn)
