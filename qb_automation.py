@@ -1791,10 +1791,13 @@ class QuickBooksAutomationEngine:
     ) -> bool:
         """Enable 'Use account numbers' and other accounting preferences via UI.
 
-        QBFC PreferencesModRq is unsupported in some QB versions.
-        Fallback: Edit → Preferences → Accounting → Company Preferences → check boxes → OK.
+        QBFC PreferencesModRq is unsupported in QB 2021.
+        Approach: pure keyboard navigation (most reliable across QB versions).
+          Edit → Preferences → Accounting (already selected, it's first) →
+          Company Preferences tab → check boxes → OK.
         """
-        from pywinauto.keyboard import send_keys
+        from pywinauto.keyboard import send_keys as _sk
+
         acct_prefs = (prefs or {}).get("accounting") or {}
         use_acct_numbers = str(acct_prefs.get("is_using_account_numbers", "")).lower() in ("true", "1", "yes")
         use_class_tracking = str(acct_prefs.get("is_using_class_tracking", "")).lower() in ("true", "1", "yes")
@@ -1807,143 +1810,162 @@ class QuickBooksAutomationEngine:
 
         try:
             # Ensure QB window is visible and focused
-            main = self._find_qb_main_window(qb_app, "2021", self.config.timeouts.launch_qb_seconds,
-                                              include_hidden=True, log_fn=log_fn)
             try:
+                main = self._find_qb_main_window(qb_app, "2021", 30,
+                                                  include_hidden=True, log_fn=log_fn)
                 main.restore()
                 main.set_focus()
             except Exception:
-                pass
+                # Fallback: just focus the app
+                try:
+                    qb_app.top_window().set_focus()
+                except Exception:
+                    pass
             time.sleep(1)
 
             # Open Edit → Preferences via keyboard
-            send_keys("%e")   # Alt+E → Edit menu
-            time.sleep(0.5)
-            # Preferences is usually the last item — use 'r' or navigate
-            # In QB 2021: Edit menu → Preferences (mnemonic varies)
-            # Safest: press Up to reach Preferences at bottom, then Enter
-            send_keys("r")   # 'r' for p[R]eferences in some QB versions
-            time.sleep(2)
+            # Method 1: Alt+E → r (preferences mnemonic)
+            _sk("%e")
+            time.sleep(0.8)
+            _sk("r")
+            time.sleep(3)
 
-            # Look for the Preferences dialog
-            prefs_dlg = None
-            for attempt in range(10):
+            # Verify Preferences dialog opened by checking for it
+            prefs_found = False
+            desktop = self._get_desktop()
+            for win in desktop.windows():
                 try:
-                    prefs_dlg = qb_app.window(title_re="(?i)preferences", visible_only=True)
-                    if prefs_dlg.exists(timeout=1):
+                    t = (win.window_text() or "").lower()
+                    if "preferences" in t and win.is_visible():
+                        prefs_found = True
                         break
                 except Exception:
-                    pass
-                time.sleep(0.5)
+                    continue
 
-            if not prefs_dlg or not prefs_dlg.exists(timeout=2):
-                # Try alternative: Alt+E then send 'Preferences' text
-                self._emit("  AcctPrefsUI: Preferences dialog not found, retrying...", log_fn)
-                send_keys("{ESC}")
+            if not prefs_found:
+                self._emit("  AcctPrefsUI: Preferences not found via 'r', trying menu navigation...", log_fn)
+                _sk("{ESC}")
                 time.sleep(0.5)
-                send_keys("%e")
-                time.sleep(0.5)
-                # Navigate to bottom of menu
+                _sk("%e")
+                time.sleep(0.8)
+                # Navigate down to Preferences (usually last item)
                 for _ in range(15):
-                    send_keys("{DOWN}")
-                    time.sleep(0.1)
-                send_keys("{ENTER}")
-                time.sleep(2)
+                    _sk("{DOWN}")
+                    time.sleep(0.08)
+                _sk("{ENTER}")
+                time.sleep(3)
+
+            self._emit("  AcctPrefsUI: Preferences dialog should be open", log_fn)
+
+            # "Accounting" is the FIRST category (already selected by default).
+            # Click "Company Preferences" tab — it's a tab control.
+            # The tab order is: My Preferences | Company Preferences
+            # We need to click Company Preferences. Use Ctrl+Tab or click.
+            # In QB Preferences, the tabs respond to mouse clicks.
+            # Use pywinauto to find the dialog and its tabs.
+            time.sleep(1)
+
+            # Try to find and click "Company Preferences" tab
+            for win in desktop.windows():
                 try:
-                    prefs_dlg = qb_app.window(title_re="(?i)preferences", visible_only=True)
-                except Exception:
-                    self._emit("  AcctPrefsUI: FAILED — could not open Preferences", log_fn)
-                    return False
+                    t = (win.window_text() or "").lower()
+                    if "preferences" not in t or not win.is_visible():
+                        continue
+                    # Found the Preferences dialog — click Company Preferences tab
+                    rect = win.rectangle()
+                    self._emit(f"  AcctPrefsUI: Preferences dialog at ({rect.left},{rect.top})-({rect.right},{rect.bottom})", log_fn)
 
-            self._emit("  AcctPrefsUI: Preferences dialog is open", log_fn)
+                    # Company Preferences tab is typically in the right half of the tab strip
+                    # Tab strip is near the top of the content area
+                    from pywinauto import mouse as _mouse
+                    tab_y = rect.top + 100  # tabs are about 100px from top
+                    tab_x = rect.left + int((rect.right - rect.left) * 0.65)  # right-ish
+                    _mouse.click(coords=(tab_x, tab_y))
+                    time.sleep(1)
+                    self._emit(f"  AcctPrefsUI: clicked Company Preferences tab at ({tab_x},{tab_y})", log_fn)
 
-            # Click "Accounting" in the left sidebar list
-            # The sidebar is a ListBox with items like "Accounting", "Bills", etc.
-            try:
-                # Try to find and click the "Accounting" item in the list
-                acct_item = prefs_dlg.child_window(title="Accounting", control_type="ListItem")
-                if acct_item.exists(timeout=2):
-                    acct_item.click_input()
-                    time.sleep(0.5)
-                else:
-                    # Fallback: just click near top-left of the dialog (Accounting is first item)
-                    rect = prefs_dlg.rectangle()
-                    from pywinauto import mouse
-                    mouse.click(coords=(rect.left + 60, rect.top + 85))
-                    time.sleep(0.5)
-            except Exception:
-                # Click position fallback
-                rect = prefs_dlg.rectangle()
-                from pywinauto import mouse
-                mouse.click(coords=(rect.left + 60, rect.top + 85))
-                time.sleep(0.5)
+                    # Now find "Use account numbers" checkbox
+                    # It's typically at specific coordinates within the dialog.
+                    # The checkbox area is in the main content pane.
+                    # Strategy: use pywinauto to find checkboxes, or use coordinates.
 
-            self._emit("  AcctPrefsUI: clicked Accounting category", log_fn)
+                    # Try pywinauto child_window first (without requiring uia backend)
+                    checked_acct = False
+                    checked_class = False
+                    try:
+                        children = win.children()
+                        for child in children:
+                            try:
+                                ct = child.window_text() or ""
+                                if not ct:
+                                    continue
+                                ct_l = ct.lower()
+                                if use_acct_numbers and "account number" in ct_l:
+                                    try:
+                                        state = child.get_toggle_state()
+                                        if state == 0:
+                                            child.click_input()
+                                            checked_acct = True
+                                            self._emit(f"  AcctPrefsUI: ✓ checked '{ct}'", log_fn)
+                                    except Exception:
+                                        child.click_input()
+                                        checked_acct = True
+                                        self._emit(f"  AcctPrefsUI: ✓ clicked '{ct}'", log_fn)
+                                    time.sleep(0.3)
+                                elif use_class_tracking and "class track" in ct_l:
+                                    try:
+                                        state = child.get_toggle_state()
+                                        if state == 0:
+                                            child.click_input()
+                                            checked_class = True
+                                            self._emit(f"  AcctPrefsUI: ✓ checked '{ct}'", log_fn)
+                                    except Exception:
+                                        child.click_input()
+                                        checked_class = True
+                                        self._emit(f"  AcctPrefsUI: ✓ clicked '{ct}'", log_fn)
+                                    time.sleep(0.3)
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
 
-            # Click "Company Preferences" tab
-            try:
-                co_tab = prefs_dlg.child_window(title_re="(?i)company.*pref", control_type="TabItem")
-                if co_tab.exists(timeout=2):
-                    co_tab.click_input()
-                    time.sleep(0.5)
-                else:
-                    # Tab is usually at top-right of the dialog — click it
-                    rect = prefs_dlg.rectangle()
-                    from pywinauto import mouse
-                    mouse.click(coords=(rect.left + 420, rect.top + 80))
-                    time.sleep(0.5)
-            except Exception:
-                rect = prefs_dlg.rectangle()
-                from pywinauto import mouse
-                mouse.click(coords=(rect.left + 420, rect.top + 80))
-                time.sleep(0.5)
+                    if not checked_acct and use_acct_numbers:
+                        # Coordinate fallback: "Use account numbers" is typically
+                        # around 40% from left, 35% from top in the content area
+                        cb_x = rect.left + int((rect.right - rect.left) * 0.12)
+                        cb_y = rect.top + int((rect.bottom - rect.top) * 0.35)
+                        _mouse.click(coords=(cb_x, cb_y))
+                        self._emit(f"  AcctPrefsUI: clicked account numbers at ({cb_x},{cb_y})", log_fn)
+                        time.sleep(0.3)
 
-            self._emit("  AcctPrefsUI: on Company Preferences tab", log_fn)
+                    if not checked_class and use_class_tracking:
+                        cb_x = rect.left + int((rect.right - rect.left) * 0.12)
+                        cb_y = rect.top + int((rect.bottom - rect.top) * 0.55)
+                        _mouse.click(coords=(cb_x, cb_y))
+                        self._emit(f"  AcctPrefsUI: clicked class tracking at ({cb_x},{cb_y})", log_fn)
+                        time.sleep(0.3)
 
-            # Find and check the checkboxes
-            checkboxes_to_set = []
-            if use_acct_numbers:
-                checkboxes_to_set.append(("Use account numbers", "account.number"))
-            if use_class_tracking:
-                checkboxes_to_set.append(("Use class tracking", "class.track"))
+                    # Click OK to save
+                    _sk("{ENTER}")
+                    time.sleep(2)
+                    self._emit("  AcctPrefsUI: ✓ Preferences saved", log_fn)
+                    return True
 
-            for label, tag in checkboxes_to_set:
-                try:
-                    cb = prefs_dlg.child_window(title_re=f"(?i){label}", control_type="CheckBox")
-                    if cb.exists(timeout=2):
-                        state = cb.get_toggle_state()
-                        if state == 0:  # unchecked
-                            cb.click_input()
-                            self._emit(f"  AcctPrefsUI: ✓ checked '{label}'", log_fn)
-                            time.sleep(0.3)
-                        else:
-                            self._emit(f"  AcctPrefsUI: '{label}' already checked", log_fn)
-                    else:
-                        self._emit(f"  AcctPrefsUI: '{label}' checkbox not found", log_fn)
                 except Exception as exc:
-                    self._emit(f"  AcctPrefsUI: '{label}' failed: {exc}", log_fn)
+                    self._emit(f"  AcctPrefsUI: dialog handling error: {exc}", log_fn)
+                    continue
 
-            # Click OK to save
-            try:
-                ok_btn = prefs_dlg.child_window(title="OK", control_type="Button")
-                if ok_btn.exists(timeout=2):
-                    ok_btn.click_input()
-                else:
-                    send_keys("{ENTER}")
-            except Exception:
-                send_keys("{ENTER}")
-            time.sleep(2)
-
-            self._emit("  AcctPrefsUI: ✓ Preferences saved", log_fn)
-            return True
+            self._emit("  AcctPrefsUI: FAILED — could not find Preferences dialog", log_fn)
+            _sk("{ESC}")
+            time.sleep(0.5)
+            return False
 
         except Exception as exc:
             self._emit(f"  AcctPrefsUI: FAILED — {exc}", log_fn)
-            # Try to dismiss any open dialog
             try:
-                send_keys("{ESC}")
+                _sk("{ESC}")
                 time.sleep(0.5)
-                send_keys("{ESC}")
+                _sk("{ESC}")
             except Exception:
                 pass
             return False

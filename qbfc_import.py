@@ -1734,20 +1734,52 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
 # Opening-balance adjustments
 # ---------------------------------------------------------------------------
 
+def _query_qb_account_balances(session: Any, log_fn: Optional[LogFn] = None) -> Dict[str, float]:
+    """Query actual account balances from the open QB company file.
+
+    Returns dict of {account_full_name: balance} where balance is the
+    raw value from QB (positive for debit-normal, positive for credit-normal).
+    """
+    balances: Dict[str, float] = {}
+    try:
+        req = _create_request_set(session)
+        req.AppendAccountQueryRq()
+        resp_set = session.session_manager.DoRequests(req)
+        resp = resp_set.ResponseList.GetAt(0)
+        if resp and resp.StatusCode == 0 and resp.Detail:
+            for i in range(resp.Detail.Count):
+                acct = resp.Detail.GetAt(i)
+                name = ""
+                bal = 0.0
+                try:
+                    name = acct.FullName.GetValue() if acct.FullName else ""
+                except Exception:
+                    pass
+                try:
+                    bal = float(acct.Balance.GetValue()) if acct.Balance else 0.0
+                except Exception:
+                    pass
+                if name:
+                    balances[name] = bal
+            _emit(f"  Queried {len(balances)} account balances from QB", log_fn)
+    except Exception as exc:
+        _emit(f"  WARNING: Could not query QB account balances: {exc}", log_fn)
+    return balances
+
+
 def import_opening_balances(
     session: Any,
     accounts: List[Dict],
     transactions: List[Dict],
     log_fn: Optional[LogFn] = None,
 ) -> int:
-    """Create JE(s) to adjust for opening balances that QB stores outside
-    of the visible transaction stream.
+    """Create JE(s) to adjust opening balances after all transactions imported.
 
-    For each account, compute the net movement implied by the snapshot
-    transactions, compare to the actual balance recorded by QB 2023, and
-    post the difference against "Opening Balance Equity".
+    APPROACH: Query the ACTUAL balances from QB 2021 (post-import), compare
+    to the TARGET balances from the QB 2023 snapshot, and only post JEs for
+    the real differences. This avoids double-counting.
 
-    This must run AFTER import_transactions so we don't double-count.
+    This must run AFTER import_transactions.
     The JE is dated one day before the earliest transaction.
     """
     import math
@@ -1755,16 +1787,8 @@ def import_opening_balances(
 
     _emit("QBFC Import: Computing opening-balance adjustments...", log_fn)
 
-    # 1. Derive per-account net movement from snapshot txns
-    derived: Dict[str, float] = {}
-    for tx in transactions:
-        for ln in tx.get("lines", []):
-            acct = (ln.get("account") or "").strip()
-            if not acct:
-                continue
-            d = float(ln.get("debit", 0) or 0)
-            c = float(ln.get("credit", 0) or 0)
-            derived[acct] = derived.get(acct, 0.0) + d - c
+    # 1. Query ACTUAL balances from QB 2021 (what transactions produced)
+    qb_balances = _query_qb_account_balances(session, log_fn)
 
     # 2. Find the earliest txn date, OB JE goes one day earlier
     dates = [tx.get("date", "") for tx in transactions if tx.get("date")]
@@ -1777,12 +1801,13 @@ def import_opening_balances(
     else:
         ob_date = "2000-01-01"
 
-    # 3. Compare actual vs derived, collect gaps
-    # CRITICAL: QB reports balances in "natural" sign — positive for all types.
-    # But our `derived` uses debit-positive convention (debit - credit).
-    # For credit-normal accounts (Liability, Equity, Income), the QB balance
-    # represents a CREDIT, so we must negate it before comparing to `derived`.
-    # Credit-normal QBFC account type enums:
+    # 3. Compare target (snapshot) vs actual (QB 2021), collect gaps
+    # Both QB 2023 and QB 2021 report balances the same way —
+    # positive for the "natural" direction of each account type.
+    # So we can compare them DIRECTLY without sign conversion.
+    # The gap in QB's native sign tells us what adjustment is needed.
+
+    # Credit-normal QBFC account type enums (for building the JE correctly):
     CREDIT_NORMAL_TYPES = {
         3,   # AccountsPayable
         6,   # CreditCard
@@ -1792,7 +1817,7 @@ def import_opening_balances(
         12,  # OtherIncome
         14,  # Equity
     }
-    # Build name→type map from account list (type field from snapshot = QBFC enum)
+    # Build name→type map from account list
     acct_type_map: Dict[str, int] = {}
     for ai in accounts:
         n = (ai.get("name") or "").strip()
@@ -1803,24 +1828,41 @@ def import_opening_balances(
             except (ValueError, TypeError):
                 pass
 
-    gaps: List[tuple] = []  # (account_name, gap_amount)  positive = debit needed
+    gaps: List[tuple] = []  # (account_name, gap_amount)
     for acct_info in accounts:
         name = (acct_info.get("name") or "").strip()
         if not name:
             continue
-        actual = float(acct_info.get("balance", 0) or 0)
-        # Convert actual to debit-positive convention
-        acct_type = acct_type_map.get(name)
-        if acct_type is not None and acct_type in CREDIT_NORMAL_TYPES:
-            actual = -actual  # Credit-normal: QB's positive balance = credit
-        txn_derived = derived.get(name, 0.0)
-        gap = actual - txn_derived
+        # Skip Opening Balance Equity — we use it as the offset account
+        if name.lower() in ("opening balance equity", "retained earnings"):
+            continue
 
-        if abs(gap) < 0.005:
+        target = float(acct_info.get("balance", 0) or 0)
+        current = qb_balances.get(name, 0.0)
+
+        # Both are in QB's native sign, so gap = target - current
+        # represents how much MORE balance the account needs.
+        # For debit-normal accounts: positive gap = needs more debit
+        # For credit-normal accounts: positive gap = needs more credit
+        raw_gap = target - current
+
+        if abs(raw_gap) < 0.005:
             continue  # close enough
 
-        gap = round(gap, 2)
-        gaps.append((name, gap))
+        raw_gap = round(raw_gap, 2)
+        acct_type = acct_type_map.get(name)
+        is_credit_normal = acct_type is not None and acct_type in CREDIT_NORMAL_TYPES
+
+        # Convert to debit-positive convention for the JE:
+        # For debit-normal: positive gap → debit the account
+        # For credit-normal: positive gap means needs more credit → credit the account
+        if is_credit_normal:
+            je_amount = -raw_gap  # positive raw_gap → credit → negative in debit convention
+        else:
+            je_amount = raw_gap   # positive raw_gap → debit
+
+        gaps.append((name, je_amount))
+        _emit(f"    {name}: target={target:.2f} current={current:.2f} gap={raw_gap:+.2f} (JE: {je_amount:+.2f})", log_fn)
 
     if not gaps:
         _emit("  No opening-balance adjustments needed — all accounts match.", log_fn)
