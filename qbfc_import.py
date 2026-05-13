@@ -937,6 +937,13 @@ def _fix_account_types_for_native_txns(
                     if acct:
                         needed[acct] = req_type
 
+    # NEVER change system accounts — they serve special purposes
+    PROTECTED_ACCOUNTS = {'opening balance equity', 'retained earnings',
+                          'undeposited funds', 'accounts receivable',
+                          'accounts payable'}
+    needed = {k: v for k, v in needed.items()
+              if k.strip().lower() not in PROTECTED_ACCOUNTS}
+
     if not needed:
         return 0
 
