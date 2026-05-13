@@ -924,19 +924,23 @@ def _fix_account_types_for_native_txns(
                     if acct:
                         needed[acct] = req_type
         elif tx_type == 'Transfer':
-            # Transfers can be between various account types (bank-to-bank,
-            # bank-to-CC, bank-to-loan, etc.)  —  only the "from" account
-            # (credit side) truly needs to be Bank for QBFC TransferAdd.
+            # QBFC TransferAdd accepts any account type for both From and To
+            # (bank-to-bank, bank-to-CC, bank-to-loan, etc.).
+            # Do NOT force any account type — let the accounts stay as-is.
+            pass
+        elif tx_type == 'CreditCardCharge':
+            # CC Charge: Credit line = CC account (liability increases)
+            # Debit lines are expense/COGS accounts — do NOT mark them!
             for ln in lines:
                 if ln.get('credit', 0) and not ln.get('debit', 0):
                     acct = (ln.get('account') or '').strip()
                     if acct:
                         needed[acct] = req_type
-        elif tx_type in ('CreditCardCharge', 'CreditCardCredit'):
-            # Credit line = credit card account (liability increases)
-            # Debit lines are expense/COGS accounts — do NOT mark them!
+        elif tx_type == 'CreditCardCredit':
+            # CC Credit (refund): Debit line = CC account (liability decreases)
+            # Credit lines are expense/COGS reversals — do NOT mark them!
             for ln in lines:
-                if ln.get('credit', 0) and not ln.get('debit', 0):
+                if ln.get('debit', 0) and not ln.get('credit', 0):
                     acct = (ln.get('account') or '').strip()
                     if acct:
                         needed[acct] = req_type
@@ -1881,6 +1885,35 @@ def import_opening_balances(
 
         gaps.append((name, je_amount))
         _emit(f"    {name}: target={target:.2f} current={current:.2f} gap={raw_gap:+.2f} (JE: {je_amount:+.2f})", log_fn)
+
+    # Also check QB 2021 accounts that are NOT in the snapshot but have
+    # non-zero balances (e.g., accounts created on-the-fly during import
+    # like "Personal Bk Acct").  Their target balance is 0.
+    snapshot_names = {(a.get("name") or "").strip().lower() for a in accounts}
+    SKIP_AUTO = {"opening balance equity", "retained earnings",
+                 "undeposited funds", "payroll liabilities"}
+    _, existing_types = _list_accounts_with_types(session, log_fn=None)
+    for acct_name_lower, acct_type in existing_types.items():
+        if acct_name_lower in snapshot_names:
+            continue
+        if acct_name_lower in SKIP_AUTO:
+            continue
+        current = qb_balances.get(acct_name_lower, 0.0)
+        # Try original-cased name first; fall back to lower-cased lookup
+        orig_name = acct_name_lower
+        for n2 in qb_balances:
+            if n2.lower() == acct_name_lower:
+                orig_name = n2
+                current = qb_balances[n2]
+                break
+        if abs(current) < 0.005:
+            continue
+        raw_gap = -current  # target is 0, so gap = 0 - current
+        raw_gap = round(raw_gap, 2)
+        is_credit_normal = acct_type in CREDIT_NORMAL_TYPES
+        je_amount = -raw_gap if is_credit_normal else raw_gap
+        gaps.append((orig_name, je_amount))
+        _emit(f"    {orig_name}: target=0.00 current={current:.2f} gap={raw_gap:+.2f} (JE: {je_amount:+.2f}) [auto-created acct]", log_fn)
 
     if not gaps:
         _emit("  No opening-balance adjustments needed — all accounts match.", log_fn)
