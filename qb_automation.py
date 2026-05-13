@@ -439,7 +439,7 @@ class QuickBooksAutomationEngine:
                 ):
                     clicked = self._click_first_button(
                         dialog,
-                        ["No", "Don't Save", "Continue", "Yes", "OK", "Close", "Cancel", "Later", "Skip"],
+                        ["Continue", "OK", "Yes", "No", "Don't Save", "Close", "Skip", "Later", "Cancel"],
                     )
                     if clicked:
                         self._emit(f"Dismissed dialog: {title}", log_fn)
@@ -3222,8 +3222,13 @@ class QuickBooksAutomationEngine:
                 # window_text() returns subtly different bytes that fail the
                 # 'in' check despite looking identical in logs.
                 # Instead, just wait a fixed 30s for QB to fully stabilize.
-                self._emit("[STEP 5] Waiting 30s for QB 2021 to stabilize after login...", log_fn)
-                time.sleep(30)
+                self._emit("[STEP 5] Waiting 30s for QB 2021 to stabilize (dismissing popups)...", log_fn)
+                # Instead of sleeping 30s straight, sleep in 5s chunks
+                # and dismiss any popups that appear during startup
+                for _wait_chunk in range(6):
+                    time.sleep(5)
+                    self._dismiss_common_dialogs(log_fn)
+                    self._close_popup_windows(qb2021_main, log_fn)
                 try:
                     _t = qb2021_main.window_text() or ""
                     self._emit(f"[STEP 5] QB 2021 window title: '{_t}'", log_fn)
@@ -3245,68 +3250,111 @@ class QuickBooksAutomationEngine:
                 # top-level windows, so desktop.windows() may miss them.
                 # Strategy: try pywinauto child-dialog detection first,
                 # then fall back to brute-force keyboard dismissal.
+                # ── aggressive modal-dialog sweep ──────────────────────
+                # QBFC cannot connect while a modal dialog is showing.
+                # The "Usage & Analytics Study" popup is a modal dialog
+                # that blocks QBFC. Key insight: clicking "Cancel" on this
+                # dialog opens FAQ instead of dismissing it; "Continue"
+                # is the correct dismiss button. So we try "Continue" first.
                 self._emit("[STEP 5] Sweeping for modal dialogs before QBFC...", log_fn)
+                _dismiss_btns = ["Continue", "OK", "Yes", "Close", "No", "Skip", "Later", "Cancel"]
                 for sweep in range(5):
                     dismissed = False
-                    # 1) Try to find modal dialogs as children of the QB window
-                    try:
-                        for child in qb2021_main.children(control_type="Window"):
-                            ct = ""
-                            try:
-                                ct = child.window_text() or ""
-                            except Exception:
-                                pass
-                            if not ct:
-                                continue
-                            self._emit(f"  [sweep {sweep}] Found child window: '{ct}'", log_fn)
-                            clicked = self._click_first_button(
-                                child,
-                                ["Cancel", "No", "Close", "Continue", "OK", "Skip", "Later"],
-                            )
-                            if clicked:
-                                self._emit(f"  [sweep {sweep}] Dismissed child dialog: '{ct}'", log_fn)
-                                dismissed = True
-                                time.sleep(1)
-                    except Exception as _e:
-                        self._emit(f"  [sweep {sweep}] Child scan error (non-fatal): {_e}", log_fn)
 
-                    # 2) Also scan desktop windows for any dialog with QB-related title
+                    # 1) Use pywinauto find_windows to locate any dialog that
+                    #    might be a child of the QB process
                     try:
-                        desktop = self._get_desktop()
-                        for win in desktop.windows():
-                            try:
-                                if not win.is_visible():
-                                    continue
-                                wt = (win.window_text() or "").lower()
-                                if not wt:
-                                    continue
-                                # Skip the main QB window
-                                if win.handle == getattr(qb2021_main, "handle", None):
-                                    continue
-                                if re.search(self.QB_WINDOW_RE, win.window_text() or ""):
-                                    continue
-                                # Match any remaining QB-related or study/analytics/usage dialogs
-                                if any(k in wt for k in ["usage", "analytics", "study", "survey",
-                                                          "quickbooks desktop", "privacy", "data collection",
-                                                          "have a question", "faq"]):
-                                    clicked = self._click_first_button(
-                                        win,
-                                        ["Cancel", "No", "Close", "Continue", "OK", "Skip", "Later"],
-                                    )
-                                    if not clicked:
+                        from pywinauto import findwindows
+                        qb_pid = None
+                        try:
+                            qb_pid = qb2021_main.process_id()
+                        except Exception:
+                            pass
+                        if qb_pid:
+                            dlg_handles = findwindows.find_windows(
+                                process=qb_pid, top_level_only=False,
+                            )
+                            for h in dlg_handles:
+                                try:
+                                    from pywinauto.controls.hwndwrapper import HwndWrapper
+                                    w = HwndWrapper(h)
+                                    if not w.is_visible():
+                                        continue
+                                    wt = w.window_text() or ""
+                                    if not wt:
+                                        continue
+                                    # Skip main QB window
+                                    if h == getattr(qb2021_main, "handle", None):
+                                        continue
+                                    wt_l = wt.lower()
+                                    if any(k in wt_l for k in [
+                                        "usage", "analytics", "study", "survey",
+                                        "privacy", "data collection", "have a question",
+                                        "faq", "quickbooks desktop",
+                                    ]):
+                                        self._emit(f"  [sweep {sweep}] Found dialog via PID scan: '{wt}'", log_fn)
+                                        # Bring it to front and use keyboard
                                         try:
-                                            win.close()
+                                            w.set_focus()
+                                            time.sleep(0.3)
                                         except Exception:
                                             pass
-                                    self._emit(f"  [sweep {sweep}] Dismissed desktop dialog: '{win.window_text()}'", log_fn)
-                                    dismissed = True
-                                    time.sleep(1)
-                            except Exception:
-                                continue
+                                        # Try clicking buttons via pywinauto
+                                        clicked = self._click_first_button(w, _dismiss_btns)
+                                        if clicked:
+                                            self._emit(f"  [sweep {sweep}] Dismissed via button: '{wt}'", log_fn)
+                                            dismissed = True
+                                            time.sleep(1)
+                                        else:
+                                            # Keyboard fallback: Enter to click default button
+                                            if send_keys is not None:
+                                                send_keys("{ENTER}")
+                                                time.sleep(0.5)
+                                            self._emit(f"  [sweep {sweep}] Dismissed via ENTER: '{wt}'", log_fn)
+                                            dismissed = True
+                                            time.sleep(1)
+                                except Exception:
+                                    continue
                     except Exception as _e:
-                        self._emit(f"  [sweep {sweep}] Desktop scan error (non-fatal): {_e}", log_fn)
+                        self._emit(f"  [sweep {sweep}] PID scan error (non-fatal): {_e}", log_fn)
 
-                    # 3) Keyboard fallback: focus QB and press Escape
+                    # 2) Desktop-level scan as fallback
+                    if not dismissed:
+                        try:
+                            desktop = self._get_desktop()
+                            for win in desktop.windows():
+                                try:
+                                    if not win.is_visible():
+                                        continue
+                                    wt = (win.window_text() or "").lower()
+                                    if not wt:
+                                        continue
+                                    if win.handle == getattr(qb2021_main, "handle", None):
+                                        continue
+                                    if re.search(self.QB_WINDOW_RE, win.window_text() or ""):
+                                        continue
+                                    if any(k in wt for k in ["usage", "analytics", "study", "survey",
+                                                              "quickbooks desktop", "privacy",
+                                                              "have a question", "faq"]):
+                                        clicked = self._click_first_button(win, _dismiss_btns)
+                                        if not clicked:
+                                            try:
+                                                win.set_focus()
+                                                time.sleep(0.2)
+                                                if send_keys is not None:
+                                                    send_keys("{ENTER}")
+                                                    time.sleep(0.5)
+                                            except Exception:
+                                                pass
+                                        self._emit(f"  [sweep {sweep}] Dismissed desktop dialog: '{win.window_text()}'", log_fn)
+                                        dismissed = True
+                                        time.sleep(1)
+                                except Exception:
+                                    continue
+                        except Exception as _e:
+                            self._emit(f"  [sweep {sweep}] Desktop scan error (non-fatal): {_e}", log_fn)
+
+                    # 3) Last resort: focus QB and press Escape then Enter
                     if not dismissed:
                         try:
                             self._focus_window(qb2021_main)
@@ -3314,10 +3362,12 @@ class QuickBooksAutomationEngine:
                             if send_keys is not None:
                                 send_keys("{ESCAPE}")
                                 time.sleep(0.5)
+                                send_keys("{ENTER}")
+                                time.sleep(0.5)
                         except Exception:
                             pass
-                        break  # no more dialogs found, stop sweeping
-                    # If we dismissed something, loop again to catch cascading dialogs
+                        break  # no more dialogs found
+                    # If we dismissed something, loop to catch cascading dialogs
 
                 self._emit("QB 2021 template is open and ready for QBFC import.", log_fn)
             else:
