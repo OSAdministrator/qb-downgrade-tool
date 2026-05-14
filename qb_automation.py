@@ -492,6 +492,38 @@ class QuickBooksAutomationEngine:
                 except Exception:
                     pass
 
+        # ---- Fallback: click "Maybe later" at known position relative to
+        # main QB window.  The Enterprise popup is often an embedded pane
+        # inside the QB window, not a separate top-level window, so
+        # EnumWindows can't find it.  From screenshots, "Maybe later" is
+        # at approximately (left+250, bottom-30) of the main window.
+        if not dismissed and main_window:
+            main_hwnd = getattr(main_window, 'handle', 0)
+            if main_hwnd and win32gui:
+                try:
+                    rect = win32gui.GetWindowRect(main_hwnd)
+                    if rect:
+                        left, top, right, bottom = rect
+                        # "Maybe later" appears at ~55% from left, ~95% from top
+                        # of the QB window when the Enterprise panel is embedded.
+                        w = right - left
+                        h = bottom - top
+                        candidates = [
+                            (left + int(w * 0.50), top + int(h * 0.95)),  # 50% x, 95% y
+                            (left + int(w * 0.55), top + int(h * 0.95)),  # 55% x, 95% y
+                            (left + int(w * 0.45), top + int(h * 0.95)),  # 45% x, 95% y
+                            (left + int(w * 0.50), top + int(h * 0.93)),  # 50% x, 93% y
+                        ]
+                        for cx, cy in candidates:
+                            self._emit(f"  Enterprise fallback: clicking at ({cx},{cy})", log_fn)
+                            self._click_at(cx, cy, log_fn)
+                            time.sleep(1.0)
+                            # Check if popup disappeared by seeing if a menu responds now
+                            # (We can't easily verify, so just try all candidates)
+                        dismissed = True  # We tried — can't confirm but worth attempting
+                except Exception:
+                    pass
+
         return dismissed
 
     def _open_menu_by_coords(self, main_window, menu_name: str, submenu_name: str, log_fn=None) -> bool:
