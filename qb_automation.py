@@ -2196,6 +2196,46 @@ class QuickBooksAutomationEngine:
 
         self._emit(f"  AcctPrefsUI: need account_numbers={use_acct_numbers}, class_tracking={use_class_tracking}", log_fn)
 
+        # ── Quick check: are the preferences ALREADY set in the template? ──
+        # If the user pre-configured the template, skip the entire UI dance.
+        # Open a brief QBFC session to query current preferences.
+        try:
+            from qbfc_export import open_qbfc_session
+            sess = open_qbfc_session(log_fn=log_fn)
+            try:
+                req_set = sess.session_manager.CreateMsgSetRequest("US", sess.major_version, sess.minor_version)
+                req_set.AppendPreferencesQueryRq()
+                resp_set = sess.session_manager.DoRequests(req_set)
+                resp = resp_set.ResponseList.GetAt(0)
+                already_ok = True
+                if resp.StatusCode == 0 and resp.Detail is not None:
+                    detail = resp.Detail
+                    acct_pref = getattr(detail, "AccountingPreferences", None)
+                    if acct_pref:
+                        cur_acct_nums = getattr(acct_pref, "IsUsingAccountNumbers", None)
+                        cur_class     = getattr(acct_pref, "IsUsingClassTracking", None)
+                        cur_an = str(getattr(cur_acct_nums, "GetValue", lambda: "")()).lower() in ("true", "1") if cur_acct_nums else False
+                        cur_ct = str(getattr(cur_class,     "GetValue", lambda: "")()).lower() in ("true", "1") if cur_class     else False
+                        self._emit(f"  AcctPrefsUI: current values — account_numbers={cur_an}, class_tracking={cur_ct}", log_fn)
+                        if use_acct_numbers and not cur_an:
+                            already_ok = False
+                        if use_class_tracking and not cur_ct:
+                            already_ok = False
+                    else:
+                        already_ok = False
+                else:
+                    already_ok = False
+            finally:
+                sess.end()
+
+            if already_ok:
+                self._emit("  AcctPrefsUI: preferences ALREADY SET in template — skipping UI automation!", log_fn)
+                return True
+            else:
+                self._emit("  AcctPrefsUI: preferences NOT set yet, proceeding with UI automation...", log_fn)
+        except Exception as qe:
+            self._emit(f"  AcctPrefsUI: QBFC prefs check failed ({qe}), proceeding with UI...", log_fn)
+
         try:
             # Ensure QB window is visible and focused.
             # The watchdog uses SW_HIDE which persists even after the watchdog
