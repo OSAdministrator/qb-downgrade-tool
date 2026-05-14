@@ -405,6 +405,165 @@ class QuickBooksAutomationEngine:
             pass
         return False
 
+    @staticmethod
+    def _click_at(x: int, y: int, log_fn=None):
+        """Click at absolute screen coordinates using ctypes (works even when
+        pywinauto/pyautogui fail with QB's custom controls)."""
+        import ctypes
+        # Move cursor
+        ctypes.windll.user32.SetCursorPos(x, y)
+        time.sleep(0.15)
+        # Left button down + up
+        MOUSEEVENTF_LEFTDOWN = 0x0002
+        MOUSEEVENTF_LEFTUP   = 0x0004
+        ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.05)
+        ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        time.sleep(0.3)
+
+    def _dismiss_enterprise_popup_by_coords(self, main_window, log_fn=None) -> bool:
+        """Find the Enterprise upgrade popup and click 'Maybe later' using
+        screen coordinates.  The popup is a child of the QB window with known
+        layout: 'Maybe later' is a link in the lower-left area.
+        Returns True if a popup was found and clicked."""
+        try:
+            import win32gui
+        except ImportError:
+            return False
+
+        dismissed = False
+        def _enum(hwnd, _):
+            nonlocal dismissed
+            if dismissed:
+                return False
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            title = win32gui.GetWindowText(hwnd) or ""
+            title_l = title.lower()
+            # Match the Enterprise popup by its content keywords
+            if any(kw in title_l for kw in ('enterprise', 'get the latest', 'upgrade')):
+                rect = win32gui.GetWindowRect(hwnd)
+                if rect:
+                    left, top, right, bottom = rect
+                    w = right - left
+                    h = bottom - top
+                    if w > 100 and h > 100:  # sanity check
+                        # "Maybe later" is typically in the lower-left area
+                        # approximately 25% from left, 90% from top
+                        click_x = left + int(w * 0.25)
+                        click_y = top + int(h * 0.92)
+                        self._emit(f"  Dismissing Enterprise popup at ({click_x},{click_y}) rect={rect}", log_fn)
+                        self._click_at(click_x, click_y, log_fn)
+                        dismissed = True
+                        return False
+            return True
+
+        try:
+            win32gui.EnumWindows(_enum, None)
+        except Exception:
+            pass
+
+        # Also try: look for the popup as a child of the main QB window
+        if not dismissed and main_window:
+            main_hwnd = getattr(main_window, 'handle', 0)
+            if main_hwnd:
+                def _enum_child(hwnd, _):
+                    nonlocal dismissed
+                    if dismissed:
+                        return False
+                    try:
+                        text = win32gui.GetWindowText(hwnd) or ""
+                        if any(kw in text.lower() for kw in ('enterprise', 'get the latest', 'maybe later')):
+                            rect = win32gui.GetWindowRect(hwnd)
+                            if rect:
+                                left, top, right, bottom = rect
+                                # Click the center of this element (could be the link itself)
+                                cx = (left + right) // 2
+                                cy = (top + bottom) // 2
+                                self._emit(f"  Dismissing via child '{text}' at ({cx},{cy})", log_fn)
+                                self._click_at(cx, cy, log_fn)
+                                dismissed = True
+                                return False
+                    except Exception:
+                        pass
+                    return True
+                try:
+                    win32gui.EnumChildWindows(main_hwnd, _enum_child, None)
+                except Exception:
+                    pass
+
+        return dismissed
+
+    def _open_menu_by_coords(self, main_window, menu_name: str, submenu_name: str, log_fn=None) -> bool:
+        """Open a QB menu item by clicking at approximate screen coordinates.
+        Uses the main window's position + known menu bar offsets.
+        Returns True if a dialog matching submenu_name appeared."""
+        try:
+            import win32gui
+        except ImportError:
+            return False
+
+        main_hwnd = getattr(main_window, 'handle', 0)
+        if not main_hwnd:
+            return False
+
+        rect = win32gui.GetWindowRect(main_hwnd)
+        if not rect:
+            return False
+        left, top, right, bottom = rect
+
+        # QB 2021 menu bar layout (approximate x-offsets from window left edge):
+        # File=30, Edit=70, View=100, Lists=140, Favorites=195, Accountant=260,
+        # Company=335, Customers=410, Vendors=470, Employees=535, Banking=605
+        menu_offsets = {
+            "File": 30, "Edit": 70, "View": 105, "Lists": 145,
+            "Favorites": 200, "Accountant": 265, "Company": 340,
+            "Customers": 415, "Vendors": 478, "Employees": 545, "Banking": 610,
+            "Reports": 670,
+        }
+        menu_y_offset = 52  # menu bar is ~52px below window top (title bar + toolbar)
+
+        if menu_name not in menu_offsets:
+            self._emit(f"  _open_menu_by_coords: unknown menu '{menu_name}'", log_fn)
+            return False
+
+        # Click the menu name
+        click_x = left + menu_offsets[menu_name]
+        click_y = top + menu_y_offset
+        self._emit(f"  Clicking menu '{menu_name}' at ({click_x},{click_y})", log_fn)
+        self._click_at(click_x, click_y, log_fn)
+        time.sleep(1.5)
+
+        # Now find the submenu item in the dropdown
+        # The dropdown menu items are a separate window — look for them
+        desktop = self._get_desktop()
+        for win in desktop.windows():
+            try:
+                t = (win.window_text() or "").lower()
+                if submenu_name.lower() in t and win.is_visible():
+                    self._emit(f"  Found submenu dialog '{win.window_text()}'!", log_fn)
+                    return True
+            except Exception:
+                continue
+
+        # Didn't find the dialog — try clicking submenu items in the dropdown
+        # Preferences is usually the LAST item in Edit menu
+        # My Company is usually the FIRST item in Company menu
+        if menu_name == "Edit" and submenu_name.lower() == "preferences":
+            # Preferences is last in Edit — use END + ENTER
+            from pywinauto.keyboard import send_keys as _sk
+            _sk("{END}")
+            time.sleep(0.3)
+            _sk("{ENTER}")
+            time.sleep(3)
+        elif menu_name == "Company" and "my company" in submenu_name.lower():
+            # My Company is first or second — just press 'm' or 'y'
+            from pywinauto.keyboard import send_keys as _sk
+            _sk("y")  # "My Company" — 'y' might be the mnemonic
+            time.sleep(3)
+
+        return False
+
     def _nuke_all_popups(self, main_window, log_fn: Optional[LogFn], tag: str = "") -> bool:
         """Aggressively find and close ALL popup/dialog windows that aren't the
         main QB company window.  Uses win32gui.EnumWindows (catches everything
@@ -1997,43 +2156,28 @@ class QuickBooksAutomationEngine:
                 self._nuke_all_popups(main, log_fn, tag="AcctPrefsUI")
                 time.sleep(1)
 
-                # --- Method 1: Mouse-click the Edit menu at screen coordinates ---
-                # QB's menu bar isn't standard Win32 — use pywinauto click_input
-                # on the "Edit" menu item directly, then find & click "Preferences"
-                try:
-                    self._emit("  AcctPrefsUI: trying mouse-click on Edit menu...", log_fn)
-                    edit_menu = main.child_window(title="Edit", control_type="MenuItem")
-                    if edit_menu.exists(timeout=3):
-                        edit_menu.click_input()
-                        self._emit("  AcctPrefsUI: clicked Edit menu item", log_fn)
-                        time.sleep(1.5)
-                        # Now find and click Preferences in the dropdown
-                        try:
-                            prefs_item = main.child_window(title_re="(?i)Preferences", control_type="MenuItem")
-                            if prefs_item.exists(timeout=3):
-                                prefs_item.click_input()
-                                self._emit("  AcctPrefsUI: clicked Preferences menu item", log_fn)
-                                time.sleep(3)
-                        except Exception as pe:
-                            self._emit(f"  AcctPrefsUI: could not click Preferences item: {pe}", log_fn)
-                            # Try keyboard 'r' or END+ENTER while menu is open
-                            _sk("r")
-                            time.sleep(1)
-                    else:
-                        self._emit("  AcctPrefsUI: Edit MenuItem not found via UIA", log_fn)
-                except Exception as me1:
-                    self._emit(f"  AcctPrefsUI: mouse-click method failed: {me1}", log_fn)
+                # --- Method 1: Raw mouse-click on Edit menu bar item ---
+                # QB's menu bar doesn't respond to pywinauto menu_select or
+                # UIA MenuItem.click_input.  Use raw ctypes mouse clicks.
+                self._emit("  AcctPrefsUI: Method 1 — raw mouse click on Edit menu...", log_fn)
+                # First dismiss Enterprise popup if present
+                self._dismiss_enterprise_popup_by_coords(main, log_fn)
+                time.sleep(0.5)
+                # Click Edit menu in the menu bar
+                self._open_menu_by_coords(main, "Edit", "Preferences", log_fn)
 
-                # Check if Preferences dialog opened
                 prefs_found = self._check_prefs_dialog()
                 if prefs_found:
                     self._emit("  AcctPrefsUI: Preferences dialog found after mouse-click!", log_fn)
                     break
 
                 # --- Method 2: pywinauto menu_select ---
+                self._emit("  AcctPrefsUI: Method 2 — menu_select...", log_fn)
+                _sk("{ESC}")
+                time.sleep(0.5)
                 try:
                     main.menu_select("Edit->Preferences")
-                    self._emit("  AcctPrefsUI: menu_select('Edit->Preferences') succeeded", log_fn)
+                    self._emit("  AcctPrefsUI: menu_select succeeded", log_fn)
                     time.sleep(3)
                 except Exception as me:
                     self._emit(f"  AcctPrefsUI: menu_select failed: {me}", log_fn)
@@ -2044,7 +2188,7 @@ class QuickBooksAutomationEngine:
                     break
 
                 # --- Method 3: keyboard Alt+E → END → ENTER ---
-                self._emit("  AcctPrefsUI: trying Edit menu arrow-key navigation...", log_fn)
+                self._emit("  AcctPrefsUI: Method 3 — keyboard Alt+E...", log_fn)
                 _sk("{ESC}")
                 time.sleep(0.5)
                 _sk("%e")
@@ -2053,11 +2197,11 @@ class QuickBooksAutomationEngine:
                 # Check if a popup intercepted — nuke it
                 nuked = self._nuke_all_popups(main, log_fn, tag="AcctPrefsUI")
                 if nuked:
+                    self._dismiss_enterprise_popup_by_coords(main, log_fn)
                     _sk("{ESC}")
                     time.sleep(0.5)
                     continue
 
-                # Preferences is usually the last item in Edit menu
                 _sk("{END}")
                 time.sleep(0.3)
                 _sk("{ENTER}")
@@ -2236,33 +2380,20 @@ class QuickBooksAutomationEngine:
             self._emit("  CompanyUI: Opening Company -> My Company...", log_fn)
 
             # Navigate: Company menu → My Company
-            # Method 1: Mouse-click on Company menu item via UIA
-            co_dialog_found = False
-            try:
-                self._emit("  CompanyUI: trying mouse-click on Company menu...", log_fn)
-                co_menu = main_win.child_window(title="Company", control_type="MenuItem")
-                if co_menu.exists(timeout=3):
-                    co_menu.click_input()
-                    self._emit("  CompanyUI: clicked Company menu item", log_fn)
-                    time.sleep(1.5)
-                    try:
-                        my_co_item = main_win.child_window(title_re="(?i)My Company", control_type="MenuItem")
-                        if my_co_item.exists(timeout=3):
-                            my_co_item.click_input()
-                            self._emit("  CompanyUI: clicked My Company menu item", log_fn)
-                            time.sleep(3)
-                    except Exception as pe:
-                        self._emit(f"  CompanyUI: could not click My Company item: {pe}", log_fn)
-                        if send_keys:
-                            send_keys("m")
-                            time.sleep(1)
-                else:
-                    self._emit("  CompanyUI: Company MenuItem not found via UIA", log_fn)
-            except Exception as me1:
-                self._emit(f"  CompanyUI: mouse-click method failed: {me1}", log_fn)
+            # Method 1: Raw mouse-click on Company menu bar item
+            self._emit("  CompanyUI: Method 1 — raw mouse click on Company menu...", log_fn)
+            self._dismiss_enterprise_popup_by_coords(main_win, log_fn)
+            time.sleep(0.5)
+            self._open_menu_by_coords(main_win, "Company", "My Company", log_fn)
+            time.sleep(2)
 
             # Method 2: pywinauto menu_select
-            if not co_dialog_found:
+            dialog = self._find_active_dialog(
+                title_re=r"(?i)(company\s+information|my\s+company)",
+                parent_window=main_win,
+            )
+            if dialog is None:
+                self._emit("  CompanyUI: Method 2 — menu_select...", log_fn)
                 try:
                     main_win.menu_select("Company->My Company")
                     self._emit("  CompanyUI: menu_select succeeded", log_fn)
