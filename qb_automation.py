@@ -578,20 +578,72 @@ class QuickBooksAutomationEngine:
             except Exception:
                 continue
 
-        # Didn't find the dialog — try clicking submenu items in the dropdown
-        # Preferences is usually the LAST item in Edit menu
-        # My Company is usually the FIRST item in Company menu
+        # Didn't find the dialog — try navigating the dropdown.
+        # The dropdown is a standard Win32 popup menu — use keyboard to navigate.
+        from pywinauto.keyboard import send_keys as _sk
+
         if menu_name == "Edit" and submenu_name.lower() == "preferences":
-            # Preferences is last in Edit — use END + ENTER
-            from pywinauto.keyboard import send_keys as _sk
+            # Preferences is typically the LAST item in QB Edit menu.
+            # Try multiple approaches:
+            # 1. Press 'e' for Preferences (mnemonic might be 'e' not 'r')
+            for key in ("e", "r", "p"):
+                _sk(key)
+                time.sleep(2)
+                if self._check_prefs_dialog():
+                    self._emit(f"  Preferences opened with key '{key}'!", log_fn)
+                    return True
+                # Close menu if wrong item was triggered
+                _sk("{ESC}")
+                time.sleep(0.3)
+                # Re-open Edit menu
+                self._click_at(click_x, click_y, log_fn)
+                time.sleep(1.5)
+
+            # 2. Use END + ENTER (last item)
             _sk("{END}")
             time.sleep(0.3)
             _sk("{ENTER}")
             time.sleep(3)
+            if self._check_prefs_dialog():
+                return True
+
+            # 3. Arrow-down 20 times + ENTER (brute force to last item)
+            _sk("{ESC}")
+            time.sleep(0.3)
+            self._click_at(click_x, click_y, log_fn)
+            time.sleep(1.5)
+            for _ in range(20):
+                _sk("{DOWN}")
+                time.sleep(0.1)
+            _sk("{ENTER}")
+            time.sleep(3)
+
         elif menu_name == "Company" and "my company" in submenu_name.lower():
-            # My Company is first or second — just press 'm' or 'y'
-            from pywinauto.keyboard import send_keys as _sk
-            _sk("y")  # "My Company" — 'y' might be the mnemonic
+            # "My Company" — mnemonic is likely 'm' (first letter)
+            for key in ("m", "y"):
+                _sk(key)
+                time.sleep(2)
+                # Check if Company Information dialog appeared
+                desktop = self._get_desktop()
+                for win in desktop.windows():
+                    try:
+                        t = (win.window_text() or "").lower()
+                        if ("company information" in t or "my company" in t) and win.is_visible():
+                            self._emit(f"  My Company opened with key '{key}'!", log_fn)
+                            return True
+                    except Exception:
+                        continue
+                # Wrong item — escape and re-open
+                _sk("{ESC}")
+                time.sleep(0.3)
+                self._click_at(click_x, click_y, log_fn)
+                time.sleep(1.5)
+
+            # Arrow down to "My Company" (it's around position 6 in the menu)
+            for _ in range(6):
+                _sk("{DOWN}")
+                time.sleep(0.1)
+            _sk("{ENTER}")
             time.sleep(3)
 
         return False
