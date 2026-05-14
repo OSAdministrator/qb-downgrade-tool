@@ -390,6 +390,131 @@ class QuickBooksAutomationEngine:
                 continue
         return None
 
+    def _nuke_all_popups(self, main_window, log_fn: Optional[LogFn], tag: str = "") -> bool:
+        """Aggressively find and close ALL popup/dialog windows that aren't the
+        main QB company window.  Uses win32gui.EnumWindows (catches everything
+        including embedded dialogs) plus pywinauto desktop.windows() for
+        clicking labelled buttons.  Returns True if any popup was closed."""
+        import ctypes
+        import ctypes.wintypes
+        try:
+            import win32gui, win32con
+        except ImportError:
+            win32gui = win32con = None  # type: ignore
+
+        closed_any = False
+        main_hwnd = getattr(main_window, "handle", 0) if main_window else 0
+
+        # Popup-title keywords (lower-cased)
+        _popup_kw = (
+            'enterprise', 'upgrade', 'get the latest', 'update',
+            'new feature', "what's new", 'whats new', 'usage', 'analytics',
+            'study', 'faq', 'have a question', 'coach', 'learning center',
+            'accountant center', 'getting started', 'tips', 'home page',
+            'quickbooks home', 'quickbooks desktop', 'create backup',
+            'backup', 'did you know',
+        )
+        # Button labels we want to click to dismiss (order = preference)
+        _dismiss_btns = [
+            "Maybe later", "Continue", "OK", "Close", "No", "Skip",
+            "Later", "Cancel", "Not Now", "Dismiss", "X",
+        ]
+
+        # ---- Pass 1: win32gui raw enumeration ----
+        if win32gui:
+            BM_CLICK = 0x00F5
+            WM_CLOSE = 0x0010
+
+            def _enum_callback(hwnd, _extra):
+                nonlocal closed_any
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                if hwnd == main_hwnd:
+                    return True
+                title = win32gui.GetWindowText(hwnd) or ""
+                title_l = title.lower()
+                # Skip the main QB company window (regex match)
+                if re.search(self.QB_WINDOW_RE, title) and not any(k in title_l for k in _popup_kw):
+                    return True
+                if not any(k in title_l for k in _popup_kw):
+                    return True
+                # Found a popup — try to click a dismiss button inside it
+                self._emit(f"  {tag}: win32gui found popup hwnd={hwnd} title='{title}'", log_fn)
+                clicked = False
+                def _find_btn(child_hwnd, _):
+                    nonlocal clicked
+                    if clicked:
+                        return False  # stop enumerating
+                    try:
+                        btn_text = win32gui.GetWindowText(child_hwnd) or ""
+                        for lbl in _dismiss_btns:
+                            if lbl.lower() in btn_text.lower():
+                                self._emit(f"  {tag}: clicking button '{btn_text}' via BM_CLICK", log_fn)
+                                win32gui.SendMessage(child_hwnd, BM_CLICK, 0, 0)
+                                clicked = True
+                                return False
+                    except Exception:
+                        pass
+                    return True
+                try:
+                    win32gui.EnumChildWindows(hwnd, _find_btn, None)
+                except Exception:
+                    pass
+                if not clicked:
+                    # No button found — just close the window
+                    try:
+                        win32gui.PostMessage(hwnd, WM_CLOSE, 0, 0)
+                        self._emit(f"  {tag}: sent WM_CLOSE to popup hwnd={hwnd}", log_fn)
+                    except Exception:
+                        pass
+                closed_any = True
+                time.sleep(0.3)
+                return True
+
+            try:
+                win32gui.EnumWindows(_enum_callback, None)
+            except Exception:
+                pass
+
+        # ---- Pass 2: pywinauto desktop.windows() (catches things win32gui might miss) ----
+        try:
+            desktop = self._get_desktop()
+            for win in desktop.windows():
+                try:
+                    if not win.is_visible():
+                        continue
+                    if getattr(win, 'handle', 0) == main_hwnd:
+                        continue
+                    t = (win.window_text() or "").lower()
+                    if re.search(self.QB_WINDOW_RE, win.window_text() or "") and not any(k in t for k in _popup_kw):
+                        continue
+                    if not any(k in t for k in _popup_kw):
+                        continue
+                    self._emit(f"  {tag}: pywinauto found popup '{win.window_text()}'", log_fn)
+                    clicked = self._click_first_button(win, _dismiss_btns)
+                    if not clicked:
+                        try:
+                            win.close()
+                        except Exception:
+                            pass
+                    closed_any = True
+                    time.sleep(0.3)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # ---- Re-focus main window ----
+        if main_window:
+            try:
+                if win32gui and main_hwnd:
+                    ctypes.windll.user32.SetForegroundWindow(main_hwnd)
+                main_window.set_focus()
+            except Exception:
+                pass
+
+        return closed_any
+
     def _dismiss_common_dialogs(self, log_fn: Optional[LogFn]) -> None:
         desktop = self._get_desktop()
         for dialog in desktop.windows():
@@ -1841,52 +1966,10 @@ class QuickBooksAutomationEngine:
                     pass
             time.sleep(1)
 
-            # ── Dismiss popups/dialogs BEFORE trying Edit → Preferences ──
-            # The Enterprise upgrade popup ("Get the latest QuickBooks Desktop
-            # Enterprise") steals focus and intercepts keystrokes.
-            self._emit("  AcctPrefsUI: dismissing popups before opening Preferences...", log_fn)
-            try:
-                self._dismiss_common_dialogs(log_fn)
-            except Exception:
-                pass
-            time.sleep(0.5)
-            try:
-                if main:
-                    self._close_popup_windows(main, log_fn)
-            except Exception:
-                pass
-            time.sleep(0.5)
-
-            # Close any remaining "Enterprise" / "upgrade" / "Get the latest" windows
-            desktop = self._get_desktop()
-            for win in desktop.windows():
-                try:
-                    t = (win.window_text() or "").lower()
-                    if not win.is_visible():
-                        continue
-                    if any(kw in t for kw in ('enterprise', 'upgrade', 'get the latest',
-                                               'update', 'new feature', 'what\'s new')):
-                        self._emit(f"  AcctPrefsUI: closing popup '{win.window_text()}'", log_fn)
-                        try:
-                            win.close()
-                        except Exception:
-                            try:
-                                _sk("{ESC}")
-                            except Exception:
-                                pass
-                        time.sleep(0.5)
-                except Exception:
-                    continue
-
-            # Re-focus the main window after popup dismissal
-            try:
-                main.set_focus()
-            except Exception:
-                try:
-                    qb_app.top_window().set_focus()
-                except Exception:
-                    pass
-            time.sleep(0.5)
+            # ── Aggressively dismiss ALL popups/dialogs BEFORE trying Preferences ──
+            self._emit("  AcctPrefsUI: aggressively dismissing all popups...", log_fn)
+            self._nuke_all_popups(main, log_fn, tag="AcctPrefsUI")
+            time.sleep(1.0)
 
             # Open Edit → Preferences via keyboard — with retry loop
             # The Enterprise upgrade popup can steal focus at any moment,
@@ -1896,37 +1979,7 @@ class QuickBooksAutomationEngine:
                 self._emit(f"  AcctPrefsUI: attempt {attempt+1}/3 to open Preferences...", log_fn)
 
                 # Dismiss any popup that appeared between attempts
-                desktop = self._get_desktop()
-                for win in desktop.windows():
-                    try:
-                        t = (win.window_text() or "").lower()
-                        if not win.is_visible():
-                            continue
-                        if any(kw in t for kw in ('enterprise', 'upgrade', 'get the latest',
-                                                   'update', 'new feature', 'what\'s new',
-                                                   'usage', 'analytics', 'study', 'faq')):
-                            self._emit(f"  AcctPrefsUI: closing popup '{win.window_text()}'", log_fn)
-                            clicked = self._click_first_button(
-                                win, ["Continue", "OK", "Close", "No", "Skip", "Later", "Cancel"]
-                            )
-                            if not clicked:
-                                try: win.close()
-                                except Exception: pass
-                            time.sleep(0.5)
-                    except Exception:
-                        continue
-
-                # Re-focus main window
-                try:
-                    import ctypes
-                    ctypes.windll.user32.SetForegroundWindow(main.handle)
-                except Exception:
-                    pass
-                try:
-                    main.set_focus()
-                except Exception:
-                    try: qb_app.top_window().set_focus()
-                    except Exception: pass
+                self._nuke_all_popups(main, log_fn, tag="AcctPrefsUI")
                 time.sleep(1)
 
                 # --- Method 1: pywinauto menu_select ---
@@ -1943,28 +1996,9 @@ class QuickBooksAutomationEngine:
                     _sk("%e")
                     time.sleep(1.0)
 
-                    # Check if a popup intercepted
-                    desktop = self._get_desktop()
-                    intercepted = False
-                    for win in desktop.windows():
-                        try:
-                            t = (win.window_text() or "").lower()
-                            if not win.is_visible():
-                                continue
-                            if any(kw in t for kw in ('enterprise', 'upgrade', 'get the latest')):
-                                self._emit(f"  AcctPrefsUI: popup intercepted: '{win.window_text()}'", log_fn)
-                                clicked = self._click_first_button(
-                                    win, ["Continue", "OK", "Close", "No", "Skip", "Later", "Cancel"]
-                                )
-                                if not clicked:
-                                    try: win.close()
-                                    except Exception: pass
-                                intercepted = True
-                                time.sleep(0.5)
-                        except Exception:
-                            continue
-
-                    if intercepted:
+                    # Check if a popup intercepted — nuke it
+                    nuked = self._nuke_all_popups(main, log_fn, tag="AcctPrefsUI")
+                    if nuked:
                         _sk("{ESC}")
                         time.sleep(0.5)
                         continue
@@ -2172,6 +2206,11 @@ class QuickBooksAutomationEngine:
                 main_win.restore()
             main_win.set_focus()
             time.sleep(0.5)
+
+            # Aggressively dismiss all popups before menu navigation
+            self._emit("  CompanyUI: aggressively dismissing all popups...", log_fn)
+            self._nuke_all_popups(main_win, log_fn, tag="CompanyUI")
+            time.sleep(1.0)
             self._emit("  CompanyUI: Opening Company -> My Company...", log_fn)
 
             # Navigate: Company menu → My Company
