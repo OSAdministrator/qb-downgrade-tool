@@ -1814,14 +1814,27 @@ class QuickBooksAutomationEngine:
         self._emit(f"  AcctPrefsUI: need account_numbers={use_acct_numbers}, class_tracking={use_class_tracking}", log_fn)
 
         try:
-            # Ensure QB window is visible and focused
+            # Ensure QB window is visible and focused.
+            # The watchdog uses SW_HIDE which persists even after the watchdog
+            # pauses — we MUST use ShowWindow(SW_SHOW) to make it visible again.
+            main = None
             try:
                 main = self._find_qb_main_window(qb_app, "2021", 30,
                                                   include_hidden=True, log_fn=log_fn)
-                main.restore()
+                try:
+                    import ctypes
+                    hwnd = main.handle
+                    SW_SHOW = 5
+                    SW_RESTORE = 9
+                    ctypes.windll.user32.ShowWindow(hwnd, SW_SHOW)
+                    ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+                    self._emit("  AcctPrefsUI: force-showed QB window via ShowWindow", log_fn)
+                except Exception as e:
+                    self._emit(f"  AcctPrefsUI: ShowWindow fallback: {e}", log_fn)
+                    main.restore()
                 main.set_focus()
             except Exception:
-                # Fallback: just focus the app
                 try:
                     qb_app.top_window().set_focus()
                 except Exception:
@@ -2130,8 +2143,21 @@ class QuickBooksAutomationEngine:
             return False
 
         try:
-            main_win = self._find_qb_main_window(qb_app, "2021", timeout_s=15)
-            self._emit(f"  CompanyUI: Opening Company → My Company...", log_fn)
+            main_win = self._find_qb_main_window(qb_app, "2021", timeout_s=15,
+                                                  include_hidden=True)
+            # Force-show the window (watchdog's SW_HIDE persists after pause)
+            try:
+                import ctypes
+                hwnd = main_win.handle
+                ctypes.windll.user32.ShowWindow(hwnd, 5)   # SW_SHOW
+                ctypes.windll.user32.ShowWindow(hwnd, 9)   # SW_RESTORE
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+                self._emit("  CompanyUI: force-showed QB window", log_fn)
+            except Exception:
+                main_win.restore()
+            main_win.set_focus()
+            time.sleep(0.5)
+            self._emit("  CompanyUI: Opening Company -> My Company...", log_fn)
 
             # Navigate: Company menu → My Company
             # Alt+P is the Company menu accelerator in some QB versions,
