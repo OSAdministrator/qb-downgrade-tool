@@ -390,6 +390,21 @@ class QuickBooksAutomationEngine:
                 continue
         return None
 
+    def _check_prefs_dialog(self) -> bool:
+        """Check if a Preferences dialog is currently open."""
+        try:
+            desktop = self._get_desktop()
+            for win in desktop.windows():
+                try:
+                    t = (win.window_text() or "").lower()
+                    if "preferences" in t and win.is_visible():
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
     def _nuke_all_popups(self, main_window, log_fn: Optional[LogFn], tag: str = "") -> bool:
         """Aggressively find and close ALL popup/dialog windows that aren't the
         main QB company window.  Uses win32gui.EnumWindows (catches everything
@@ -1982,7 +1997,40 @@ class QuickBooksAutomationEngine:
                 self._nuke_all_popups(main, log_fn, tag="AcctPrefsUI")
                 time.sleep(1)
 
-                # --- Method 1: pywinauto menu_select ---
+                # --- Method 1: Mouse-click the Edit menu at screen coordinates ---
+                # QB's menu bar isn't standard Win32 — use pywinauto click_input
+                # on the "Edit" menu item directly, then find & click "Preferences"
+                try:
+                    self._emit("  AcctPrefsUI: trying mouse-click on Edit menu...", log_fn)
+                    edit_menu = main.child_window(title="Edit", control_type="MenuItem")
+                    if edit_menu.exists(timeout=3):
+                        edit_menu.click_input()
+                        self._emit("  AcctPrefsUI: clicked Edit menu item", log_fn)
+                        time.sleep(1.5)
+                        # Now find and click Preferences in the dropdown
+                        try:
+                            prefs_item = main.child_window(title_re="(?i)Preferences", control_type="MenuItem")
+                            if prefs_item.exists(timeout=3):
+                                prefs_item.click_input()
+                                self._emit("  AcctPrefsUI: clicked Preferences menu item", log_fn)
+                                time.sleep(3)
+                        except Exception as pe:
+                            self._emit(f"  AcctPrefsUI: could not click Preferences item: {pe}", log_fn)
+                            # Try keyboard 'r' or END+ENTER while menu is open
+                            _sk("r")
+                            time.sleep(1)
+                    else:
+                        self._emit("  AcctPrefsUI: Edit MenuItem not found via UIA", log_fn)
+                except Exception as me1:
+                    self._emit(f"  AcctPrefsUI: mouse-click method failed: {me1}", log_fn)
+
+                # Check if Preferences dialog opened
+                prefs_found = self._check_prefs_dialog()
+                if prefs_found:
+                    self._emit("  AcctPrefsUI: Preferences dialog found after mouse-click!", log_fn)
+                    break
+
+                # --- Method 2: pywinauto menu_select ---
                 try:
                     main.menu_select("Edit->Preferences")
                     self._emit("  AcctPrefsUI: menu_select('Edit->Preferences') succeeded", log_fn)
@@ -1990,60 +2038,34 @@ class QuickBooksAutomationEngine:
                 except Exception as me:
                     self._emit(f"  AcctPrefsUI: menu_select failed: {me}", log_fn)
 
-                    # --- Method 2: keyboard Alt+E → r ---
-                    _sk("{ESC}")
-                    time.sleep(0.3)
-                    _sk("%e")
-                    time.sleep(1.0)
-
-                    # Check if a popup intercepted — nuke it
-                    nuked = self._nuke_all_popups(main, log_fn, tag="AcctPrefsUI")
-                    if nuked:
-                        _sk("{ESC}")
-                        time.sleep(0.5)
-                        continue
-
-                    # Try 'r' then 'p' then arrow-key navigation
-                    _sk("r")
-                    time.sleep(2)
-
-                # Verify Preferences dialog opened
-                desktop = self._get_desktop()
-                for win in desktop.windows():
-                    try:
-                        t = (win.window_text() or "").lower()
-                        if "preferences" in t and win.is_visible():
-                            prefs_found = True
-                            break
-                    except Exception:
-                        continue
-
+                prefs_found = self._check_prefs_dialog()
                 if prefs_found:
+                    self._emit("  AcctPrefsUI: Preferences dialog found after menu_select!", log_fn)
                     break
 
-                # --- Method 3: arrow-key navigation to last item ---
+                # --- Method 3: keyboard Alt+E → END → ENTER ---
                 self._emit("  AcctPrefsUI: trying Edit menu arrow-key navigation...", log_fn)
                 _sk("{ESC}")
                 time.sleep(0.5)
                 _sk("%e")
                 time.sleep(1.0)
+
+                # Check if a popup intercepted — nuke it
+                nuked = self._nuke_all_popups(main, log_fn, tag="AcctPrefsUI")
+                if nuked:
+                    _sk("{ESC}")
+                    time.sleep(0.5)
+                    continue
+
                 # Preferences is usually the last item in Edit menu
                 _sk("{END}")
                 time.sleep(0.3)
                 _sk("{ENTER}")
                 time.sleep(3)
 
-                # Check again
-                desktop = self._get_desktop()
-                for win in desktop.windows():
-                    try:
-                        t = (win.window_text() or "").lower()
-                        if "preferences" in t and win.is_visible():
-                            prefs_found = True
-                            break
-                    except Exception:
-                        continue
+                prefs_found = self._check_prefs_dialog()
                 if prefs_found:
+                    self._emit("  AcctPrefsUI: Preferences dialog found after keyboard nav!", log_fn)
                     break
 
                 _sk("{ESC}")
@@ -2214,29 +2236,40 @@ class QuickBooksAutomationEngine:
             self._emit("  CompanyUI: Opening Company -> My Company...", log_fn)
 
             # Navigate: Company menu → My Company
+            # Method 1: Mouse-click on Company menu item via UIA
+            co_dialog_found = False
             try:
-                main_win.menu_select("Company->My Company")
-                self._emit("  CompanyUI: menu_select succeeded", log_fn)
-            except Exception:
-                self._emit("  CompanyUI: menu_select failed, trying keyboard...", log_fn)
-                if send_keys:
-                    # Try Alt+C for Company menu (some QB versions)
-                    send_keys("%c")
-                    time.sleep(0.8)
-                    send_keys("m")   # 'M' = My Company
-                    time.sleep(0.5)
-                    # If that didn't work, try Alt+P
-                    desktop_check = self._get_desktop()
-                    found_co = False
-                    for w in desktop_check.windows():
-                        t = (w.window_text() or "").lower()
-                        if ("company information" in t or "my company" in t) and w.is_visible():
-                            found_co = True
-                            break
-                    if not found_co:
-                        send_keys("{ESC}")
-                        time.sleep(0.3)
-                        send_keys("%p")
+                self._emit("  CompanyUI: trying mouse-click on Company menu...", log_fn)
+                co_menu = main_win.child_window(title="Company", control_type="MenuItem")
+                if co_menu.exists(timeout=3):
+                    co_menu.click_input()
+                    self._emit("  CompanyUI: clicked Company menu item", log_fn)
+                    time.sleep(1.5)
+                    try:
+                        my_co_item = main_win.child_window(title_re="(?i)My Company", control_type="MenuItem")
+                        if my_co_item.exists(timeout=3):
+                            my_co_item.click_input()
+                            self._emit("  CompanyUI: clicked My Company menu item", log_fn)
+                            time.sleep(3)
+                    except Exception as pe:
+                        self._emit(f"  CompanyUI: could not click My Company item: {pe}", log_fn)
+                        if send_keys:
+                            send_keys("m")
+                            time.sleep(1)
+                else:
+                    self._emit("  CompanyUI: Company MenuItem not found via UIA", log_fn)
+            except Exception as me1:
+                self._emit(f"  CompanyUI: mouse-click method failed: {me1}", log_fn)
+
+            # Method 2: pywinauto menu_select
+            if not co_dialog_found:
+                try:
+                    main_win.menu_select("Company->My Company")
+                    self._emit("  CompanyUI: menu_select succeeded", log_fn)
+                except Exception:
+                    self._emit("  CompanyUI: menu_select failed, trying keyboard...", log_fn)
+                    if send_keys:
+                        send_keys("%c")
                         time.sleep(0.8)
                         send_keys("m")
                         time.sleep(0.5)
