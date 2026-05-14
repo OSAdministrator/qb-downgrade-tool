@@ -80,9 +80,11 @@ class QuickBooksAutomationEngine:
         self._startup_password_handled: bool = False
 
     def _emit(self, msg: str, log_fn: Optional[LogFn]) -> None:
-        self.logger.info(msg)
+        # Sanitize non-ASCII characters that break Windows console/file encoding
+        safe_msg = msg.encode('ascii', 'replace').decode('ascii')
+        self.logger.info(safe_msg)
         if log_fn:
-            log_fn(msg)
+            log_fn(safe_msg)
 
     def _with_retries(self, fn: Callable[[], None], step_name: str, log_fn: Optional[LogFn]) -> None:
         attempts = self.config.retry_attempts + 1
@@ -495,6 +497,9 @@ class QuickBooksAutomationEngine:
             "study",
             "have a question",
             "faq",
+            "enterprise",
+            "upgrade",
+            "get the latest",
         ]
 
         closed_any = False
@@ -1870,39 +1875,119 @@ class QuickBooksAutomationEngine:
                     pass
             time.sleep(0.5)
 
-            # Open Edit → Preferences via keyboard
-            # Method 1: Alt+E → r (preferences mnemonic)
-            _sk("%e")
-            time.sleep(0.8)
-            _sk("r")
-            time.sleep(3)
-
-            # Verify Preferences dialog opened by checking for it
+            # Open Edit → Preferences via keyboard — with retry loop
+            # The Enterprise upgrade popup can steal focus at any moment,
+            # so we retry up to 3 times: dismiss popups → try menu → check.
             prefs_found = False
-            desktop = self._get_desktop()
-            for win in desktop.windows():
-                try:
-                    t = (win.window_text() or "").lower()
-                    if "preferences" in t and win.is_visible():
-                        prefs_found = True
-                        break
-                except Exception:
-                    continue
+            for attempt in range(3):
+                self._emit(f"  AcctPrefsUI: attempt {attempt+1}/3 to open Preferences...", log_fn)
 
-            if not prefs_found:
-                self._emit("  AcctPrefsUI: Preferences not found via 'r', trying menu navigation...", log_fn)
+                # Dismiss any popup that appeared between attempts
+                desktop = self._get_desktop()
+                for win in desktop.windows():
+                    try:
+                        t = (win.window_text() or "").lower()
+                        if not win.is_visible():
+                            continue
+                        if any(kw in t for kw in ('enterprise', 'upgrade', 'get the latest',
+                                                   'update', 'new feature', 'what\'s new',
+                                                   'usage', 'analytics', 'study', 'faq')):
+                            self._emit(f"  AcctPrefsUI: closing popup '{win.window_text()}'", log_fn)
+                            clicked = self._click_first_button(
+                                win, ["Continue", "OK", "Close", "No", "Skip", "Later", "Cancel"]
+                            )
+                            if not clicked:
+                                try: win.close()
+                                except Exception: pass
+                            time.sleep(0.5)
+                    except Exception:
+                        continue
+
+                # Re-focus main window
+                try:
+                    main.set_focus()
+                except Exception:
+                    try: qb_app.top_window().set_focus()
+                    except Exception: pass
+                time.sleep(0.5)
+
+                # Method 1: Alt+E → r (preferences mnemonic)
+                _sk("%e")
+                time.sleep(1.0)
+
+                # Check if a menu opened or if a popup intercepted
+                # If a popup appeared, dismiss it and retry
+                desktop = self._get_desktop()
+                intercepted = False
+                for win in desktop.windows():
+                    try:
+                        t = (win.window_text() or "").lower()
+                        if not win.is_visible():
+                            continue
+                        if any(kw in t for kw in ('enterprise', 'upgrade', 'get the latest')):
+                            self._emit(f"  AcctPrefsUI: popup intercepted Alt+E: '{win.window_text()}'", log_fn)
+                            clicked = self._click_first_button(
+                                win, ["Continue", "OK", "Close", "No", "Skip", "Later", "Cancel"]
+                            )
+                            if not clicked:
+                                try: win.close()
+                                except Exception: pass
+                            intercepted = True
+                            time.sleep(0.5)
+                    except Exception:
+                        continue
+
+                if intercepted:
+                    _sk("{ESC}")
+                    time.sleep(0.5)
+                    continue  # retry from top
+
+                _sk("r")
+                time.sleep(3)
+
+                # Verify Preferences dialog opened
+                desktop = self._get_desktop()
+                for win in desktop.windows():
+                    try:
+                        t = (win.window_text() or "").lower()
+                        if "preferences" in t and win.is_visible():
+                            prefs_found = True
+                            break
+                    except Exception:
+                        continue
+
+                if prefs_found:
+                    break
+
+                # Method 2: arrow-key navigation
+                self._emit("  AcctPrefsUI: Preferences not found via 'r', trying arrow-key navigation...", log_fn)
                 _sk("{ESC}")
                 time.sleep(0.5)
                 _sk("%e")
-                time.sleep(0.8)
-                # Navigate down to Preferences (usually last item)
+                time.sleep(1.0)
                 for _ in range(15):
                     _sk("{DOWN}")
                     time.sleep(0.08)
                 _sk("{ENTER}")
                 time.sleep(3)
 
-            self._emit("  AcctPrefsUI: Preferences dialog should be open", log_fn)
+                # Check again
+                desktop = self._get_desktop()
+                for win in desktop.windows():
+                    try:
+                        t = (win.window_text() or "").lower()
+                        if "preferences" in t and win.is_visible():
+                            prefs_found = True
+                            break
+                    except Exception:
+                        continue
+                if prefs_found:
+                    break
+
+                _sk("{ESC}")
+                time.sleep(0.5)
+
+            self._emit(f"  AcctPrefsUI: Preferences dialog {'found' if prefs_found else 'NOT FOUND'}", log_fn)
 
             # "Accounting" is the FIRST category (already selected by default).
             # Click "Company Preferences" tab — it's a tab control.

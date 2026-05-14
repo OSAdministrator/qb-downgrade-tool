@@ -42,10 +42,12 @@ QBFC_MULTI_USER = 0  # ENOpenMode.omMultiUser
 
 
 def _emit(msg: str, log_fn: Optional[LogFn]) -> None:
-    logger.info(msg)
+    # Sanitize non-ASCII characters that break Windows console/file encoding
+    safe_msg = msg.encode('ascii', 'replace').decode('ascii') if isinstance(msg, str) else msg
+    logger.info(safe_msg)
     if log_fn:
         try:
-            log_fn(msg)
+            log_fn(safe_msg)
         except Exception:  # noqa: BLE001
             pass
 

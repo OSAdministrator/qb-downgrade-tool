@@ -42,10 +42,12 @@ QBFC_DO_NOT_CARE = 2
 
 
 def _emit(msg: str, log_fn: Optional[LogFn]) -> None:
-    logger.info(msg)
+    # Sanitize non-ASCII characters that break Windows console/file encoding
+    safe_msg = msg.encode('ascii', 'replace').decode('ascii') if isinstance(msg, str) else msg
+    logger.info(safe_msg)
     if log_fn:
         try:
-            log_fn(msg)
+            log_fn(safe_msg)
         except Exception:
             pass
 
@@ -1453,8 +1455,11 @@ def _set_cleared_status(session: Any, txn_id: str, status: str, log_fn: Optional
         resp = resp_set.ResponseList.GetAt(0)
         if resp and resp.StatusCode == 0:
             return True
+        if resp:
+            _emit(f"    ClearedStatusMod {txn_id}: status={resp.StatusCode} msg={resp.StatusMessage}", log_fn)
         return False
-    except Exception:
+    except Exception as exc:
+        _emit(f"    ClearedStatusMod {txn_id}: exception: {exc}", log_fn)
         return False
 
 
@@ -1618,8 +1623,10 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
 
             try:
                 for acct, debit, credit in valid_lines:
-                    # QB requires entity on A/P (type=0) and A/R (type=1) lines.
-                    # Use the cached account type, falling back to name heuristic.
+                    # QB REQUIRES entity on A/P (type=0) and A/R (type=1) lines —
+                    # for those, fall back to a dummy entity if none provided.
+                    # For ALL other account types, set entity if available so
+                    # the transaction appears under the customer/vendor in QB.
                     acct_key = acct.strip().lower()
                     acct_type = _ACCOUNT_TYPE_CACHE.get(acct_key)
                     if acct_type is None:
@@ -1628,11 +1635,11 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                             acct_type = 0  # QBFC enum: 0=AP
                         elif 'accounts receivable' in acct_lower or acct_lower.startswith('a/r'):
                             acct_type = 1  # QBFC enum: 1=AR
-                    needs_entity = acct_type in (0, 1)
+                    is_ap_ar = acct_type in (0, 1)
                     line_entity = entity
-                    if needs_entity and not line_entity:
+                    if is_ap_ar and not line_entity:
                         line_entity = 'TimeWarp Migration'
-                    if needs_entity:
+                    if is_ap_ar:
                         _emit(f"    -> AP/AR line: acct='{acct}' type={acct_type} entity='{line_entity}'", log_fn)
 
                     if debit > 0:
@@ -1702,6 +1709,9 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                     ol.JournalDebitLine.Amount.SetValue(abs(amount))
                     try: ol.JournalDebitLine.Memo.SetValue(line_memo[:4095])
                     except Exception: pass
+                    if entity:
+                        try: ol.JournalDebitLine.EntityRef.FullName.SetValue(entity)
+                        except Exception: pass
                     ol2 = je.ORJournalLineList.Append()
                     ol2.JournalCreditLine.AccountRef.FullName.SetValue('Opening Balance Equity')
                     ol2.JournalCreditLine.Amount.SetValue(abs(amount))
@@ -1713,6 +1723,9 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                     ol.JournalCreditLine.Amount.SetValue(abs(amount))
                     try: ol.JournalCreditLine.Memo.SetValue(line_memo[:4095])
                     except Exception: pass
+                    if entity:
+                        try: ol.JournalCreditLine.EntityRef.FullName.SetValue(entity)
+                        except Exception: pass
                     ol2 = je.ORJournalLineList.Append()
                     ol2.JournalDebitLine.AccountRef.FullName.SetValue('Opening Balance Equity')
                     ol2.JournalDebitLine.Amount.SetValue(abs(amount))
@@ -1743,10 +1756,16 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
     if txns_to_clear:
         _emit(f"  Marking all {len(txns_to_clear)} transactions as reconciled...", log_fn)
         cleared_ok = 0
+        cleared_fail = 0
         for txn_id in txns_to_clear:
             if _set_cleared_status(session, txn_id, "Cleared", log_fn):
                 cleared_ok += 1
-        _emit(f"  Reconciled: {cleared_ok}/{len(txns_to_clear)} marked as cleared ✓", log_fn)
+            else:
+                cleared_fail += 1
+                if cleared_fail <= 5:
+                    _emit(f"    FAILED to clear TxnID={txn_id}", log_fn)
+        _emit(f"  Reconciled: {cleared_ok}/{len(txns_to_clear)} marked as cleared "
+              f"({cleared_fail} failed)", log_fn)
 
     return ok
 
