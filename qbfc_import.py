@@ -1357,6 +1357,57 @@ def _import_sales_tax_payment(session, tx, date_str, ref_num, entity, memo, line
                          return_txn_id=return_txn_id)
 
 
+_GENERIC_ITEM_NAME = "Migrated Item"
+_generic_item_ensured = False
+
+
+def _ensure_generic_service_item(session, log_fn=None):
+    """Create a generic service item for SalesReceipt lines if it doesn't exist.
+
+    SalesReceiptLineAdd requires an ItemRef — we use this catch-all service item
+    for migrated SalesReceipts whose original line items are account-based.
+    """
+    global _generic_item_ensured
+    if _generic_item_ensured:
+        return True
+
+    # First, query whether the item already exists
+    try:
+        req = _create_request_set(session)
+        query = req.AppendItemServiceQueryRq()
+        query.ORListQuery.FullNameList.Add(_GENERIC_ITEM_NAME)
+        resp_set = session.session_manager.DoRequests(req)
+        if resp_set and resp_set.ResponseList and resp_set.ResponseList.GetAt(0).StatusCode == 0:
+            _emit(f"  Generic item '{_GENERIC_ITEM_NAME}' already exists", log_fn)
+            _generic_item_ensured = True
+            return True
+    except Exception:
+        pass  # Item doesn't exist — create it
+
+    # Create the service item
+    try:
+        req = _create_request_set(session)
+        add = req.AppendItemServiceAddRq()
+        add.Name.SetValue(_GENERIC_ITEM_NAME)
+        try:
+            add.ORSalesPurchase.SalesOrPurchase.Desc.SetValue(
+                "Generic service item for migrated transactions"
+            )
+            add.ORSalesPurchase.SalesOrPurchase.ORPrice.Price.SetValue(0.0)
+            add.ORSalesPurchase.SalesOrPurchase.AccountRef.FullName.SetValue("Sales")
+        except Exception:
+            pass
+        result = _do_add_request(session, req, f"ItemService '{_GENERIC_ITEM_NAME}'", log_fn)
+        if result:
+            _emit(f"  Created generic item '{_GENERIC_ITEM_NAME}' for SalesReceipt lines", log_fn)
+            _generic_item_ensured = True
+            return True
+    except Exception as exc:
+        _emit(f"  Failed to create generic item: {exc}", log_fn)
+
+    return False
+
+
 def _import_sales_receipt(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
                           return_txn_id=False):
     """Import a SalesReceipt using AppendSalesReceiptAddRq.
@@ -1367,11 +1418,8 @@ def _import_sales_receipt(session, tx, date_str, ref_num, entity, memo, lines, l
 
     QBFC SalesReceiptAdd:
       - CustomerRef = customer
-      - SalesReceiptLineAddList = line items
+      - SalesReceiptLineAddList = line items (each needs ItemRef)
       - DepositToAccountRef = where the money goes
-
-    Falls back to JournalEntry if the native SalesReceipt structure is
-    too complex (e.g., missing customer, item references).
 
     Returns TxnID string if return_txn_id, else 1=ok/0=skipped/-1=failed.
     """
@@ -1392,6 +1440,9 @@ def _import_sales_receipt(session, tx, date_str, ref_num, entity, memo, lines, l
 
     if not deposit_acct or not revenue_lines:
         return 0
+
+    # Ensure generic service item exists for line ItemRef
+    _ensure_generic_service_item(session, log_fn)
 
     try:
         req = _create_request_set(session)
@@ -1416,12 +1467,10 @@ def _import_sales_receipt(session, tx, date_str, ref_num, entity, memo, lines, l
         for acct, amt in revenue_lines:
             try:
                 srl = add.ORSalesReceiptLineAddList.Append()
-                srl.SalesReceiptLineAdd.Amount.SetValue(amt)
-                srl.SalesReceiptLineAdd.Desc.SetValue(memo[:4095] if memo else acct)
-                # Use the account as a "Other1" or similar field
-                # SalesReceiptLineAdd uses ItemRef, not AccountRef directly.
-                # Since we may not have matching items, we use a description-only line.
-                # This requires at least one item to exist — use a generic service item.
+                line_add = srl.SalesReceiptLineAdd
+                line_add.ItemRef.FullName.SetValue(_GENERIC_ITEM_NAME)
+                line_add.Amount.SetValue(amt)
+                line_add.Desc.SetValue(memo[:4095] if memo else acct)
             except Exception:
                 pass
 
@@ -1432,8 +1481,6 @@ def _import_sales_receipt(session, tx, date_str, ref_num, entity, memo, lines, l
         return 1 if result else -1
     except Exception as exc:
         _emit(f"  SalesReceipt native failed ({exc}), falling back to JE", log_fn)
-        # SalesReceipt is tricky — if native fails, let it fall through
-        # to the JournalEntry path in the caller
         return None if return_txn_id else -1
 
 
@@ -1487,6 +1534,8 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
       {type, date, account, amount, ...}
       Uses Opening Balance Equity as the offset.
     """
+    global _generic_item_ensured
+    _generic_item_ensured = False  # Reset for each import run
     _emit(f"QBFC Import: Importing {len(transactions)} transactions...", log_fn)
     if transactions:
         sample = transactions[0]

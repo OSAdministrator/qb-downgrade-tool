@@ -1201,7 +1201,7 @@ def _extract_txn(ret, type_name, item_accts):
         "type": type_name,
         "date": _safe_get(ret, "TxnDate") or "",
         "num": _safe_get(ret, "RefNumber") or "",
-        "entity": _safe_get(ret, "EntityRef.FullName") or "",
+        "entity": _safe_get(ret, "EntityRef.FullName") or _safe_get(ret, "CustomerRef.FullName") or "",
         "memo": _safe_get(ret, "Memo") or "",
         "txn_id": _safe_get(ret, "TxnID") or "",
         "cleared": _safe_get(ret, "ClearedStatus") or "",
