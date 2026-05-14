@@ -3984,7 +3984,9 @@ class QuickBooksAutomationEngine:
                         self._emit("=== Setting accounting preferences via UI automation ===", log_fn)
                         if self._watchdog is not None:
                             self._watchdog.pause()
-                        self._set_accounting_preferences_via_ui(qb2021_app, snap_prefs, log_fn)
+                        prefs_ok = self._set_accounting_preferences_via_ui(qb2021_app, snap_prefs, log_fn)
+                        if prefs_ok and import_results is not None:
+                            import_results['accounting_prefs'] = 1
                 except Exception as exc:
                     self._emit(f"  AcctPrefsUI: non-fatal error: {exc}", log_fn)
 
