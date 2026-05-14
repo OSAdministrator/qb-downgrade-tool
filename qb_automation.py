@@ -1918,45 +1918,60 @@ class QuickBooksAutomationEngine:
 
                 # Re-focus main window
                 try:
+                    import ctypes
+                    ctypes.windll.user32.SetForegroundWindow(main.handle)
+                except Exception:
+                    pass
+                try:
                     main.set_focus()
                 except Exception:
                     try: qb_app.top_window().set_focus()
                     except Exception: pass
-                time.sleep(0.5)
+                time.sleep(1)
 
-                # Method 1: Alt+E → r (preferences mnemonic)
-                _sk("%e")
-                time.sleep(1.0)
+                # --- Method 1: pywinauto menu_select ---
+                try:
+                    main.menu_select("Edit->Preferences")
+                    self._emit("  AcctPrefsUI: menu_select('Edit->Preferences') succeeded", log_fn)
+                    time.sleep(3)
+                except Exception as me:
+                    self._emit(f"  AcctPrefsUI: menu_select failed: {me}", log_fn)
 
-                # Check if a menu opened or if a popup intercepted
-                # If a popup appeared, dismiss it and retry
-                desktop = self._get_desktop()
-                intercepted = False
-                for win in desktop.windows():
-                    try:
-                        t = (win.window_text() or "").lower()
-                        if not win.is_visible():
+                    # --- Method 2: keyboard Alt+E → r ---
+                    _sk("{ESC}")
+                    time.sleep(0.3)
+                    _sk("%e")
+                    time.sleep(1.0)
+
+                    # Check if a popup intercepted
+                    desktop = self._get_desktop()
+                    intercepted = False
+                    for win in desktop.windows():
+                        try:
+                            t = (win.window_text() or "").lower()
+                            if not win.is_visible():
+                                continue
+                            if any(kw in t for kw in ('enterprise', 'upgrade', 'get the latest')):
+                                self._emit(f"  AcctPrefsUI: popup intercepted: '{win.window_text()}'", log_fn)
+                                clicked = self._click_first_button(
+                                    win, ["Continue", "OK", "Close", "No", "Skip", "Later", "Cancel"]
+                                )
+                                if not clicked:
+                                    try: win.close()
+                                    except Exception: pass
+                                intercepted = True
+                                time.sleep(0.5)
+                        except Exception:
                             continue
-                        if any(kw in t for kw in ('enterprise', 'upgrade', 'get the latest')):
-                            self._emit(f"  AcctPrefsUI: popup intercepted Alt+E: '{win.window_text()}'", log_fn)
-                            clicked = self._click_first_button(
-                                win, ["Continue", "OK", "Close", "No", "Skip", "Later", "Cancel"]
-                            )
-                            if not clicked:
-                                try: win.close()
-                                except Exception: pass
-                            intercepted = True
-                            time.sleep(0.5)
-                    except Exception:
+
+                    if intercepted:
+                        _sk("{ESC}")
+                        time.sleep(0.5)
                         continue
 
-                if intercepted:
-                    _sk("{ESC}")
-                    time.sleep(0.5)
-                    continue  # retry from top
-
-                _sk("r")
-                time.sleep(3)
+                    # Try 'r' then 'p' then arrow-key navigation
+                    _sk("r")
+                    time.sleep(2)
 
                 # Verify Preferences dialog opened
                 desktop = self._get_desktop()
@@ -1972,15 +1987,15 @@ class QuickBooksAutomationEngine:
                 if prefs_found:
                     break
 
-                # Method 2: arrow-key navigation
-                self._emit("  AcctPrefsUI: Preferences not found via 'r', trying arrow-key navigation...", log_fn)
+                # --- Method 3: arrow-key navigation to last item ---
+                self._emit("  AcctPrefsUI: trying Edit menu arrow-key navigation...", log_fn)
                 _sk("{ESC}")
                 time.sleep(0.5)
                 _sk("%e")
                 time.sleep(1.0)
-                for _ in range(15):
-                    _sk("{DOWN}")
-                    time.sleep(0.08)
+                # Preferences is usually the last item in Edit menu
+                _sk("{END}")
+                time.sleep(0.3)
                 _sk("{ENTER}")
                 time.sleep(3)
 
@@ -2160,17 +2175,32 @@ class QuickBooksAutomationEngine:
             self._emit("  CompanyUI: Opening Company -> My Company...", log_fn)
 
             # Navigate: Company menu → My Company
-            # Alt+P is the Company menu accelerator in some QB versions,
-            # but the safe way is to try menu_select or keyboard nav.
             try:
                 main_win.menu_select("Company->My Company")
+                self._emit("  CompanyUI: menu_select succeeded", log_fn)
             except Exception:
                 self._emit("  CompanyUI: menu_select failed, trying keyboard...", log_fn)
                 if send_keys:
-                    send_keys("%p")  # Alt+P = Company menu (QB 2021)
-                    time.sleep(0.5)
+                    # Try Alt+C for Company menu (some QB versions)
+                    send_keys("%c")
+                    time.sleep(0.8)
                     send_keys("m")   # 'M' = My Company
                     time.sleep(0.5)
+                    # If that didn't work, try Alt+P
+                    desktop_check = self._get_desktop()
+                    found_co = False
+                    for w in desktop_check.windows():
+                        t = (w.window_text() or "").lower()
+                        if ("company information" in t or "my company" in t) and w.is_visible():
+                            found_co = True
+                            break
+                    if not found_co:
+                        send_keys("{ESC}")
+                        time.sleep(0.3)
+                        send_keys("%p")
+                        time.sleep(0.8)
+                        send_keys("m")
+                        time.sleep(0.5)
 
             time.sleep(2)
 
