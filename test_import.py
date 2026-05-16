@@ -98,7 +98,7 @@ def main():
     log("")
     log("=" * 60)
     log("  QB 2021 is launching with Blank Template.")
-    log("  Password: 3825You171")
+    log("  Password: Fl0640098!@!")
     log("  Dismiss any startup dialogs after login.")
     log("  Once the company file is fully open, press ENTER here.")
     log("=" * 60)

@@ -27,8 +27,8 @@ class SettingsDialog(tk.Toplevel):
     def __init__(self, parent: tk.Tk, config: AppConfig, on_save):
         super().__init__(parent)
         self.title("Settings")
-        self.geometry("700x430")
-        self.resizable(False, False)
+        self.geometry("750x430")
+        self.resizable(True, True)
         self.config_data = config
         self.on_save = on_save
 
@@ -169,6 +169,7 @@ class QuickBooksDowngradeGUI:
         ttk.Button(top, text="Add QBW Files", command=self._add_files).pack(side=LEFT, padx=4)
         ttk.Button(top, text="Remove Selected", command=self._remove_selected).pack(side=LEFT, padx=4)
         ttk.Button(top, text="Settings", command=self._open_settings).pack(side=LEFT, padx=4)
+        # add time warp graphic
 
         self.btn_start = ttk.Button(top, text="Start Processing", command=self._start_processing)
         self.btn_start.pack(side=RIGHT, padx=4)
@@ -179,7 +180,7 @@ class QuickBooksDowngradeGUI:
         self.drop_frame.pack(fill=tk.X, padx=10, pady=(4, 2))
         self.drop_label = tk.Label(
             self.drop_frame,
-            text="📂  Drag .QBW files onto Launch TimeWarp  —  or click Add QBW Files above",
+            text="📂  Drag .QBW files here to Launch TimeWarp  —  or click Add QBW Files above",
             bg="#2a3a4a", fg="#8ab4d8", font=("Segoe UI", 10),
             padx=20, pady=6, cursor="hand2",
         )
@@ -189,6 +190,23 @@ class QuickBooksDowngradeGUI:
         # Try to enable native drag-and-drop via tkinterdnd2 (optional dependency)
         self._setup_dnd()
 
+        # Password bar — single password applied to all files in the batch
+        pw_frame = ttk.Frame(self.root, padding=(10, 4))
+        pw_frame.pack(fill=tk.X)
+        ttk.Label(pw_frame, text="Admin Password:",
+                  font=("Segoe UI", 10, "bold")).pack(side=LEFT)
+        self.pw_var = tk.StringVar(value="")
+        self.pw_entry = ttk.Entry(pw_frame, textvariable=self.pw_var,
+                                  show="*", width=28, font=("Segoe UI", 10))
+        self.pw_entry.pack(side=LEFT, padx=(6, 4))
+        self.pw_show_var = tk.BooleanVar(value=False)
+        self.pw_show_cb = ttk.Checkbutton(
+            pw_frame, text="Show", variable=self.pw_show_var,
+            command=self._toggle_pw_visibility)
+        self.pw_show_cb.pack(side=LEFT, padx=(0, 8))
+        ttk.Label(pw_frame, text="(applied to all files in this batch)",
+                  font=("Segoe UI", 9), foreground="#6b7280").pack(side=LEFT)
+
         columns = ("file", "status", "message")
         self.tree = ttk.Treeview(self.root, columns=columns, show="headings", height=2)
         self.tree.pack(fill=BOTH, expand=False, padx=10, pady=4)
@@ -197,7 +215,7 @@ class QuickBooksDowngradeGUI:
         self.tree.heading("status", text="Status")
         self.tree.heading("message", text="Message")
 
-        self.tree.column("file", width=620)
+        self.tree.column("file", width=580)
         self.tree.column("status", width=110)
         self.tree.column("message", width=330)
 
@@ -228,7 +246,7 @@ class QuickBooksDowngradeGUI:
         )
         status_label.pack(fill=tk.X, padx=10, pady=(0, 4))
 
-        log_frame = ttk.LabelFrame(self.root, text="Activity Log", padding=8)
+        log_frame = ttk.LabelFrame(self.root, text="Activity/Progress Log", padding=8)
         log_frame.pack(fill=BOTH, expand=True, padx=10, pady=4)
 
         self.log_text = tk.Text(
@@ -258,7 +276,7 @@ class QuickBooksDowngradeGUI:
         footer.pack(fill=tk.X, side=tk.BOTTOM)
         tk.Label(
             footer,
-            text="oursystemadmin.com  •  liveremotesupport.com",
+            text="oursystemadmin.com  •  liveremotesupport.net",
             bg="#1e293b", fg="#64748b", font=("Segoe UI", 8),
             padx=10, pady=4, cursor="hand2",
         ).pack(side=LEFT)
@@ -326,6 +344,9 @@ class QuickBooksDowngradeGUI:
             else:
                 messagebox.showwarning("Invalid Path", f"File not found: {path}")
 
+    def _toggle_pw_visibility(self) -> None:
+        self.pw_entry.configure(show="" if self.pw_show_var.get() else "*")
+
     def _remove_selected(self) -> None:
         for row in self.tree.selection():
             self.tree.delete(row)
@@ -356,6 +377,17 @@ class QuickBooksDowngradeGUI:
         if not queue_items:
             messagebox.showwarning("No files", "Add one or more .QBW files first.")
             return
+
+        if not self.pw_var.get().strip():
+            proceed = messagebox.askyesno(
+                "No Password",
+                "No admin password was entered.\n\n"
+                "QuickBooks will prompt for the password during processing "
+                "and you'll need to type it manually.\n\n"
+                "Continue anyway?"
+            )
+            if not proceed:
+                return
 
         self.btn_start.configure(state=tk.DISABLED)
         self.progress["value"] = 0

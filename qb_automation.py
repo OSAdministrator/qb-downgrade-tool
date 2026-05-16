@@ -2812,7 +2812,7 @@ class QuickBooksAutomationEngine:
                             self._watchdog.resume()
 
                 time.sleep(3)
-            self._emit("  QB still running after 90s — will force-kill.", log_fn)
+            self._emit("  QB still running after 120s — will force-kill.", log_fn)
 
         # -----------------------------------------------------------
         # PHASE 3 — Force-kill only as absolute last resort

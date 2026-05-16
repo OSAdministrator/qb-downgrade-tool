@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-REM QuickBooks Downgrade Tool build script
+REM QuickBooks TimeWarp Tool build script
 REM Run this on Windows in a terminal opened at project root.
 
 python -m venv .venv
@@ -18,11 +18,11 @@ pyinstaller ^
   --noconfirm ^
   --clean ^
   --windowed ^
-  --name "QuickBooksDowngradeTool" ^
+  --name "QuickBooks TimeWarp" ^
   --icon docs\app_icon.ico ^
   --add-data "sample_config.json;." ^
   qb_downgrade_gui.py
 
 echo.
-echo Build complete. Executable available at dist\QuickBooksDowngradeTool\QuickBooksDowngradeTool.exe
+echo Build complete. Executable available at dist\QB-TimeWarp\QuickBooksDowngradeTool.exe
 pause

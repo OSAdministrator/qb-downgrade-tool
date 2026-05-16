@@ -69,7 +69,7 @@ class FinishDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, result: Any, original_name: str) -> None:
         super().__init__(parent)
         self.title(f"Conversion Complete — {original_name}")
-        self.geometry("640x500")
+        self.geometry("640x580")
         self.configure(bg="#0f172a")
         self.resizable(False, False)
 
