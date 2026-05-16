@@ -27,8 +27,8 @@ class SettingsDialog(tk.Toplevel):
     def __init__(self, parent: tk.Tk, config: AppConfig, on_save):
         super().__init__(parent)
         self.title("Settings")
-        self.geometry("700x430")
-        self.resizable(False, False)
+        self.geometry("750x430")
+        self.resizable(True, True)
         self.config_data = config
         self.on_save = on_save
 
@@ -132,7 +132,7 @@ class QuickBooksDowngradeGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("QuickBooks TimeWarp\u00ae by Our System Administrator")
-        self.root.geometry("1100x430")
+        self.root.geometry("1000x430")
 
         self.config_manager = ConfigManager()
         self.config = self.config_manager.load()
@@ -169,6 +169,7 @@ class QuickBooksDowngradeGUI:
         ttk.Button(top, text="Add QBW Files", command=self._add_files).pack(side=LEFT, padx=4)
         ttk.Button(top, text="Remove Selected", command=self._remove_selected).pack(side=LEFT, padx=4)
         ttk.Button(top, text="Settings", command=self._open_settings).pack(side=LEFT, padx=4)
+        # add time warp graphic
 
         self.btn_start = ttk.Button(top, text="Start Processing", command=self._start_processing)
         self.btn_start.pack(side=RIGHT, padx=4)
@@ -179,7 +180,7 @@ class QuickBooksDowngradeGUI:
         self.drop_frame.pack(fill=tk.X, padx=10, pady=(4, 2))
         self.drop_label = tk.Label(
             self.drop_frame,
-            text="📂  Drag .QBW files onto Launch TimeWarp  —  or click Add QBW Files above",
+            text="📂  Drag .QBW files here to Launch TimeWarp  —  or click Add QBW Files above",
             bg="#2a3a4a", fg="#8ab4d8", font=("Segoe UI", 10),
             padx=20, pady=6, cursor="hand2",
         )
@@ -214,7 +215,7 @@ class QuickBooksDowngradeGUI:
         self.tree.heading("status", text="Status")
         self.tree.heading("message", text="Message")
 
-        self.tree.column("file", width=620)
+        self.tree.column("file", width=580)
         self.tree.column("status", width=110)
         self.tree.column("message", width=330)
 
@@ -245,7 +246,7 @@ class QuickBooksDowngradeGUI:
         )
         status_label.pack(fill=tk.X, padx=10, pady=(0, 4))
 
-        log_frame = ttk.LabelFrame(self.root, text="Activity Log", padding=8)
+        log_frame = ttk.LabelFrame(self.root, text="Activity/Progress Log", padding=8)
         log_frame.pack(fill=BOTH, expand=True, padx=10, pady=4)
 
         self.log_text = tk.Text(
@@ -275,7 +276,7 @@ class QuickBooksDowngradeGUI:
         footer.pack(fill=tk.X, side=tk.BOTTOM)
         tk.Label(
             footer,
-            text="oursystemadmin.com  •  liveremotesupport.com",
+            text="oursystemadmin.com  •  liveremotesupport.net",
             bg="#1e293b", fg="#64748b", font=("Segoe UI", 8),
             padx=10, pady=4, cursor="hand2",
         ).pack(side=LEFT)
