@@ -141,36 +141,7 @@ class FinishDialog(tk.Toplevel):
                   relief="flat", padx=14, pady=8, cursor="hand2",
                   ).pack(fill=X, pady=(10, 4))
 
-        # Password reminder
-        pw_note = tk.Frame(body, bg="#1e293b", padx=10, pady=8)
-        pw_note.pack(fill=X, pady=(8, 4))
-        tk.Label(pw_note, text="🔑  Password Note:",
-                 bg="#1e293b", fg="#fbbf24",
-                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        tk.Label(pw_note,
-                 text="The converted file's admin password is:  Fl0640098!@!\n"
-                      "To change it: Open in QuickBooks 2021 → Company → "
-                      "Set Up Users and Passwords → Change Your Password",
-                 bg="#1e293b", fg="#94a3b8",
-                 font=("Segoe UI", 8), justify="left",
-                 wraplength=560).pack(anchor="w", pady=(2, 0))
-
-        # Review prompt
-        review_frame = tk.Frame(body, bg="#0f172a")
-        review_frame.pack(fill=X, pady=(14, 4))
-        tk.Label(review_frame, text="Enjoying QuickBooks TimeWarp®? Leave us a review:",
-                 bg="#0f172a", fg="#e2e8f0",
-                 font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        btn_row = tk.Frame(review_frame, bg="#0f172a")
-        btn_row.pack(fill=X, pady=(6, 0))
-        for label, url in REVIEW_URLS.items():
-            tk.Button(btn_row, text=f"★  {label}",
-                      command=lambda u=url: webbrowser.open(u),
-                      bg="#1e293b", fg="#facc15",
-                      activebackground="#334155", activeforeground="#facc15",
-                      font=("Segoe UI", 9, "bold"),
-                      relief="flat", padx=10, pady=6, cursor="hand2",
-                      ).pack(side=LEFT, padx=(0, 6))
+        # (Review section removed — Matt Mike internal build)
 
         # Footer / Close
         footer = tk.Frame(self, bg="#0f172a", padx=20, pady=10)

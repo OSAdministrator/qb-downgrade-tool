@@ -37,8 +37,8 @@ class TimeoutConfig:
 class QBInstallPaths:
     qb_2023_path: str = r"C:\Program Files\Intuit\QuickBooks 2023\QBWPremierAccountant.exe"
     qb_2021_path: str = r"C:\Program Files (x86)\Intuit\QuickBooks 2021\QBW32PremierAccountant.exe"
-    qb_2021_template_path: str = r"C:\QB-TimeWarp\Working\QB-2021 Template\Blank Template.qbw"
-    qb_2021_template_password: str = "Fl0640098!@!"
+    qb_2021_template_path: str = r"C:\QB-TimeWarp\QB-2021 Template\Tax-Man-Mike-Template.qbw"
+    qb_2021_template_password: str = "3825You171"
 
 
 @dataclass

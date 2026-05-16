@@ -6,6 +6,7 @@ Uses pywinauto/pyautogui when available, with a dry-run fallback for testing.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -72,15 +73,18 @@ class QuickBooksAutomationEngine:
         self.validator = ValidationReportBuilder()
         self._qb2023_app: Optional[object] = None
         self._qb2021_app: Optional[object] = None
+        self._watchdog: Optional[object] = None  # DialogWatchdog reference for pause/resume
         # Tracks whether password was already entered during QB startup dialogs.
         # Used to prevent redundant _open_company_file() call in _export_from_qb2023().
         # See bug note in _export_from_qb2023() for details.
         self._startup_password_handled: bool = False
 
     def _emit(self, msg: str, log_fn: Optional[LogFn]) -> None:
-        self.logger.info(msg)
+        # Sanitize non-ASCII characters that break Windows console/file encoding
+        safe_msg = msg.encode('ascii', 'replace').decode('ascii')
+        self.logger.info(safe_msg)
         if log_fn:
-            log_fn(msg)
+            log_fn(safe_msg)
 
     def _with_retries(self, fn: Callable[[], None], step_name: str, log_fn: Optional[LogFn]) -> None:
         attempts = self.config.retry_attempts + 1
@@ -134,7 +138,14 @@ class QuickBooksAutomationEngine:
         self._ensure_automation_ready()
         return Desktop(backend="uia")
 
-    def _find_qb_main_window(self, app: Optional[object], version_hint: Optional[str], timeout_s: int):
+    def _find_qb_main_window(self, app: Optional[object], version_hint: Optional[str], timeout_s: int, include_hidden: bool = False, log_fn: Optional[LogFn] = None):
+        """Find the QB main window.
+
+        When *include_hidden* is True the visibility check is skipped so
+        windows hidden by the watchdog are still returned.  This is
+        necessary for the QB 2021 import phase because the watchdog hides
+        the main window before the company fully loads.
+        """
         def _is_own_gui(title: str) -> bool:
             """Return True if *title* belongs to our own GUI, not real QB."""
             tl = title.lower()
@@ -144,7 +155,9 @@ class QuickBooksAutomationEngine:
             if app is not None:
                 try:
                     for win in app.windows():
-                        if not win.exists() or not win.is_visible():
+                        if not win.exists():
+                            continue
+                        if not include_hidden and not win.is_visible():
                             continue
                         title = win.window_text()
                         if _is_own_gui(title):
@@ -154,7 +167,7 @@ class QuickBooksAutomationEngine:
                         if re.search(self.QB_WINDOW_RE, title):
                             return win
                     top = app.top_window()
-                    if top.exists() and top.is_visible():
+                    if top.exists() and (include_hidden or top.is_visible()):
                         title = top.window_text() or ""
                         if not _is_own_gui(title):
                             return top
@@ -163,9 +176,9 @@ class QuickBooksAutomationEngine:
 
             desktop = self._get_desktop()
             candidates = []
-            for w in desktop.windows(title_re=self.QB_WINDOW_RE):
+            for w in desktop.windows(title_re=self.QB_WINDOW_RE, visible_only=not include_hidden):
                 try:
-                    if not w.is_visible():
+                    if not include_hidden and not w.is_visible():
                         continue
                     title = w.window_text()
                     if _is_own_gui(title):
@@ -182,20 +195,78 @@ class QuickBooksAutomationEngine:
                 return None
             candidates.sort(key=lambda x: x[0], reverse=True)
             return candidates[0][1]
-
         box: Dict[str, object] = {}
+        poll_count = 0
 
         def _cond() -> bool:
+            nonlocal poll_count
+            poll_count += 1
             win = _pick_window()
             if win is not None:
                 box["window"] = win
                 return True
+            # Log a window census every 30 polls to aid debugging
+            if poll_count % 30 == 0:
+                try:
+                    import win32gui  # type: ignore[import-untyped]
+                    titles = []
+                    def _enum_cb(hwnd, _):
+                        if win32gui.IsWindowVisible(hwnd):
+                            t = win32gui.GetWindowText(hwnd)
+                            if t:
+                                titles.append(t)
+                        return True
+                    win32gui.EnumWindows(_enum_cb, None)
+                    if log_fn:
+                        log_fn(f"  [WindowCensus] Poll #{poll_count}: {len(titles)} visible windows")
+                        for t in titles:
+                            if "quickbooks" in t.lower() or "qb" in t.lower() or "intuit" in t.lower():
+                                log_fn(f"    QB-related: '{t}'")
+                except Exception:
+                    pass
             return False
 
         if not self._wait_until(_cond, timeout_s, 1.0):
+            # Last-ditch: try win32gui.FindWindow for any QB window
+            try:
+                import win32gui  # type: ignore[import-untyped]
+                all_qb = []
+                def _enum_all(hwnd, _):
+                    t = win32gui.GetWindowText(hwnd)
+                    if t and "quickbooks" in t.lower():
+                        all_qb.append((hwnd, t, win32gui.IsWindowVisible(hwnd)))
+                    return True
+                win32gui.EnumWindows(_enum_all, None)
+                if all_qb and log_fn:
+                    log_fn(f"  [win32gui] Found {len(all_qb)} QB windows after timeout:")
+                    for hwnd, t, vis in all_qb:
+                        log_fn(f"    hwnd={hwnd} vis={vis} title='{t}'")
+                    # If we found a matching window, try to wrap it
+                    for hwnd, t, vis in all_qb:
+                        if version_hint and version_hint in t:
+                            if not vis:
+                                import win32con  # type: ignore[import-untyped]
+                                win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+                            try:
+                                desktop = self._get_desktop()
+                                for w in desktop.windows(visible_only=False):
+                                    try:
+                                        if w.handle == hwnd:
+                                            box["window"] = w
+                                            if log_fn:
+                                                log_fn(f"  [win32gui] Recovered QB window via hwnd={hwnd}")
+                                            return box["window"]
+                                    except Exception:
+                                        continue
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
             hint_text = f" ({version_hint})" if version_hint else ""
             raise RuntimeError(f"Could not find QuickBooks main window{hint_text} within {timeout_s}s")
 
+        return box["window"]
         return box["window"]
 
     def _focus_window(self, window) -> None:
@@ -210,6 +281,25 @@ class QuickBooksAutomationEngine:
                 btn = dialog.child_window(title_re=fr"(?i){re.escape(label)}", control_type="Button")
                 if btn.exists(timeout=1):
                     btn.wrapper_object().click_input()
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        # Fallback: try without control_type filter (some buttons are custom controls)
+        for label in labels:
+            try:
+                btn = dialog.child_window(title_re=fr"(?i){re.escape(label)}")
+                if btn.exists(timeout=0.5):
+                    try:
+                        btn.wrapper_object().click_input()
+                    except Exception:
+                        # Last resort: focus and send Enter
+                        try:
+                            btn.set_focus()
+                            time.sleep(0.1)
+                            if send_keys is not None:
+                                send_keys("{ENTER}")
+                        except Exception:
+                            continue
                     return True
             except Exception:  # noqa: BLE001
                 continue
@@ -300,6 +390,389 @@ class QuickBooksAutomationEngine:
                 continue
         return None
 
+    def _check_prefs_dialog(self) -> bool:
+        """Check if a Preferences dialog is currently open."""
+        try:
+            desktop = self._get_desktop()
+            for win in desktop.windows():
+                try:
+                    t = (win.window_text() or "").lower()
+                    if "preferences" in t and win.is_visible():
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _click_at(x: int, y: int, log_fn=None):
+        """Click at absolute screen coordinates using ctypes (works even when
+        pywinauto/pyautogui fail with QB's custom controls)."""
+        import ctypes
+        # Move cursor
+        ctypes.windll.user32.SetCursorPos(x, y)
+        time.sleep(0.15)
+        # Left button down + up
+        MOUSEEVENTF_LEFTDOWN = 0x0002
+        MOUSEEVENTF_LEFTUP   = 0x0004
+        ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.05)
+        ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        time.sleep(0.3)
+
+    def _dismiss_enterprise_popup_by_coords(self, main_window, log_fn=None) -> bool:
+        """Find the Enterprise upgrade popup and click 'Maybe later' using
+        screen coordinates.  The popup is a child of the QB window with known
+        layout: 'Maybe later' is a link in the lower-left area.
+        Returns True if a popup was found and clicked."""
+        try:
+            import win32gui
+        except ImportError:
+            return False
+
+        dismissed = False
+        def _enum(hwnd, _):
+            nonlocal dismissed
+            if dismissed:
+                return False
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            title = win32gui.GetWindowText(hwnd) or ""
+            title_l = title.lower()
+            # Match the Enterprise popup by its content keywords
+            if any(kw in title_l for kw in ('enterprise', 'get the latest', 'upgrade')):
+                rect = win32gui.GetWindowRect(hwnd)
+                if rect:
+                    left, top, right, bottom = rect
+                    w = right - left
+                    h = bottom - top
+                    if w > 100 and h > 100:  # sanity check
+                        # "Maybe later" is typically in the lower-left area
+                        # approximately 25% from left, 90% from top
+                        click_x = left + int(w * 0.25)
+                        click_y = top + int(h * 0.92)
+                        self._emit(f"  Dismissing Enterprise popup at ({click_x},{click_y}) rect={rect}", log_fn)
+                        self._click_at(click_x, click_y, log_fn)
+                        dismissed = True
+                        return False
+            return True
+
+        try:
+            win32gui.EnumWindows(_enum, None)
+        except Exception:
+            pass
+
+        # Also try: look for the popup as a child of the main QB window
+        if not dismissed and main_window:
+            main_hwnd = getattr(main_window, 'handle', 0)
+            if main_hwnd:
+                def _enum_child(hwnd, _):
+                    nonlocal dismissed
+                    if dismissed:
+                        return False
+                    try:
+                        text = win32gui.GetWindowText(hwnd) or ""
+                        if any(kw in text.lower() for kw in ('enterprise', 'get the latest', 'maybe later')):
+                            rect = win32gui.GetWindowRect(hwnd)
+                            if rect:
+                                left, top, right, bottom = rect
+                                # Click the center of this element (could be the link itself)
+                                cx = (left + right) // 2
+                                cy = (top + bottom) // 2
+                                self._emit(f"  Dismissing via child '{text}' at ({cx},{cy})", log_fn)
+                                self._click_at(cx, cy, log_fn)
+                                dismissed = True
+                                return False
+                    except Exception:
+                        pass
+                    return True
+                try:
+                    win32gui.EnumChildWindows(main_hwnd, _enum_child, None)
+                except Exception:
+                    pass
+
+        # ---- Fallback: click "Maybe later" at known position relative to
+        # main QB window.  The Enterprise popup is often an embedded pane
+        # inside the QB window, not a separate top-level window, so
+        # EnumWindows can't find it.  From screenshots, "Maybe later" is
+        # at approximately (left+250, bottom-30) of the main window.
+        if not dismissed and main_window:
+            main_hwnd = getattr(main_window, 'handle', 0)
+            if main_hwnd and win32gui:
+                try:
+                    rect = win32gui.GetWindowRect(main_hwnd)
+                    if rect:
+                        left, top, right, bottom = rect
+                        # "Maybe later" appears at ~55% from left, ~95% from top
+                        # of the QB window when the Enterprise panel is embedded.
+                        w = right - left
+                        h = bottom - top
+                        candidates = [
+                            (left + int(w * 0.50), top + int(h * 0.95)),  # 50% x, 95% y
+                            (left + int(w * 0.55), top + int(h * 0.95)),  # 55% x, 95% y
+                            (left + int(w * 0.45), top + int(h * 0.95)),  # 45% x, 95% y
+                            (left + int(w * 0.50), top + int(h * 0.93)),  # 50% x, 93% y
+                        ]
+                        for cx, cy in candidates:
+                            self._emit(f"  Enterprise fallback: clicking at ({cx},{cy})", log_fn)
+                            self._click_at(cx, cy, log_fn)
+                            time.sleep(1.0)
+                            # Check if popup disappeared by seeing if a menu responds now
+                            # (We can't easily verify, so just try all candidates)
+                        dismissed = True  # We tried — can't confirm but worth attempting
+                except Exception:
+                    pass
+
+        return dismissed
+
+    def _open_menu_by_coords(self, main_window, menu_name: str, submenu_name: str, log_fn=None) -> bool:
+        """Open a QB menu item by clicking at approximate screen coordinates.
+        Uses the main window's position + known menu bar offsets.
+        Returns True if a dialog matching submenu_name appeared."""
+        try:
+            import win32gui
+        except ImportError:
+            return False
+
+        main_hwnd = getattr(main_window, 'handle', 0)
+        if not main_hwnd:
+            return False
+
+        rect = win32gui.GetWindowRect(main_hwnd)
+        if not rect:
+            return False
+        left, top, right, bottom = rect
+
+        # QB 2021 menu bar layout (approximate x-offsets from window left edge):
+        # File=30, Edit=70, View=100, Lists=140, Favorites=195, Accountant=260,
+        # Company=335, Customers=410, Vendors=470, Employees=535, Banking=605
+        menu_offsets = {
+            "File": 30, "Edit": 70, "View": 105, "Lists": 145,
+            "Favorites": 200, "Accountant": 265, "Company": 340,
+            "Customers": 415, "Vendors": 478, "Employees": 545, "Banking": 610,
+            "Reports": 670,
+        }
+        menu_y_offset = 52  # menu bar is ~52px below window top (title bar + toolbar)
+
+        if menu_name not in menu_offsets:
+            self._emit(f"  _open_menu_by_coords: unknown menu '{menu_name}'", log_fn)
+            return False
+
+        # Click the menu name
+        click_x = left + menu_offsets[menu_name]
+        click_y = top + menu_y_offset
+        self._emit(f"  Clicking menu '{menu_name}' at ({click_x},{click_y})", log_fn)
+        self._click_at(click_x, click_y, log_fn)
+        time.sleep(1.5)
+
+        # Now find the submenu item in the dropdown
+        # The dropdown menu items are a separate window — look for them
+        desktop = self._get_desktop()
+        for win in desktop.windows():
+            try:
+                t = (win.window_text() or "").lower()
+                if submenu_name.lower() in t and win.is_visible():
+                    self._emit(f"  Found submenu dialog '{win.window_text()}'!", log_fn)
+                    return True
+            except Exception:
+                continue
+
+        # Didn't find the dialog — try navigating the dropdown.
+        # The dropdown is a standard Win32 popup menu — use keyboard to navigate.
+        from pywinauto.keyboard import send_keys as _sk
+
+        if menu_name == "Edit" and submenu_name.lower() == "preferences":
+            # Preferences is typically the LAST item in QB Edit menu.
+            # Try multiple approaches:
+            # 1. Press 'e' for Preferences (mnemonic might be 'e' not 'r')
+            for key in ("e", "r", "p"):
+                _sk(key)
+                time.sleep(2)
+                if self._check_prefs_dialog():
+                    self._emit(f"  Preferences opened with key '{key}'!", log_fn)
+                    return True
+                # Close menu if wrong item was triggered
+                _sk("{ESC}")
+                time.sleep(0.3)
+                # Re-open Edit menu
+                self._click_at(click_x, click_y, log_fn)
+                time.sleep(1.5)
+
+            # 2. Use END + ENTER (last item)
+            _sk("{END}")
+            time.sleep(0.3)
+            _sk("{ENTER}")
+            time.sleep(3)
+            if self._check_prefs_dialog():
+                return True
+
+            # 3. Arrow-down 20 times + ENTER (brute force to last item)
+            _sk("{ESC}")
+            time.sleep(0.3)
+            self._click_at(click_x, click_y, log_fn)
+            time.sleep(1.5)
+            for _ in range(20):
+                _sk("{DOWN}")
+                time.sleep(0.1)
+            _sk("{ENTER}")
+            time.sleep(3)
+
+        elif menu_name == "Company" and "my company" in submenu_name.lower():
+            # "My Company" — mnemonic is likely 'm' (first letter)
+            for key in ("m", "y"):
+                _sk(key)
+                time.sleep(2)
+                # Check if Company Information dialog appeared
+                desktop = self._get_desktop()
+                for win in desktop.windows():
+                    try:
+                        t = (win.window_text() or "").lower()
+                        if ("company information" in t or "my company" in t) and win.is_visible():
+                            self._emit(f"  My Company opened with key '{key}'!", log_fn)
+                            return True
+                    except Exception:
+                        continue
+                # Wrong item — escape and re-open
+                _sk("{ESC}")
+                time.sleep(0.3)
+                self._click_at(click_x, click_y, log_fn)
+                time.sleep(1.5)
+
+            # Arrow down to "My Company" (it's around position 6 in the menu)
+            for _ in range(6):
+                _sk("{DOWN}")
+                time.sleep(0.1)
+            _sk("{ENTER}")
+            time.sleep(3)
+
+        return False
+
+    def _nuke_all_popups(self, main_window, log_fn: Optional[LogFn], tag: str = "") -> bool:
+        """Aggressively find and close ALL popup/dialog windows that aren't the
+        main QB company window.  Uses win32gui.EnumWindows (catches everything
+        including embedded dialogs) plus pywinauto desktop.windows() for
+        clicking labelled buttons.  Returns True if any popup was closed."""
+        import ctypes
+        import ctypes.wintypes
+        try:
+            import win32gui, win32con
+        except ImportError:
+            win32gui = win32con = None  # type: ignore
+
+        closed_any = False
+        main_hwnd = getattr(main_window, "handle", 0) if main_window else 0
+
+        # Popup-title keywords (lower-cased)
+        _popup_kw = (
+            'enterprise', 'upgrade', 'get the latest', 'update',
+            'new feature', "what's new", 'whats new', 'usage', 'analytics',
+            'study', 'faq', 'have a question', 'coach', 'learning center',
+            'accountant center', 'getting started', 'tips', 'home page',
+            'quickbooks home', 'quickbooks desktop', 'create backup',
+            'backup', 'did you know',
+        )
+        # Button labels we want to click to dismiss (order = preference)
+        _dismiss_btns = [
+            "Maybe later", "Continue", "OK", "Close", "No", "Skip",
+            "Later", "Cancel", "Not Now", "Dismiss", "X",
+        ]
+
+        # ---- Pass 1: win32gui raw enumeration ----
+        if win32gui:
+            BM_CLICK = 0x00F5
+            WM_CLOSE = 0x0010
+
+            def _enum_callback(hwnd, _extra):
+                nonlocal closed_any
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                if hwnd == main_hwnd:
+                    return True
+                title = win32gui.GetWindowText(hwnd) or ""
+                title_l = title.lower()
+                # Skip the main QB company window (regex match)
+                if re.search(self.QB_WINDOW_RE, title) and not any(k in title_l for k in _popup_kw):
+                    return True
+                if not any(k in title_l for k in _popup_kw):
+                    return True
+                # Found a popup — try to click a dismiss button inside it
+                self._emit(f"  {tag}: win32gui found popup hwnd={hwnd} title='{title}'", log_fn)
+                clicked = False
+                def _find_btn(child_hwnd, _):
+                    nonlocal clicked
+                    if clicked:
+                        return False  # stop enumerating
+                    try:
+                        btn_text = win32gui.GetWindowText(child_hwnd) or ""
+                        for lbl in _dismiss_btns:
+                            if lbl.lower() in btn_text.lower():
+                                self._emit(f"  {tag}: clicking button '{btn_text}' via BM_CLICK", log_fn)
+                                win32gui.SendMessage(child_hwnd, BM_CLICK, 0, 0)
+                                clicked = True
+                                return False
+                    except Exception:
+                        pass
+                    return True
+                try:
+                    win32gui.EnumChildWindows(hwnd, _find_btn, None)
+                except Exception:
+                    pass
+                if not clicked:
+                    # No button found — just close the window
+                    try:
+                        win32gui.PostMessage(hwnd, WM_CLOSE, 0, 0)
+                        self._emit(f"  {tag}: sent WM_CLOSE to popup hwnd={hwnd}", log_fn)
+                    except Exception:
+                        pass
+                closed_any = True
+                time.sleep(0.3)
+                return True
+
+            try:
+                win32gui.EnumWindows(_enum_callback, None)
+            except Exception:
+                pass
+
+        # ---- Pass 2: pywinauto desktop.windows() (catches things win32gui might miss) ----
+        try:
+            desktop = self._get_desktop()
+            for win in desktop.windows():
+                try:
+                    if not win.is_visible():
+                        continue
+                    if getattr(win, 'handle', 0) == main_hwnd:
+                        continue
+                    t = (win.window_text() or "").lower()
+                    if re.search(self.QB_WINDOW_RE, win.window_text() or "") and not any(k in t for k in _popup_kw):
+                        continue
+                    if not any(k in t for k in _popup_kw):
+                        continue
+                    self._emit(f"  {tag}: pywinauto found popup '{win.window_text()}'", log_fn)
+                    clicked = self._click_first_button(win, _dismiss_btns)
+                    if not clicked:
+                        try:
+                            win.close()
+                        except Exception:
+                            pass
+                    closed_any = True
+                    time.sleep(0.3)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # ---- Re-focus main window ----
+        if main_window:
+            try:
+                if win32gui and main_hwnd:
+                    ctypes.windll.user32.SetForegroundWindow(main_hwnd)
+                main_window.set_focus()
+            except Exception:
+                pass
+
+        return closed_any
+
     def _dismiss_common_dialogs(self, log_fn: Optional[LogFn]) -> None:
         desktop = self._get_desktop()
         for dialog in desktop.windows():
@@ -360,11 +833,17 @@ class QuickBooksAutomationEngine:
                         "product information",
                         "new feature",
                         "intuit",
+                        "usage",
+                        "analytics",
+                        "study",
+                        "survey",
+                        "have a question",
+                        "faq",
                     ]
                 ):
                     clicked = self._click_first_button(
                         dialog,
-                        ["No", "Don't Save", "Continue", "Yes", "OK", "Close", "Cancel", "Later", "Skip"],
+                        ["Continue", "OK", "Yes", "No", "Don't Save", "Close", "Skip", "Later", "Cancel"],
                     )
                     if clicked:
                         self._emit(f"Dismissed dialog: {title}", log_fn)
@@ -396,6 +875,14 @@ class QuickBooksAutomationEngine:
             "coach",
             "did you know",
             "quickbooks desktop",  # generic splash / promo windows
+            "usage",
+            "analytics",
+            "study",
+            "have a question",
+            "faq",
+            "enterprise",
+            "upgrade",
+            "get the latest",
         ]
 
         closed_any = False
@@ -418,7 +905,7 @@ class QuickBooksAutomationEngine:
                 if any(hint in title_l for hint in popup_hints):
                     # Try clicking common close/dismiss buttons first
                     clicked = self._click_first_button(
-                        win, ["Close", "OK", "No", "Cancel", "Skip", "Later", "X"]
+                        win, ["Continue", "Close", "OK", "No", "Skip", "Later", "X", "Cancel"]
                     )
                     if not clicked:
                         # Fall back to closing the window directly
@@ -776,7 +1263,14 @@ class QuickBooksAutomationEngine:
 
             if company_hint:
                 # Positive match: the file name must appear in the title
-                found = company_hint.lower() in title.lower()
+                # Normalize: strip non-ASCII, collapse whitespace
+                import re as _re
+                norm_title = _re.sub(r'\s+', ' ', title.strip()).lower()
+                norm_hint = company_hint.strip().lower()
+                found = norm_hint in norm_title
+                if not found and poll_count <= 3:
+                    self._emit(f"  [Load] DEBUG: norm_hint={repr(norm_hint)} norm_title={repr(norm_title)}", log_fn)
+                    self._emit(f"  [Load] DEBUG: title hex={title.encode('utf-8', errors='replace').hex()}", log_fn)
             else:
                 # Negative match: "No Company Open" must be absent
                 found = "No Company Open" not in title
@@ -1643,22 +2137,23 @@ class QuickBooksAutomationEngine:
         # instance first. This prevents the "Secondary" window problem where
         # QB opens the new file as a secondary window while the old file
         # remains the primary — QBFC then connects to the wrong company.
+        #
+        # 2026-05-11: Skip the graceful menu-close for stale instances.
+        # The old _close_qb path gets stuck on password dialogs from cached
+        # company files, wasting 90+ seconds before force-killing anyway.
+        # Just force-kill immediately — we don't care about data in the
+        # stale instance (we're about to open a fresh template).
         if qbw_path:
-            try:
-                existing = Application(backend="uia").connect(path=exe_path)
-                self._emit(f"  Killing existing QB instance before clean launch...", log_fn)
-                self._close_qb(existing, log_fn)
-                time.sleep(5)  # give QB time to fully exit
-            except Exception:  # noqa: BLE001
-                pass  # not running — good
-
-            # Also force-kill any lingering QB processes
             import subprocess
-            subprocess.run(
-                ["taskkill", "/F", "/IM", exe_name],
-                capture_output=True, timeout=10
-            )
-            time.sleep(3)
+            self._emit(f"  Force-killing any existing QB instance before clean launch...", log_fn)
+            for img in (exe_name, "QBW32.EXE", "QBW.EXE",
+                        "QBW32PremierAccountant.exe", "QBWPremierAccountant.exe",
+                        "qbw32.exe", "qbw.exe"):
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", img],
+                    capture_output=True, timeout=10
+                )
+            time.sleep(5)  # give Windows time to release file locks
 
             cmd_line = f'"{exe_path}" "{qbw_path}"'
             self._emit(f"  Starting QB with command: {cmd_line}", log_fn)
@@ -1675,6 +2170,476 @@ class QuickBooksAutomationEngine:
 
         app = Application(backend="uia").start(exe_path)
         return app
+
+    def _set_accounting_preferences_via_ui(
+        self,
+        qb_app,
+        prefs: Dict[str, Any],
+        log_fn: Optional[LogFn] = None,
+    ) -> bool:
+        """Enable 'Use account numbers' and other accounting preferences via UI.
+
+        QBFC PreferencesModRq is unsupported in QB 2021.
+        Approach: pure keyboard navigation (most reliable across QB versions).
+          Edit → Preferences → Accounting (already selected, it's first) →
+          Company Preferences tab → check boxes → OK.
+        """
+        from pywinauto.keyboard import send_keys as _sk
+
+        acct_prefs = (prefs or {}).get("accounting") or {}
+        use_acct_numbers = str(acct_prefs.get("is_using_account_numbers", "")).lower() in ("true", "1", "yes")
+        use_class_tracking = str(acct_prefs.get("is_using_class_tracking", "")).lower() in ("true", "1", "yes")
+
+        if not use_acct_numbers and not use_class_tracking:
+            self._emit("  AcctPrefsUI: nothing to set (both disabled in source)", log_fn)
+            return True
+
+        self._emit(f"  AcctPrefsUI: need account_numbers={use_acct_numbers}, class_tracking={use_class_tracking}", log_fn)
+
+        # ── Quick check: are the preferences ALREADY set in the template? ──
+        # If the user pre-configured the template, skip the entire UI dance.
+        # Open a brief QBFC session to query current preferences.
+        try:
+            from qbfc_export import open_qbfc_session
+            sess = open_qbfc_session(log_fn=log_fn)
+            try:
+                req_set = sess.session_manager.CreateMsgSetRequest("US", sess.major_version, sess.minor_version)
+                req_set.AppendPreferencesQueryRq()
+                resp_set = sess.session_manager.DoRequests(req_set)
+                resp = resp_set.ResponseList.GetAt(0)
+                already_ok = True
+                if resp.StatusCode == 0 and resp.Detail is not None:
+                    detail = resp.Detail
+                    acct_pref = getattr(detail, "AccountingPreferences", None)
+                    if acct_pref:
+                        cur_acct_nums = getattr(acct_pref, "IsUsingAccountNumbers", None)
+                        cur_class     = getattr(acct_pref, "IsUsingClassTracking", None)
+                        cur_an = str(getattr(cur_acct_nums, "GetValue", lambda: "")()).lower() in ("true", "1") if cur_acct_nums else False
+                        cur_ct = str(getattr(cur_class,     "GetValue", lambda: "")()).lower() in ("true", "1") if cur_class     else False
+                        self._emit(f"  AcctPrefsUI: current values — account_numbers={cur_an}, class_tracking={cur_ct}", log_fn)
+                        if use_acct_numbers and not cur_an:
+                            already_ok = False
+                        if use_class_tracking and not cur_ct:
+                            already_ok = False
+                    else:
+                        already_ok = False
+                else:
+                    already_ok = False
+            finally:
+                sess.end()
+
+            if already_ok:
+                self._emit("  AcctPrefsUI: preferences ALREADY SET in template — skipping UI automation!", log_fn)
+                return True
+            else:
+                self._emit("  AcctPrefsUI: preferences NOT set yet, proceeding with UI automation...", log_fn)
+        except Exception as qe:
+            self._emit(f"  AcctPrefsUI: QBFC prefs check failed ({qe}), proceeding with UI...", log_fn)
+
+        try:
+            # Ensure QB window is visible and focused.
+            # The watchdog uses SW_HIDE which persists even after the watchdog
+            # pauses — we MUST use ShowWindow(SW_SHOW) to make it visible again.
+            main = None
+            try:
+                main = self._find_qb_main_window(qb_app, "2021", 30,
+                                                  include_hidden=True, log_fn=log_fn)
+                try:
+                    import ctypes
+                    hwnd = main.handle
+                    SW_SHOW = 5
+                    SW_RESTORE = 9
+                    ctypes.windll.user32.ShowWindow(hwnd, SW_SHOW)
+                    ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+                    self._emit("  AcctPrefsUI: force-showed QB window via ShowWindow", log_fn)
+                except Exception as e:
+                    self._emit(f"  AcctPrefsUI: ShowWindow fallback: {e}", log_fn)
+                    main.restore()
+                main.set_focus()
+            except Exception:
+                try:
+                    qb_app.top_window().set_focus()
+                except Exception:
+                    pass
+            time.sleep(1)
+
+            # ── Aggressively dismiss ALL popups/dialogs BEFORE trying Preferences ──
+            self._emit("  AcctPrefsUI: aggressively dismissing all popups...", log_fn)
+            self._nuke_all_popups(main, log_fn, tag="AcctPrefsUI")
+            time.sleep(1.0)
+
+            # Open Edit → Preferences via keyboard — with retry loop
+            # The Enterprise upgrade popup can steal focus at any moment,
+            # so we retry up to 3 times: dismiss popups → try menu → check.
+            prefs_found = False
+            for attempt in range(3):
+                self._emit(f"  AcctPrefsUI: attempt {attempt+1}/3 to open Preferences...", log_fn)
+
+                # Dismiss any popup that appeared between attempts
+                self._nuke_all_popups(main, log_fn, tag="AcctPrefsUI")
+                time.sleep(1)
+
+                # --- Method 1: Raw mouse-click on Edit menu bar item ---
+                # QB's menu bar doesn't respond to pywinauto menu_select or
+                # UIA MenuItem.click_input.  Use raw ctypes mouse clicks.
+                self._emit("  AcctPrefsUI: Method 1 — raw mouse click on Edit menu...", log_fn)
+                # First dismiss Enterprise popup if present
+                self._dismiss_enterprise_popup_by_coords(main, log_fn)
+                time.sleep(0.5)
+                # Click Edit menu in the menu bar
+                self._open_menu_by_coords(main, "Edit", "Preferences", log_fn)
+
+                prefs_found = self._check_prefs_dialog()
+                if prefs_found:
+                    self._emit("  AcctPrefsUI: Preferences dialog found after mouse-click!", log_fn)
+                    break
+
+                # --- Method 2: pywinauto menu_select ---
+                self._emit("  AcctPrefsUI: Method 2 — menu_select...", log_fn)
+                _sk("{ESC}")
+                time.sleep(0.5)
+                try:
+                    main.menu_select("Edit->Preferences")
+                    self._emit("  AcctPrefsUI: menu_select succeeded", log_fn)
+                    time.sleep(3)
+                except Exception as me:
+                    self._emit(f"  AcctPrefsUI: menu_select failed: {me}", log_fn)
+
+                prefs_found = self._check_prefs_dialog()
+                if prefs_found:
+                    self._emit("  AcctPrefsUI: Preferences dialog found after menu_select!", log_fn)
+                    break
+
+                # --- Method 3: keyboard Alt+E → END → ENTER ---
+                self._emit("  AcctPrefsUI: Method 3 — keyboard Alt+E...", log_fn)
+                _sk("{ESC}")
+                time.sleep(0.5)
+                _sk("%e")
+                time.sleep(1.0)
+
+                # Check if a popup intercepted — nuke it
+                nuked = self._nuke_all_popups(main, log_fn, tag="AcctPrefsUI")
+                if nuked:
+                    self._dismiss_enterprise_popup_by_coords(main, log_fn)
+                    _sk("{ESC}")
+                    time.sleep(0.5)
+                    continue
+
+                _sk("{END}")
+                time.sleep(0.3)
+                _sk("{ENTER}")
+                time.sleep(3)
+
+                prefs_found = self._check_prefs_dialog()
+                if prefs_found:
+                    self._emit("  AcctPrefsUI: Preferences dialog found after keyboard nav!", log_fn)
+                    break
+
+                _sk("{ESC}")
+                time.sleep(0.5)
+
+            self._emit(f"  AcctPrefsUI: Preferences dialog {'found' if prefs_found else 'NOT FOUND'}", log_fn)
+
+            # "Accounting" is the FIRST category (already selected by default).
+            # Click "Company Preferences" tab — it's a tab control.
+            # The tab order is: My Preferences | Company Preferences
+            # We need to click Company Preferences. Use Ctrl+Tab or click.
+            # In QB Preferences, the tabs respond to mouse clicks.
+            # Use pywinauto to find the dialog and its tabs.
+            time.sleep(1)
+
+            # Try to find and click "Company Preferences" tab
+            for win in desktop.windows():
+                try:
+                    t = (win.window_text() or "").lower()
+                    if "preferences" not in t or not win.is_visible():
+                        continue
+                    # Found the Preferences dialog — click Company Preferences tab
+                    rect = win.rectangle()
+                    self._emit(f"  AcctPrefsUI: Preferences dialog at ({rect.left},{rect.top})-({rect.right},{rect.bottom})", log_fn)
+
+                    # Company Preferences tab is typically in the right half of the tab strip
+                    # Tab strip is near the top of the content area
+                    from pywinauto import mouse as _mouse
+                    tab_y = rect.top + 100  # tabs are about 100px from top
+                    tab_x = rect.left + int((rect.right - rect.left) * 0.65)  # right-ish
+                    _mouse.click(coords=(tab_x, tab_y))
+                    time.sleep(1)
+                    self._emit(f"  AcctPrefsUI: clicked Company Preferences tab at ({tab_x},{tab_y})", log_fn)
+
+                    # Now find "Use account numbers" checkbox
+                    # It's typically at specific coordinates within the dialog.
+                    # The checkbox area is in the main content pane.
+                    # Strategy: use pywinauto to find checkboxes, or use coordinates.
+
+                    # Try pywinauto child_window first (without requiring uia backend)
+                    checked_acct = False
+                    checked_class = False
+                    try:
+                        children = win.children()
+                        for child in children:
+                            try:
+                                ct = child.window_text() or ""
+                                if not ct:
+                                    continue
+                                ct_l = ct.lower()
+                                if use_acct_numbers and "account number" in ct_l:
+                                    try:
+                                        state = child.get_toggle_state()
+                                        if state == 0:
+                                            child.click_input()
+                                            checked_acct = True
+                                            self._emit(f"  AcctPrefsUI: ✓ checked '{ct}'", log_fn)
+                                    except Exception:
+                                        child.click_input()
+                                        checked_acct = True
+                                        self._emit(f"  AcctPrefsUI: ✓ clicked '{ct}'", log_fn)
+                                    time.sleep(0.3)
+                                elif use_class_tracking and "class track" in ct_l:
+                                    try:
+                                        state = child.get_toggle_state()
+                                        if state == 0:
+                                            child.click_input()
+                                            checked_class = True
+                                            self._emit(f"  AcctPrefsUI: ✓ checked '{ct}'", log_fn)
+                                    except Exception:
+                                        child.click_input()
+                                        checked_class = True
+                                        self._emit(f"  AcctPrefsUI: ✓ clicked '{ct}'", log_fn)
+                                    time.sleep(0.3)
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+
+                    if not checked_acct and use_acct_numbers:
+                        # Coordinate fallback: "Use account numbers" is typically
+                        # around 40% from left, 35% from top in the content area
+                        cb_x = rect.left + int((rect.right - rect.left) * 0.12)
+                        cb_y = rect.top + int((rect.bottom - rect.top) * 0.35)
+                        _mouse.click(coords=(cb_x, cb_y))
+                        self._emit(f"  AcctPrefsUI: clicked account numbers at ({cb_x},{cb_y})", log_fn)
+                        time.sleep(0.3)
+
+                    if not checked_class and use_class_tracking:
+                        cb_x = rect.left + int((rect.right - rect.left) * 0.12)
+                        cb_y = rect.top + int((rect.bottom - rect.top) * 0.55)
+                        _mouse.click(coords=(cb_x, cb_y))
+                        self._emit(f"  AcctPrefsUI: clicked class tracking at ({cb_x},{cb_y})", log_fn)
+                        time.sleep(0.3)
+
+                    # Click OK to save
+                    _sk("{ENTER}")
+                    time.sleep(2)
+                    self._emit("  AcctPrefsUI: ✓ Preferences saved", log_fn)
+                    return True
+
+                except Exception as exc:
+                    self._emit(f"  AcctPrefsUI: dialog handling error: {exc}", log_fn)
+                    continue
+
+            self._emit("  AcctPrefsUI: FAILED — could not find Preferences dialog", log_fn)
+            _sk("{ESC}")
+            time.sleep(0.5)
+            return False
+
+        except Exception as exc:
+            self._emit(f"  AcctPrefsUI: FAILED — {exc}", log_fn)
+            try:
+                _sk("{ESC}")
+                time.sleep(0.5)
+                _sk("{ESC}")
+            except Exception:
+                pass
+            return False
+
+    def _set_company_info_via_ui(self, qb_app, info: Dict[str, Any], log_fn: Optional[LogFn] = None) -> bool:
+        """Set company profile via Company → My Company (UI automation).
+
+        QBFC has no CompanyMod method, so we navigate the QB 2021 UI:
+          1. Company menu → My Company
+          2. Tab through edit fields and type values
+          3. OK to save
+
+        Returns True on success.
+        """
+        if not info:
+            self._emit("  CompanyUI: no company info, skipping", log_fn)
+            return False
+
+        # Sanitise all values to ASCII – Windows console encoding chokes on
+        # characters like \u2192 (→) that can appear in QB company names.
+        def _ascii_safe(v):
+            if isinstance(v, str):
+                return v.encode('ascii', 'replace').decode('ascii')
+            return v
+        info = {k: _ascii_safe(v) for k, v in info.items()}
+
+        company_name = info.get("company_name", "")
+        if not company_name:
+            self._emit("  CompanyUI: no company_name in snapshot, skipping", log_fn)
+            return False
+
+        try:
+            main_win = self._find_qb_main_window(qb_app, "2021", timeout_s=15,
+                                                  include_hidden=True)
+            # Force-show the window (watchdog's SW_HIDE persists after pause)
+            try:
+                import ctypes
+                hwnd = main_win.handle
+                ctypes.windll.user32.ShowWindow(hwnd, 5)   # SW_SHOW
+                ctypes.windll.user32.ShowWindow(hwnd, 9)   # SW_RESTORE
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+                self._emit("  CompanyUI: force-showed QB window", log_fn)
+            except Exception:
+                main_win.restore()
+            main_win.set_focus()
+            time.sleep(0.5)
+
+            # Aggressively dismiss all popups before menu navigation
+            self._emit("  CompanyUI: aggressively dismissing all popups...", log_fn)
+            self._nuke_all_popups(main_win, log_fn, tag="CompanyUI")
+            time.sleep(1.0)
+            self._emit("  CompanyUI: Opening Company -> My Company...", log_fn)
+
+            # Navigate: Company menu → My Company
+            # Method 1: Raw mouse-click on Company menu bar item
+            self._emit("  CompanyUI: Method 1 — raw mouse click on Company menu...", log_fn)
+            self._dismiss_enterprise_popup_by_coords(main_win, log_fn)
+            time.sleep(0.5)
+            self._open_menu_by_coords(main_win, "Company", "My Company", log_fn)
+            time.sleep(2)
+
+            # Method 2: pywinauto menu_select
+            dialog = self._find_active_dialog(
+                title_re=r"(?i)(company\s+information|my\s+company)",
+                parent_window=main_win,
+            )
+            if dialog is None:
+                self._emit("  CompanyUI: Method 2 — menu_select...", log_fn)
+                try:
+                    main_win.menu_select("Company->My Company")
+                    self._emit("  CompanyUI: menu_select succeeded", log_fn)
+                except Exception:
+                    self._emit("  CompanyUI: menu_select failed, trying keyboard...", log_fn)
+                    if send_keys:
+                        send_keys("%c")
+                        time.sleep(0.8)
+                        send_keys("m")
+                        time.sleep(0.5)
+
+            time.sleep(2)
+
+            # Find the Company Information dialog
+            dialog = self._find_active_dialog(
+                title_re=r"(?i)(company\s+information|my\s+company)",
+                parent_window=main_win,
+            )
+            if dialog is None:
+                # Try desktop level
+                from pywinauto import Desktop
+                for w in Desktop(backend="uia").windows():
+                    t = w.window_text() or ""
+                    if "company information" in t.lower() or "my company" in t.lower():
+                        dialog = w
+                        break
+
+            if dialog is None:
+                self._emit("  CompanyUI: Company Information dialog not found", log_fn)
+                return False
+
+            self._emit("  CompanyUI: Found Company Information dialog", log_fn)
+            dialog.set_focus()
+            time.sleep(0.5)
+
+            # The Company Information dialog has these fields (typical order):
+            #   Company Name, Legal Name, Address, City, State, Zip, Country,
+            #   Phone, Fax, Email, Website, Legal Address, Legal City, ...
+            #   EIN, SSN, Tax Form
+            # We use Tab to move between fields and Ctrl+A to select existing text.
+
+            edits = dialog.descendants(control_type="Edit")
+            self._emit(f"  CompanyUI: Found {len(edits)} edit fields", log_fn)
+
+            # Build a mapping of field values to set.
+            # We'll log what we find and set company name at minimum.
+            addr = info.get("address") or {}
+            legal_addr = info.get("legal_address") or {}
+
+            # Strategy: Set focus to the first edit (Company Name), then
+            # Tab through all fields setting values in order.
+            # The exact field order depends on QB version, so we'll set
+            # the first field (Company Name) directly, then use Tab for the rest.
+
+            field_sequence = [
+                ("Company Name", company_name),
+                ("Legal Name", info.get("legal_name", "")),
+                # Address block
+                ("Address Line 1", addr.get("addr1", "")),
+                ("Address Line 2", addr.get("addr2", "")),
+                ("Address Line 3", addr.get("addr3", "")),
+                ("City", addr.get("city", "")),
+                ("State", addr.get("state", "")),
+                ("Zip", addr.get("postalcode", "")),
+                ("Country", addr.get("country", "")),
+                # Contact
+                ("Phone", info.get("phone", "")),
+                ("Fax", info.get("fax", "")),
+                ("Email", info.get("email", "")),
+                ("Website", info.get("website", "")),
+                # Legal address
+                ("Legal Address Line 1", legal_addr.get("addr1", "")),
+                ("Legal City", legal_addr.get("city", "")),
+                ("Legal State", legal_addr.get("state", "")),
+                ("Legal Zip", legal_addr.get("postalcode", "")),
+            ]
+
+            # Set each edit field by index
+            set_count = 0
+            for idx, (label, value) in enumerate(field_sequence):
+                if idx >= len(edits):
+                    break
+                if not value:
+                    # Skip empty values but still Tab past the field
+                    continue
+                # Sanitize non-ASCII characters (e.g. → arrow, ® symbols)
+                # to prevent encoding errors in type_keys/set_edit_text
+                value = ''.join(c if ord(c) < 128 else ' ' for c in str(value))
+                if not value.strip():
+                    continue
+                try:
+                    edit = edits[idx]
+                    edit.set_focus()
+                    time.sleep(0.1)
+                    if send_keys:
+                        send_keys("^a")  # Select all
+                        time.sleep(0.05)
+                    try:
+                        edit.set_edit_text(value)
+                    except Exception:
+                        if send_keys:
+                            send_keys("{DELETE}")
+                            time.sleep(0.05)
+                            edit.type_keys(value, with_spaces=True, pause=0.02)
+                    set_count += 1
+                    self._emit(f"    Set {label} = '{value}'", log_fn)
+                except Exception as exc:
+                    self._emit(f"    Could not set {label}: {exc}", log_fn)
+
+            # Click OK to save
+            time.sleep(0.3)
+            ok_clicked = self._click_first_button(dialog, ["OK", "Save", "Close"])
+            if not ok_clicked and send_keys:
+                send_keys("{ENTER}")
+            time.sleep(1)
+
+            self._emit(f"  CompanyUI: Set {set_count} fields for '{company_name}'", log_fn)
+            return set_count > 0
+
+        except Exception as exc:
+            self._emit(f"  CompanyUI: _set_company_info_via_ui failed: {exc}", log_fn)
+            return False
 
     def _close_qb(self, app: Optional[object], log_fn: Optional[LogFn]) -> None:
         """Close QuickBooks using menu navigation (File → Close Company, then
@@ -1699,13 +2664,26 @@ class QuickBooksAutomationEngine:
         # -----------------------------------------------------------
         menu_close_done = False
 
-        # Try to find the QB window and use it
+        # Try to find the QB window and use it.
+        # CRITICAL: pass include_hidden=True because the watchdog may
+        # have hidden the QB window.  After finding it, restore it so
+        # keyboard shortcuts (Ctrl+W, Alt+F4) actually reach it.
         try:
-            main_window = self._find_qb_main_window(app, None, timeout_s=10)
+            main_window = self._find_qb_main_window(app, None, timeout_s=10, include_hidden=True)
             if main_window is not None:
                 try:
+                    # Un-hide the window if the watchdog hid it (SW_RESTORE)
+                    hwnd = main_window.handle
+                    if hwnd:
+                        import win32gui   # type: ignore[import-untyped]
+                        import win32con   # type: ignore[import-untyped]
+                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                        time.sleep(0.3)
+                        win32gui.SetForegroundWindow(hwnd)
+                        time.sleep(0.3)
                     main_window.set_focus()
                     time.sleep(0.5)
+                    self._emit("  QB window found and restored to foreground.", log_fn)
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -1746,22 +2724,93 @@ class QuickBooksAutomationEngine:
         # -----------------------------------------------------------
         # PHASE 2 — Wait for QB to exit gracefully (up to 90s)
         # QB 2021 is slow — it checks for updates during shutdown.
+        # IMPORTANT: QB may pop a password/login dialog during shutdown
+        # (e.g. for a cached company file). If we don't dismiss it,
+        # QB hangs forever and we time out + force-kill.
         # -----------------------------------------------------------
         if menu_close_done:
-            self._emit("  Waiting up to 120s for QB to gracefully exit...", log_fn)
-            deadline = time.time() + 120
+            self._emit("  Waiting up to 90s for QB to exit...", log_fn)
+            # Passwords to try if a login dialog appears during close
+            close_passwords = [
+                self.config.install_paths.qb_2021_template_password,
+                "3825You171",
+                "Fl0640098!@!",
+            ]
+            # De-duplicate while preserving order
+            seen = set()
+            close_passwords = [p for p in close_passwords if not (p in seen or seen.add(p))]
+            close_pw_idx = 0
+            deadline = time.time() + 90
             while time.time() < deadline:
+                # Check if QB exited (check BOTH QB 2021 = QBW32.EXE and QB 2023 = qbw.exe)
                 try:
-                    result = subprocess.run(
-                        ["tasklist", "/FI", "IMAGENAME eq QBW32.EXE"],
-                        capture_output=True, timeout=5, text=True, check=False,
-                    )
-                    if "QBW32.EXE" not in (result.stdout or ""):
+                    still_running = False
+                    for proc_name in ("QBW32.EXE", "qbw.exe"):
+                        result = subprocess.run(
+                            ["tasklist", "/FI", f"IMAGENAME eq {proc_name}"],
+                            capture_output=True, timeout=5, text=True, check=False,
+                        )
+                        if proc_name.upper() in (result.stdout or "").upper():
+                            still_running = True
+                            break
+                    if not still_running:
                         self._emit("  QuickBooks exited cleanly!", log_fn)
                         time.sleep(3)  # let Windows release file locks
                         return  # SUCCESS — no force kill needed
                 except Exception:  # noqa: BLE001
                     pass
+
+                # Check for password/login dialog blocking the close
+                login_dlg = self._find_active_dialog(title_re=r"(?i)(password|login)")
+                if login_dlg is not None and send_keys is not None:
+                    pw = close_passwords[close_pw_idx]
+                    self._emit(f"  Password dialog blocking close — entering password (attempt {close_pw_idx + 1})", log_fn)
+                    # Pause watchdog so it doesn't interfere
+                    if self._watchdog is not None:
+                        self._watchdog.pause()
+                    try:
+                        time.sleep(0.5)
+                        login_dlg.set_focus()
+                        time.sleep(0.3)
+                        # Click the Edit field
+                        try:
+                            edits = [c for c in login_dlg.children()
+                                     if c.friendly_class_name() == "Edit"]
+                            if edits:
+                                edits[0].click_input()
+                                time.sleep(0.2)
+                        except Exception:
+                            pass
+                        # Clear any existing text before typing
+                        send_keys("^a", pause=0.02)
+                        time.sleep(0.1)
+                        # Escape special chars for send_keys
+                        safe_pw = pw
+                        for ch in ('{', '}'):
+                            safe_pw = safe_pw.replace(ch, '{' + ch + '}')
+                        for ch in ('+', '^', '%', '(', ')', '~'):
+                            safe_pw = safe_pw.replace(ch, '{' + ch + '}')
+                        # Log what we're sending
+                        mask = pw[0:3] + '*' * max(0, len(pw) - 6) + pw[-3:] if len(pw) > 6 else '***'
+                        self._emit(f"  [PW DEBUG close] raw='{mask}' escaped='{safe_pw}' len={len(pw)}", log_fn)
+                        send_keys(safe_pw, pause=0.02)
+                        time.sleep(0.3)
+                        send_keys("{ENTER}")
+                        time.sleep(3)
+                        # Check for wrong-password warning
+                        warning_dlg = self._find_active_dialog(title_re=r"(?i)(warning|error|incorrect)")
+                        if warning_dlg is not None:
+                            self._emit(f"  Password {close_pw_idx + 1} incorrect during close, trying next", log_fn)
+                            self._click_first_button(warning_dlg, ["OK", "Close"])
+                            if close_pw_idx + 1 < len(close_passwords):
+                                close_pw_idx += 1
+                            time.sleep(1)
+                    except Exception as exc:
+                        self._emit(f"  WARN: password entry during close failed: {exc}", log_fn)
+                    finally:
+                        if self._watchdog is not None:
+                            self._watchdog.resume()
+
                 time.sleep(3)
             self._emit("  QB still running after 120s — will force-kill.", log_fn)
 
@@ -1850,7 +2899,9 @@ class QuickBooksAutomationEngine:
             pass
         return False
 
-    def _handle_startup_dialogs(self, password: str, timeout_s: int, log_fn: Optional[LogFn]) -> None:
+    def _handle_startup_dialogs(self, password: str, timeout_s: int, log_fn: Optional[LogFn],
+                                alt_password: Optional[str] = None,
+                                min_wait_s: int = 90) -> None:
         """Handle dialogs that appear when QB starts up.
 
         =====================================================================
@@ -1863,21 +2914,119 @@ class QuickBooksAutomationEngine:
           2. Wait a moment for it to render
           3. Type the password and press Enter
         See _handle_password_prompt() docstring for full explanation.
+
+        2026-05-11: Added watchdog pause/resume around password entry to
+        prevent the watchdog from dismissing "wrong password" warnings
+        before the main thread can detect them.  Also added alt_password
+        parameter — if the primary password fails, we retry with the
+        alternate password before giving up.
+
+        2026-05-11 (fix): Added min_wait_s parameter (default 30s).
+        QB can show non-blocking dialogs (Update Service, promo popups)
+        BEFORE the password dialog appears. Without a minimum wait, the
+        loop would see no blocking dialogs and break early — before the
+        password dialog ever appeared. Then _find_qb_main_window would
+        time out because nobody entered the password.
         =====================================================================
         """
+        passwords_to_try = [password]
+        if alt_password and alt_password != password:
+            passwords_to_try.append(alt_password)
+        password_attempt_idx = 0
         password_entered = False
+
+        # PAUSE the watchdog for the ENTIRE startup-dialog phase.
+        # Critical: the watchdog hides QB main windows (SW_HIDE).
+        # In Windows, hiding a parent window also hides its owned
+        # child windows — including the password dialog!  If the
+        # watchdog hides QB's main frame before the password dialog
+        # appears, _find_active_dialog will never see it (it only
+        # searches visible windows).  Pausing the watchdog keeps
+        # the main window visible so the password dialog is
+        # discoverable.  We resume once the password is entered
+        # (or we give up).
+        if self._watchdog is not None:
+            self._watchdog.pause()
+
         start = time.time()
         while time.time() - start < timeout_s:
-            # Check for password/login dialog first
-            login_dlg = self._find_active_dialog(title_re=r"(?i)(password|login)")
-            if login_dlg is not None and not password_entered:
-                self._emit("Found startup login dialog, entering password", log_fn)
+            # Check for password/login dialog first.
+            # Strategy: Use win32gui.FindWindow to look for the exact QB
+            # login dialog title. This is MORE RELIABLE than
+            # Desktop().windows() or EnumWindows + pywinauto wrapping,
+            # because QB 2021's 32-bit dialogs are often invisible to
+            # pywinauto's UIA backend.
+            login_dlg = None
+            login_hwnd = None
+            try:
+                import win32gui
+                # FindWindow scans ALL top-level windows — class=None means any class
+                hwnd = win32gui.FindWindow(None, "QuickBooks Desktop Login")
+                if hwnd and win32gui.IsWindowVisible(hwnd):
+                    login_hwnd = hwnd
+                    # Try to wrap with pywinauto for .children()/.click_input()
+                    try:
+                        from pywinauto.controls.hwndwrapper import HwndWrapper
+                        login_dlg = HwndWrapper(hwnd)
+                    except Exception:
+                        pass
+                    if login_dlg is None:
+                        self._emit(f"  Found login hwnd={hwnd} but could not wrap with pywinauto", log_fn)
+            except Exception as e:
+                self._emit(f"  win32gui.FindWindow error: {e}", log_fn)
 
-                # Simple approach: just type the password and press Enter.
-                # The dialog appears with cursor in the password field by default.
+            # Fallback: pywinauto desktop search
+            if login_dlg is None and login_hwnd is None:
+                login_dlg = self._find_active_dialog(title_re=r"(?i)(password|login)")
+
+            if (login_dlg is not None or login_hwnd is not None) and not password_entered:
+                current_pw = passwords_to_try[password_attempt_idx]
+                self._emit(f"Found startup login dialog, entering password (attempt {password_attempt_idx + 1}/{len(passwords_to_try)})", log_fn)
+
+                # Focus the dialog, click the password field, then type.
                 if send_keys is not None:
                     time.sleep(1)  # Let dialog fully render
-                    send_keys(password, pause=0.02)
+
+                    # Bring dialog to foreground — try pywinauto first,
+                    # then fall back to win32gui.
+                    try:
+                        if login_dlg is not None:
+                            login_dlg.set_focus()
+                        elif login_hwnd:
+                            import win32gui
+                            win32gui.SetForegroundWindow(login_hwnd)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    time.sleep(0.3)
+
+                    # Try to click the password Edit field so the cursor
+                    # is definitely there (QB may default focus elsewhere).
+                    try:
+                        if login_dlg is not None:
+                            edits = [c for c in login_dlg.children()
+                                     if c.friendly_class_name() == "Edit"]
+                            if edits:
+                                edits[0].click_input()
+                                time.sleep(0.2)
+                    except Exception:  # noqa: BLE001
+                        pass  # Fallback: just type and hope for the best
+
+                    # Clear any existing text in the field (previous failed
+                    # attempt may have left partial text) before typing.
+                    send_keys("^a", pause=0.02)  # Ctrl+A = select all
+                    time.sleep(0.1)
+
+                    # Escape pywinauto special chars: + ^ % { } ( ) ~
+                    # so passwords with these chars are typed literally.
+                    safe_pw = current_pw
+                    for ch in ('{', '}'):  # must escape braces FIRST
+                        safe_pw = safe_pw.replace(ch, '{' + ch + '}')
+                    for ch in ('+', '^', '%', '(', ')', '~'):
+                        safe_pw = safe_pw.replace(ch, '{' + ch + '}')
+                    # Log what we're actually sending (mask middle chars for security)
+                    mask = current_pw[0:3] + '*' * max(0, len(current_pw) - 6) + current_pw[-3:] if len(current_pw) > 6 else '***'
+                    self._emit(f"  [PW DEBUG] raw='{mask}' escaped='{safe_pw}' len={len(current_pw)}", log_fn)
+                    send_keys(safe_pw, pause=0.02)
                     time.sleep(0.3)
                     send_keys("{ENTER}")
 
@@ -1886,19 +3035,28 @@ class QuickBooksAutomationEngine:
                     self._emit("Password entered at startup (type + Enter)", log_fn)
                     time.sleep(5)  # Wait for QB to process login
 
-                    # Check if a "wrong password" warning appeared
+                    # Check if a "wrong password" warning appeared.
+                    # Watchdog is PAUSED so the warning is still visible.
                     warning_dlg = self._find_active_dialog(title_re=r"(?i)(warning|error|incorrect)")
                     if warning_dlg is not None:
-                        self._emit("Password may have been incorrect, dismissing warning", log_fn)
+                        self._emit(f"Password attempt {password_attempt_idx + 1} was incorrect, dismissing warning", log_fn)
                         self._click_first_button(warning_dlg, ["OK", "Close"])
-                        password_entered = False  # Allow retry
-                        self._startup_password_handled = False  # Reset — password was wrong
+                        password_entered = False
+                        self._startup_password_handled = False
                         time.sleep(1)
+                        # Move to next password if available
+                        if password_attempt_idx + 1 < len(passwords_to_try):
+                            password_attempt_idx += 1
+                            self._emit(f"Will try alternate password next...", log_fn)
+                        else:
+                            self._emit("All passwords exhausted — will keep retrying last one", log_fn)
+
+                    # (watchdog stays paused — will be resumed at end of method)
                     continue
                 else:
                     self._emit("WARNING: send_keys unavailable, cannot enter password", log_fn)
 
-            elif login_dlg is not None and password_entered:
+            elif (login_dlg is not None or login_hwnd is not None) and password_entered:
                 # Password was already entered but dialog is still showing - wait
                 time.sleep(2)
                 continue
@@ -1906,6 +3064,97 @@ class QuickBooksAutomationEngine:
             # Dismiss other common startup dialogs
             self._dismiss_common_dialogs(log_fn)
             time.sleep(1)
+
+            # Periodic progress log so we know the wait is alive
+            elapsed_now = time.time() - start
+            if int(elapsed_now) % 10 == 0 and int(elapsed_now) > 0:
+                self._emit(f"  [Startup] waiting for password dialog... {int(elapsed_now)}s elapsed", log_fn)
+
+            # ---------------------------------------------------------------
+            # BLIND PASSWORD ENTRY FALLBACK (after 90s of failing to detect)
+            # QB 2021's login dialog can take 60-80s to appear (splash screen,
+            # "Updating QuickBooks..." etc). The regular FindWindow detection
+            # should catch it given enough time. Only fall to blind entry as
+            # a last resort after 90s.
+            # ---------------------------------------------------------------
+            if not password_entered and elapsed_now >= 90 and send_keys is not None:
+                current_pw = passwords_to_try[password_attempt_idx]
+                self._emit(f"  [BLIND ENTRY] Dialog not found after {int(elapsed_now)}s — typing password blind (attempt {password_attempt_idx + 1})", log_fn)
+
+                # Focus the LOGIN DIALOG specifically, not the main QB window.
+                # The login dialog title is "QuickBooks Desktop Login".
+                # If we can't find it, fall back to any QB window.
+                try:
+                    import win32gui, win32con  # type: ignore[import-untyped]
+                    login_hwnd = None
+                    fallback_hwnd = None
+                    def _enum_focus(hwnd, _):
+                        nonlocal login_hwnd, fallback_hwnd
+                        t = win32gui.GetWindowText(hwnd)
+                        if not t:
+                            return True
+                        tl = t.lower()
+                        if "timewarp" in tl:
+                            return True  # skip our own GUI
+                        if "login" in tl and "quickbooks" in tl:
+                            login_hwnd = hwnd
+                            return False  # found it — stop
+                        if "quickbooks" in tl and fallback_hwnd is None:
+                            fallback_hwnd = hwnd
+                        return True
+                    win32gui.EnumWindows(_enum_focus, None)
+                    target_hwnd = login_hwnd or fallback_hwnd
+                    if target_hwnd:
+                        target_title = win32gui.GetWindowText(target_hwnd)
+                        self._emit(f"  [BLIND ENTRY] Focusing hwnd={target_hwnd}: '{target_title}'", log_fn)
+                        win32gui.ShowWindow(target_hwnd, win32con.SW_RESTORE)
+                        time.sleep(0.3)
+                        win32gui.SetForegroundWindow(target_hwnd)
+                        time.sleep(0.5)
+                    else:
+                        self._emit("  [BLIND ENTRY] WARNING: Could not find any QB window to focus!", log_fn)
+                except Exception as focus_err:
+                    self._emit(f"  [BLIND ENTRY] WARNING: Focus attempt failed: {focus_err}", log_fn)
+
+                safe_pw = current_pw
+                for ch in ('{', '}'):
+                    safe_pw = safe_pw.replace(ch, '{' + ch + '}')
+                for ch in ('+', '^', '%', '(', ')', '~'):
+                    safe_pw = safe_pw.replace(ch, '{' + ch + '}')
+                mask = current_pw[0:3] + '*' * max(0, len(current_pw) - 6) + current_pw[-3:] if len(current_pw) > 6 else '***'
+                self._emit(f"  [PW DEBUG] raw='{mask}' escaped='{safe_pw}' len={len(current_pw)}", log_fn)
+                # Clear any existing text and type password directly.
+                # Do NOT send Tab — the password field should already have
+                # focus in the login dialog. Tab would move to OK button.
+                send_keys("^a", pause=0.02)  # select all (clear stale text)
+                time.sleep(0.1)
+                send_keys(safe_pw, pause=0.02)
+                time.sleep(0.3)
+                send_keys("{ENTER}")
+                password_entered = True
+                self._startup_password_handled = True
+                self._emit("  [BLIND ENTRY] Password + Enter sent", log_fn)
+                time.sleep(8)  # Wait for QB to process login
+
+                # Check for wrong-password warning
+                warning_dlg = self._find_active_dialog(title_re=r"(?i)(warning|error|incorrect)")
+                if warning_dlg is not None:
+                    self._emit(f"  [BLIND ENTRY] Wrong password detected, dismissing", log_fn)
+                    self._click_first_button(warning_dlg, ["OK", "Close"])
+                    password_entered = False
+                time.sleep(8)  # Wait for QB to process login
+
+                # Check for wrong-password warning
+                warning_dlg = self._find_active_dialog(title_re=r"(?i)(warning|error|incorrect)")
+                if warning_dlg is not None:
+                    self._emit(f"  [BLIND ENTRY] Wrong password detected, dismissing", log_fn)
+                    self._click_first_button(warning_dlg, ["OK", "Close"])
+                    password_entered = False
+                    self._startup_password_handled = False
+                    time.sleep(1)
+                    if password_attempt_idx + 1 < len(passwords_to_try):
+                        password_attempt_idx += 1
+                continue
 
             # Check if we're past all startup dialogs
             desktop = self._get_desktop()
@@ -1922,7 +3171,22 @@ class QuickBooksAutomationEngine:
                     continue
 
             if not blocking_dialogs:
-                break
+                elapsed = time.time() - start
+                if password_entered or elapsed >= min_wait_s:
+                    # Safe to exit: either we already entered the password,
+                    # or we've waited long enough for the password dialog to
+                    # appear (it never did — file may not be password-protected).
+                    if not password_entered and elapsed >= min_wait_s:
+                        self._emit(f"  No password dialog after {int(elapsed)}s — continuing (file may not be protected)", log_fn)
+                    break
+                # Haven't entered password yet and haven't waited min_wait_s —
+                # keep polling in case the password dialog hasn't appeared yet.
+                # (QB may show other dialogs like Update Service first.)
+
+        # RESUME the watchdog — startup dialog handling is done.
+        # The watchdog will now hide QB main windows as usual.
+        if self._watchdog is not None:
+            self._watchdog.resume()
 
     def _export_from_qb2023(self, job: CompanyJob, export_dir: Path, log_fn: Optional[LogFn]) -> Dict[str, Path]:
         """Exports list IIF, transaction CSV, and report PDFs from QB 2023.
@@ -1950,21 +3214,36 @@ class QuickBooksAutomationEngine:
             if self._qb2023_app is None:
                 raise RuntimeError("QB 2023 app instance is not initialized")
 
-            # Wait for the user to enter the password in QB 2023 manually.
-            # send_keys password typing is unreliable with QB's non-standard
-            # dialogs, so we just tell the user what to do and poll for the
-            # company to load (title bar changes from "No Company Open").
-            self._emit("", log_fn)
-            self._emit("=" * 60, log_fn)
-            self._emit("ACTION REQUIRED: Enter the admin password in QuickBooks 2023.", log_fn)
-            if job.password:
-                self._emit(f"  Password: {job.password}", log_fn)
-            self._emit("  The tool will auto-detect when the company is loaded.", log_fn)
-            self._emit("=" * 60, log_fn)
-            self._emit("", log_fn)
+            # Auto-type the source file password.
+            # For Tax Man Mike build: all files share the same password,
+            # so we auto-enter it via _handle_startup_dialogs().
+            # For public/retail build: job.password comes from the GUI
+            # password field (user enters it before clicking Start).
+            source_password = job.password or ""
+            if source_password:
+                self._emit("Auto-entering source file password in QB 2023...", log_fn)
+                self._handle_startup_dialogs(
+                    password=source_password,
+                    timeout_s=120,
+                    log_fn=log_fn,
+                )
+            else:
+                self._emit("", log_fn)
+                self._emit("=" * 60, log_fn)
+                self._emit("ACTION REQUIRED: Enter the admin password in QuickBooks 2023.", log_fn)
+                self._emit("  The tool will auto-detect when the company is loaded.", log_fn)
+                self._emit("=" * 60, log_fn)
+                self._emit("", log_fn)
+
             try:
-                main_window = self._find_qb_main_window(self._qb2023_app, "2023", self.config.timeouts.launch_qb_seconds)
-                # Give user up to 5 minutes to type the password
+                # Watchdog hides QB main windows — use include_hidden
+                # so we can still find and poll the title bar.
+                main_window = self._find_qb_main_window(
+                    self._qb2023_app, "2023",
+                    self.config.timeouts.launch_qb_seconds,
+                    include_hidden=True,
+                )
+                # Give up to 5 minutes for company to finish loading
                 self._wait_for_company_ready(main_window, timeout_s=300, log_fn=log_fn)
                 self._dismiss_common_dialogs(log_fn)
                 self._close_popup_windows(main_window, log_fn)
@@ -2255,9 +3534,11 @@ class QuickBooksAutomationEngine:
             from dialog_watchdog import DialogWatchdog
             watchdog = DialogWatchdog(log_fn=lambda m: self._emit(m, log_fn), hide_qb=True)
             watchdog.start()
+            self._watchdog = watchdog
         except Exception as _wd_exc:  # noqa: BLE001
             self._emit(f"[Watchdog] failed to start: {_wd_exc}", log_fn)
             watchdog = None
+            self._watchdog = None
 
         try:
             # --- Directory layout ---
@@ -2269,14 +3550,47 @@ class QuickBooksAutomationEngine:
             export_dir   = working_root / "Export"
             output_dir   = job.output_dir   # already points to Final Output\<Company>
 
-            # Wipe stale working dirs so a previous failed run never pollutes
-            for stale_dir in (export_dir, output_dir):
+            # Wipe stale working dirs so a previous failed run never pollutes.
+            # source_dir MUST be cleaned too — a stale template .qbw from a
+            # previous failed run may still be locked by a residual QB process.
+            # Kill any QB processes first, wait for locks to release, then wipe.
+            import subprocess as _sp
+            for img in ("QBW32.exe", "QBW32PremierAccountant.exe",
+                        "QBWPremierAccountant.exe", "qbupdate.exe",
+                        "qbw.exe",   # QB 2023 process name
+                        "QBDBMgrN.exe", "QBDBMgr.exe",
+                        "QBCFMonitorService.exe"):
+                _sp.run(["taskkill", "/F", "/IM", img], capture_output=True)
+            # CRITICAL: Stop the QuickBooks Database Manager service.
+            # The actual service name is "QuickBooksDB33" (not QBDBMgrN).
+            # Use `sc stop` (doesn't require elevated PS) + taskkill as backup.
+            try:
+                _sp.run(["sc", "stop", "QuickBooksDB33"],
+                        timeout=15, capture_output=True)
+            except Exception:
+                pass
+            try:
+                _sp.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Stop-Service QuickBooksDB* -Force -ErrorAction SilentlyContinue"],
+                    timeout=15, capture_output=True,
+                )
+            except Exception:
+                pass
+            time.sleep(5)  # Give Windows time to release file locks after service stop
+            # Retry rmtree with backoff — Windows file locks can linger after taskkill
+            for stale_dir in (source_dir, export_dir, output_dir):
                 if stale_dir.exists():
                     self._emit(f"Cleaning stale directory: {stale_dir}", log_fn)
-                    try:
-                        shutil.rmtree(stale_dir)
-                    except Exception as exc:  # noqa: BLE001
-                        self._emit(f"  WARN: could not remove {stale_dir}: {exc}", log_fn)
+                    for attempt in range(5):
+                        try:
+                            shutil.rmtree(stale_dir)
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            if attempt < 4:
+                                time.sleep(2)  # wait for file locks to release
+                            else:
+                                self._emit(f"  WARN: could not remove {stale_dir} after 5 attempts: {exc}", log_fn)
             for d in (source_dir, export_dir, output_dir):
                 d.mkdir(parents=True, exist_ok=True)
 
@@ -2287,6 +3601,12 @@ class QuickBooksAutomationEngine:
             original_qbw = job.qbw_path
             staged_qbw = source_dir / original_qbw.name
             if not self.config.dry_run:
+                # Delete destination first if it survived cleanup (locked file edge case)
+                if staged_qbw.exists():
+                    try:
+                        staged_qbw.unlink()
+                    except Exception:  # noqa: BLE001
+                        pass  # copy2 will overwrite or fail with clear error
                 shutil.copy2(str(original_qbw), str(staged_qbw))
                 self._emit(f"  Staged: {original_qbw} -> {staged_qbw}", log_fn)
                 for ext_s in (".qbw.ND", ".qbw.DSN", ".tlg", ".TLG"):
@@ -2353,18 +3673,51 @@ class QuickBooksAutomationEngine:
                         f"QB 2021 template not found at {template_path}. "
                         "Place a blank QB 2021 .qbw file there first."
                     )
+                # Remove stale destination first (previous failed run may leave a locked copy)
+                if working_qbw.exists():
+                    deleted = False
+                    for attempt in range(3):
+                        try:
+                            working_qbw.unlink()
+                            deleted = True
+                            break
+                        except PermissionError:
+                            if attempt == 0:
+                                self._emit("Stale template file is locked — killing residual QB processes...", log_fn)
+                                import subprocess as _sp
+                                for img in ("QBW32.exe", "QBW32PremierAccountant.exe",
+                                            "QBWPremierAccountant.exe", "qbupdate.exe",
+                                            "QBDBMgrN.exe", "QBDBMgr.exe",
+                                            "QBCFMonitorService.exe"):
+                                    _sp.run(["taskkill", "/F", "/IM", img], capture_output=True)
+                            self._emit(f"  Retry {attempt+1}/3 — waiting 5s for lock release...", log_fn)
+                            time.sleep(5)
+                    if not deleted:
+                        # Last resort: rename and leave behind
+                        stale_name = working_qbw.with_suffix(".qbw.stale")
+                        try:
+                            working_qbw.rename(stale_name)
+                            self._emit(f"WARN: Could not delete stale template, renamed to {stale_name.name}", log_fn)
+                        except Exception as e2:
+                            raise PermissionError(
+                                f"Cannot remove locked template {working_qbw}: {e2}. "
+                                "Close all QuickBooks instances and try again."
+                            ) from e2
+
                 shutil.copy2(template_path, working_qbw)
                 self._emit(f"Copied QB 2021 template to {working_qbw} (keeping name for QBFC auth)", log_fn)
 
-                # Also copy companion files (.tlg, .nd, .DSN) if they exist
-                for ext_suffix in (".qbw.ND", ".qbw.DSN", ".tlg"):
-                    src = template_path.parent / f"{template_path.stem}{ext_suffix}"
-                    if src.exists():
-                        dst = source_dir / f"{working_qbw.stem}{ext_suffix}"
+                # Delete any stale companion files (.ND, .DSN, .TLG) in
+                # the working directory. These may be left over from a
+                # previous run and contain wrong path references that cause
+                # error 80070057 ("The parameter is incorrect").
+                for ext_s in (".qbw.ND", ".qbw.DSN", ".tlg", ".TLG"):
+                    stale_f = source_dir / f"{working_qbw.stem}{ext_s}"
+                    if stale_f.exists():
                         try:
-                            shutil.copy2(src, dst)
+                            stale_f.unlink()
                         except Exception:
-                            pass  # QB will recreate these
+                            pass
             else:
                 working_qbw = final_target_qbw
                 working_qbw.parent.mkdir(parents=True, exist_ok=True)
@@ -2388,26 +3741,213 @@ class QuickBooksAutomationEngine:
                 )
                 self._qb2021_app = qb2021_app
 
-                # Wait for the user to enter the template password in QB 2021.
+                # -------------------------------------------------------
+                # Auto-type the template password.
+                # The template password is hardcoded (it's OUR template,
+                # not the customer's file), so auto-entry is safe.
+                # _handle_startup_dialogs() watches for the QB login
+                # dialog, types the password, presses Enter, and
+                # dismisses any other startup popups.
+                # -------------------------------------------------------
                 template_password = self.config.install_paths.qb_2021_template_password
-                self._emit("", log_fn)
-                self._emit("=" * 60, log_fn)
-                self._emit("ACTION REQUIRED: Enter the template password in QuickBooks 2021.", log_fn)
-                self._emit(f"  Password: {template_password}", log_fn)
-                self._emit("  The tool will auto-detect when the company is loaded.", log_fn)
-                self._emit("=" * 60, log_fn)
-                self._emit("", log_fn)
-                qb2021_main = self._find_qb_main_window(qb2021_app, "2021", self.config.timeouts.launch_qb_seconds)
-                # Use the template filename as a positive hint so the poller
-                # waits until the user enters the password and the company
-                # actually opens (title shows "Blank Template - QuickBooks …").
-                template_hint = template_path.stem  # e.g. "Blank Template"
-                self._wait_for_company_ready(
-                    qb2021_main, timeout_s=300, log_fn=log_fn,
-                    company_hint=template_hint,
+                # The template's internal company may be "Blank Template" with
+                # a different password than the Tax-Man-Mike template.  Try the
+                # configured password first, then fall back to the generic
+                # blank-template password.
+                alt_pw = "Fl0640098!@!" if template_password != "Fl0640098!@!" else "3825You171"
+
+                # PAUSE the watchdog BEFORE touching QB 2021.
+                # If the watchdog is running during _handle_startup_dialogs(),
+                # it hides the QB main window (SW_HIDE) as soon as it appears.
+                # Hidden windows cascade: child dialogs (like the password
+                # dialog) also become invisible, so dialog detection fails
+                # and the blind-entry keystroke goes to OUR GUI instead of QB.
+                # Keep the watchdog paused until AFTER the QBFC import
+                # completes and we close QB 2021.
+                if self._watchdog is not None:
+                    self._watchdog.pause()
+                    self._emit("[Watchdog] paused for QB 2021 phase", log_fn)
+
+                self._emit("Auto-entering template password in QB 2021...", log_fn)
+                self._handle_startup_dialogs(
+                    password=template_password,
+                    alt_password=alt_pw,
+                    timeout_s=120,     # generous — QB 2021 can be slow to launch
+                    log_fn=log_fn,
                 )
+
+                # _handle_startup_dialogs() resumes the watchdog at exit.
+                # Re-pause it immediately — QB 2021 must stay visible for
+                # _find_qb_main_window and the QBFC import that follows.
+                if self._watchdog is not None:
+                    self._watchdog.pause()
+                    self._emit("[Watchdog] re-paused after startup dialogs", log_fn)
+
+                qb2021_main = self._find_qb_main_window(
+                    qb2021_app, "2021",
+                    self.config.timeouts.launch_qb_seconds,
+                    include_hidden=True,
+                    log_fn=log_fn,
+                )
+                # loaded QB 2021 company.
+                # BYPASS: _wait_for_company_ready title-polling keeps timing
+                # out even though the title clearly contains "2021".
+                # Root-cause is likely a pywinauto/COM threading issue where
+                # window_text() returns subtly different bytes that fail the
+                # 'in' check despite looking identical in logs.
+                # Instead, just wait a fixed 30s for QB to fully stabilize.
+                self._emit("[STEP 5] Waiting 30s for QB 2021 to stabilize (dismissing popups)...", log_fn)
+                # Instead of sleeping 30s straight, sleep in 5s chunks
+                # and dismiss any popups that appear during startup
+                for _wait_chunk in range(6):
+                    time.sleep(5)
+                    self._dismiss_common_dialogs(log_fn)
+                    self._close_popup_windows(qb2021_main, log_fn)
+                try:
+                    _t = qb2021_main.window_text() or ""
+                    self._emit(f"[STEP 5] QB 2021 window title: '{_t}'", log_fn)
+                    # Sanity check — make sure it's not "No Company Open"
+                    if "no company open" in _t.lower():
+                        raise RuntimeError("QB 2021 shows 'No Company Open' — template failed to load")
+                except RuntimeError:
+                    raise
+                except Exception as _e:
+                    self._emit(f"[STEP 5] Could not read QB 2021 title (non-fatal): {_e}", log_fn)
+                self._emit("[STEP 5] QB 2021 is ready for import.", log_fn)
                 self._dismiss_common_dialogs(log_fn)
                 self._close_popup_windows(qb2021_main, log_fn)
+
+                # ── aggressive modal-dialog sweep ──────────────────────
+                # QBFC cannot connect while a modal dialog is showing.
+                # The "Usage & Analytics Study" popup and similar modals
+                # are often child dialogs of the QB window, not separate
+                # top-level windows, so desktop.windows() may miss them.
+                # Strategy: try pywinauto child-dialog detection first,
+                # then fall back to brute-force keyboard dismissal.
+                # ── aggressive modal-dialog sweep ──────────────────────
+                # QBFC cannot connect while a modal dialog is showing.
+                # The "Usage & Analytics Study" popup is a modal dialog
+                # that blocks QBFC. Key insight: clicking "Cancel" on this
+                # dialog opens FAQ instead of dismissing it; "Continue"
+                # is the correct dismiss button. So we try "Continue" first.
+                self._emit("[STEP 5] Sweeping for modal dialogs before QBFC...", log_fn)
+                _dismiss_btns = ["Continue", "OK", "Yes", "Close", "No", "Skip", "Later", "Cancel"]
+                for sweep in range(5):
+                    dismissed = False
+
+                    # 1) Use pywinauto find_windows to locate any dialog that
+                    #    might be a child of the QB process
+                    try:
+                        from pywinauto import findwindows
+                        qb_pid = None
+                        try:
+                            qb_pid = qb2021_main.process_id()
+                        except Exception:
+                            pass
+                        if qb_pid:
+                            dlg_handles = findwindows.find_windows(
+                                process=qb_pid, top_level_only=False,
+                            )
+                            for h in dlg_handles:
+                                try:
+                                    from pywinauto.controls.hwndwrapper import HwndWrapper
+                                    w = HwndWrapper(h)
+                                    if not w.is_visible():
+                                        continue
+                                    wt = w.window_text() or ""
+                                    if not wt:
+                                        continue
+                                    # Skip main QB window
+                                    if h == getattr(qb2021_main, "handle", None):
+                                        continue
+                                    wt_l = wt.lower()
+                                    if any(k in wt_l for k in [
+                                        "usage", "analytics", "study", "survey",
+                                        "privacy", "data collection", "have a question",
+                                        "faq", "quickbooks desktop",
+                                    ]):
+                                        self._emit(f"  [sweep {sweep}] Found dialog via PID scan: '{wt}'", log_fn)
+                                        # Bring it to front and use keyboard
+                                        try:
+                                            w.set_focus()
+                                            time.sleep(0.3)
+                                        except Exception:
+                                            pass
+                                        # Try clicking buttons via pywinauto
+                                        clicked = self._click_first_button(w, _dismiss_btns)
+                                        if clicked:
+                                            self._emit(f"  [sweep {sweep}] Dismissed via button: '{wt}'", log_fn)
+                                            dismissed = True
+                                            time.sleep(1)
+                                        else:
+                                            # Keyboard fallback: Tab to "Continue" then Enter
+                                            # (Cancel is default-focused, so Tab moves to Continue)
+                                            if send_keys is not None:
+                                                send_keys("{TAB}")
+                                                time.sleep(0.2)
+                                                send_keys("{ENTER}")
+                                                time.sleep(0.5)
+                                            self._emit(f"  [sweep {sweep}] Dismissed via TAB+ENTER: '{wt}'", log_fn)
+                                            dismissed = True
+                                            time.sleep(1)
+                                except Exception:
+                                    continue
+                    except Exception as _e:
+                        self._emit(f"  [sweep {sweep}] PID scan error (non-fatal): {_e}", log_fn)
+
+                    # 2) Desktop-level scan as fallback
+                    if not dismissed:
+                        try:
+                            desktop = self._get_desktop()
+                            for win in desktop.windows():
+                                try:
+                                    if not win.is_visible():
+                                        continue
+                                    wt = (win.window_text() or "").lower()
+                                    if not wt:
+                                        continue
+                                    if win.handle == getattr(qb2021_main, "handle", None):
+                                        continue
+                                    if re.search(self.QB_WINDOW_RE, win.window_text() or ""):
+                                        continue
+                                    if any(k in wt for k in ["usage", "analytics", "study", "survey",
+                                                              "quickbooks desktop", "privacy",
+                                                              "have a question", "faq"]):
+                                        clicked = self._click_first_button(win, _dismiss_btns)
+                                        if not clicked:
+                                            try:
+                                                win.set_focus()
+                                                time.sleep(0.2)
+                                                if send_keys is not None:
+                                                    send_keys("{TAB}")
+                                                    time.sleep(0.2)
+                                                    send_keys("{ENTER}")
+                                                    time.sleep(0.5)
+                                            except Exception:
+                                                pass
+                                        self._emit(f"  [sweep {sweep}] Dismissed desktop dialog: '{win.window_text()}'", log_fn)
+                                        dismissed = True
+                                        time.sleep(1)
+                                except Exception:
+                                    continue
+                        except Exception as _e:
+                            self._emit(f"  [sweep {sweep}] Desktop scan error (non-fatal): {_e}", log_fn)
+
+                    # 3) Last resort: focus QB and press Escape then Enter
+                    if not dismissed:
+                        try:
+                            self._focus_window(qb2021_main)
+                            time.sleep(0.3)
+                            if send_keys is not None:
+                                send_keys("{ESCAPE}")
+                                time.sleep(0.5)
+                                send_keys("{ENTER}")
+                                time.sleep(0.5)
+                        except Exception:
+                            pass
+                        break  # no more dialogs found
+                    # If we dismissed something, loop to catch cascading dialogs
+
                 self._emit("QB 2021 template is open and ready for QBFC import.", log_fn)
             else:
                 self._emit("Dry-run: skipping QB 2021 launch", log_fn)
@@ -2432,6 +3972,41 @@ class QuickBooksAutomationEngine:
                 self._emit(f"QBFC import complete: {sum(import_results.values())} total records", log_fn)
 
                 # ---------------------------------------------------------------
+                # ACCOUNTING PREFERENCES via UI automation
+                # QBFC PreferencesModRq is unsupported in QB 2021 — use UI instead
+                # Must happen AFTER QBFC import (accounts need to exist first)
+                # and BEFORE close so QB 2021 is still open.
+                # ---------------------------------------------------------------
+                try:
+                    snapshot_data_prefs = json.loads(Path(str(snapshot_path)).read_text(encoding="utf-8"))
+                    snap_prefs = snapshot_data_prefs.get("preferences", {})
+                    if snap_prefs:
+                        self._emit("=== Setting accounting preferences via UI automation ===", log_fn)
+                        if self._watchdog is not None:
+                            self._watchdog.pause()
+                        prefs_ok = self._set_accounting_preferences_via_ui(qb2021_app, snap_prefs, log_fn)
+                        if prefs_ok and import_results is not None:
+                            import_results['accounting_prefs'] = 1
+                except Exception as exc:
+                    self._emit(f"  AcctPrefsUI: non-fatal error: {exc}", log_fn)
+
+                # ---------------------------------------------------------------
+                # COMPANY INFO via UI automation (QBFC has no CompanyMod method)
+                # Must happen BEFORE close so QB 2021 is still open.
+                # ---------------------------------------------------------------
+                try:
+                    snapshot_data = json.loads(Path(str(snapshot_path)).read_text(encoding="utf-8"))
+                    company_info = snapshot_data.get("company", {})
+                    if company_info:
+                        self._emit("=== Setting company info via UI automation ===", log_fn)
+                        # Make sure the QB window is visible for UI automation
+                        if self._watchdog is not None:
+                            self._watchdog.pause()
+                        self._set_company_info_via_ui(qb2021_app, company_info, log_fn)
+                except Exception as exc:
+                    self._emit(f"  CompanyUI: non-fatal error: {exc}", log_fn)
+
+                # ---------------------------------------------------------------
                 # AUTOMATED CLOSE: drive QB through its own File menu so the
                 # data file is flushed cleanly to disk (Ctrl+W to close company,
                 # Yes on the save dialog, Alt+F4 to exit). _close_qb() handles
@@ -2439,6 +4014,13 @@ class QuickBooksAutomationEngine:
                 # fails. This must run BEFORE the rename so no file lock.
                 # ---------------------------------------------------------------
                 self._emit("Import done — auto-closing QB 2021 (menu-driven)...", log_fn)
+                # CRITICAL: Keep watchdog PAUSED so _close_qb can see and
+                # interact with the QB window.  If the watchdog is running
+                # it immediately hides the window, making Ctrl+W / Alt+F4
+                # hit nothing → force-kill → data never flushed to disk.
+                # This was the root cause of empty .qbw files in Runs 9-11.
+                if self._watchdog is not None:
+                    self._watchdog.pause()
                 self._close_qb(qb2021_app, log_fn)
                 qb2021_app = None
                 self._qb2021_app = None
@@ -2474,12 +4056,28 @@ class QuickBooksAutomationEngine:
                 try:
                     _sp.run(
                         ["powershell", "-NoProfile", "-Command",
-                         "Get-Process | Where-Object {$_.Name -like 'QBW32*' -or $_.Name -like 'qbupdate*' -or $_.Name -like 'QBDBMgr*' -or $_.Name -like 'QBCFMonitor*'} | Stop-Process -Force -ErrorAction SilentlyContinue"],
+                         "Get-Process | Where-Object {$_.Name -like 'QBW32*' -or $_.Name -like 'qbw*' -or $_.Name -like 'qbupdate*' -or $_.Name -like 'QBDBMgr*' -or $_.Name -like 'QBCFMonitor*'} | Stop-Process -Force -ErrorAction SilentlyContinue"],
                         timeout=15, capture_output=True,
                     )
                 except Exception:
                     pass
-                time.sleep(5)
+                # CRITICAL: Stop the QuickBooks Database Manager service.
+                # The actual service name is "QuickBooksDB33" (not QBDBMgrN).
+                self._emit("Stopping QuickBooksDB33 service to release file locks...", log_fn)
+                try:
+                    _sp.run(["sc", "stop", "QuickBooksDB33"],
+                            timeout=15, capture_output=True)
+                except Exception:
+                    pass
+                try:
+                    _sp.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         "Stop-Service QuickBooksDB* -Force -ErrorAction SilentlyContinue"],
+                        timeout=15, capture_output=True,
+                    )
+                except Exception:
+                    pass
+                time.sleep(8)  # extra time for service to fully release locks
 
                 self._emit(f"Renaming {working_qbw.name} -> {final_target_qbw.name}", log_fn)
                 # Retry the actual move with backoff (file lock can linger on Windows)

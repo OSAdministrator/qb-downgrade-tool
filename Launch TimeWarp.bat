@@ -51,6 +51,36 @@ exit /b 1
 :launch
 echo  Starting QuickBooks TimeWarp by Our System Administrator...
 echo.
+
+rem --- Pre-launch cleanup: kill stale processes so nothing is locked ---
+rem    This runs BEFORE the GUI starts, so there's no race condition.
+echo  Cleaning up stale processes...
+taskkill /F /IM QBW32PremierAccountant.exe >nul 2>&1
+taskkill /F /IM QBWPremierAccountant.exe   >nul 2>&1
+taskkill /F /IM qbw32.exe                  >nul 2>&1
+taskkill /F /IM qbw.exe                    >nul 2>&1
+taskkill /F /IM qbupdate.exe               >nul 2>&1
+rem Kill any orphaned TimeWarp Python processes (but NOT python.exe
+rem globally — other scripts may be running). We target the exact
+rem script name so only TimeWarp instances die.
+wmic process where "commandline like '%%qb_downgrade_gui%%'" call terminate >nul 2>&1
+wmic process where "commandline like '%%qb_automation%%'" call terminate >nul 2>&1
+
+rem Give Windows a moment to release file locks after kills
+timeout /t 3 /nobreak >nul
+
+rem Clean stale working directories (locked files from crashed runs)
+if exist "%~dp0..\Working\source" (
+    echo  Removing stale working\source...
+    rmdir /s /q "%~dp0..\Working\source" >nul 2>&1
+)
+if exist "%~dp0..\Working\Export" (
+    echo  Removing stale working\Export...
+    rmdir /s /q "%~dp0..\Working\Export" >nul 2>&1
+)
+echo  Clean.
+echo.
+
 echo  Detecting drive layout...
 %PYTHON_CMD% "%~dp0drive_layout.py"
 echo.

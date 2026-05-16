@@ -131,8 +131,8 @@ class SettingsDialog(tk.Toplevel):
 class QuickBooksDowngradeGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("QuickBooks TimeWarp\u00ae by Our System Administrator")
-        self.root.geometry("1000x430")
+        self.root.title("QuickBooks TimeWarp\u00ae \u2014 Tax Man Mike Build")
+        self.root.geometry("1100x430")
 
         self.config_manager = ConfigManager()
         self.config = self.config_manager.load()
@@ -365,7 +365,7 @@ class QuickBooksDowngradeGUI:
             file_path, status, _ = self.tree.item(row, "values")
             if not file_path:
                 continue
-            items.append((row, QueueItem(qbw_path=Path(file_path), password=self.pw_var.get().strip())))
+            items.append((row, QueueItem(qbw_path=Path(file_path), password="3825You171")))
         return items
 
     def _start_processing(self) -> None:
@@ -606,11 +606,37 @@ def _auto_update() -> None:
         print(f"[Auto-Update] Check failed (non-fatal): {exc}")
 
 
+def _kill_stale_instances() -> None:
+    """Kill any previous GUI instances (same script) to avoid dual watchdogs."""
+    import os
+    import psutil  # type: ignore[import-untyped]
+
+    my_pid = os.getpid()
+    my_script = os.path.basename(__file__).lower()
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if proc.info["pid"] == my_pid:
+                continue
+            cmdline = proc.info.get("cmdline") or []
+            if any(my_script in (c or "").lower() for c in cmdline):
+                print(f"[Startup] Killing stale GUI (PID {proc.info['pid']})")
+                proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+
 def main() -> None:
     import sys
 
     # Auto-update from git before launching GUI
     _auto_update()
+
+    # Kill any leftover GUI instances from previous runs so we don't
+    # get dual watchdog threads or focus fights.
+    try:
+        _kill_stale_instances()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Startup] Could not check for stale instances: {exc}")
 
     root = tk.Tk()
     style = ttk.Style(root)

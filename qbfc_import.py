@@ -42,10 +42,12 @@ QBFC_DO_NOT_CARE = 2
 
 
 def _emit(msg: str, log_fn: Optional[LogFn]) -> None:
-    logger.info(msg)
+    # Sanitize non-ASCII characters that break Windows console/file encoding
+    safe_msg = msg.encode('ascii', 'replace').decode('ascii') if isinstance(msg, str) else msg
+    logger.info(safe_msg)
     if log_fn:
         try:
-            log_fn(msg)
+            log_fn(safe_msg)
         except Exception:
             pass
 
@@ -99,6 +101,35 @@ def _set_amount_if(obj: Any, attr: str, value) -> None:
             field.SetValue(float(value))
     except Exception as exc:
         logger.debug(f"Could not set amount {attr}={value}: {exc}")
+
+
+def _safe_get(obj: Any, attr: str) -> Optional[str]:
+    """Safely read a QBFC field value, returning None if missing/empty."""
+    try:
+        field = getattr(obj, attr, None)
+        if field is None:
+            return None
+        val = field.GetValue() if hasattr(field, 'GetValue') else None
+        return str(val) if val is not None else None
+    except Exception:
+        return None
+
+
+def _set_bool_if(obj: Any, attr: str, value) -> None:
+    """Set a QBFC boolean field from a string like 'True'/'False' or a bool."""
+    if value is None or value == '':
+        return
+    try:
+        field = getattr(obj, attr, None)
+        if field is not None and hasattr(field, 'SetValue'):
+            # Convert string "True"/"False" to actual bool
+            if isinstance(value, str):
+                bool_val = value.lower() in ('true', '1', 'yes')
+            else:
+                bool_val = bool(value)
+            field.SetValue(bool_val)
+    except Exception as exc:
+        logger.debug(f"Could not set bool {attr}={value}: {exc}")
 
 
 def _set_ref_if(obj: Any, ref_attr: str, value: Optional[str]) -> None:
@@ -218,23 +249,25 @@ def import_classes(session: Any, classes: List[Dict], log_fn: Optional[LogFn] = 
 
 # QBFC account type enum mapping
 ACCOUNT_TYPE_MAP = {
-    # Friendly name -> QBFC enum value
-    'Bank': 0,
+    # Friendly name -> correct QBFC ENAccountType enum value
+    # These MUST match the values returned by AccountType.GetValue() in
+    # QBFC responses and used by AccountType.SetValue() in QBFC requests.
+    'AccountsPayable': 0,
     'AccountsReceivable': 1,
-    'OtherCurrentAsset': 2,
-    'FixedAsset': 3,
-    'OtherAsset': 4,
-    'AccountsPayable': 5,
-    'CreditCard': 6,
-    'OtherCurrentLiability': 7,
-    'LongTermLiability': 8,
-    'Equity': 9,
-    'Income': 10,
-    'CostOfGoodsSold': 11,
-    'Expense': 12,
-    'OtherIncome': 13,
+    'Bank': 2,
+    'CostOfGoodsSold': 3,
+    'CreditCard': 4,
+    'Equity': 5,
+    'Expense': 6,
+    'FixedAsset': 7,
+    'Income': 8,
+    'LongTermLiability': 9,
+    'NonPosting': 10,
+    'OtherAsset': 11,
+    'OtherCurrentAsset': 12,
+    'OtherCurrentLiability': 13,
     'OtherExpense': 14,
-    'NonPosting': 15,
+    'OtherIncome': 15,
 }
 # QBFC export returns enum integers (as strings), so also accept those
 ACCOUNT_TYPE_MAP.update({str(v): v for v in ACCOUNT_TYPE_MAP.values()})
@@ -521,9 +554,9 @@ def import_items(session: Any, items: List[Dict], accounts: Optional[List[Dict]]
     have different Add request types. We handle the main ones.
     """
     accounts = accounts or []
-    default_income = _find_default_account(accounts, [10, 13])  # Income, OtherIncome
-    default_expense = _find_default_account(accounts, [12, 11, 14])  # Expense, COGS, OtherExpense
-    default_asset = _find_default_account(accounts, [2, 4])  # OtherCurrentAsset, OtherAsset
+    default_income = _find_default_account(accounts, [8, 15])  # Income(8), OtherIncome(15)
+    default_expense = _find_default_account(accounts, [6, 3, 14])  # Expense(6), COGS(3), OtherExpense(14)
+    default_asset = _find_default_account(accounts, [12, 11])  # OtherCurrentAsset(12), OtherAsset(11)
     _emit(f"QBFC Import: Item defaults — income='{default_income}' expense='{default_expense}' asset='{default_asset}'", log_fn)
     ok = 0
     for it in items:
@@ -652,42 +685,46 @@ def import_items(session: Any, items: List[Dict], accounts: Optional[List[Dict]]
 def _guess_account_type(name: str) -> int:
     """Best-effort type guess from account name. Default = Bank.
 
-    Returns a QBFC AccountType enum int.
+    Returns a correct QBFC ENAccountType enum int:
+      0=AP, 1=AR, 2=Bank, 3=COGS, 4=CreditCard, 5=Equity,
+      6=Expense, 7=FixedAsset, 8=Income, 9=LongTermLiability,
+      10=NonPosting, 11=OtherAsset, 12=OtherCurrentAsset,
+      13=OtherCurrentLiability, 14=OtherExpense, 15=OtherIncome
     """
     n = name.lower()
     # Bank / cash
     if any(k in n for k in ('bank', 'checking', 'savings', 'cash', 'petty', 'money market', 'mm acct', 'bk acct')):
-        return 0  # Bank
+        return 2  # Bank
     # Credit card
     if any(k in n for k in ('credit card', 'visa', 'mastercard', 'amex', 'discover', 'cc ')):
-        return 6  # CreditCard
+        return 4  # CreditCard
     # A/R, A/P
     if 'accounts receivable' in n or n.startswith('a/r'):
-        return 1
+        return 1   # AccountsReceivable
     if 'accounts payable' in n or n.startswith('a/p'):
-        return 5
+        return 0   # AccountsPayable
     # Equity hints
     if any(k in n for k in ('equity', 'retained', 'opening balance')):
-        return 9
+        return 5   # Equity
     # Income hints
     if any(k in n for k in ('income', 'revenue', 'sales')):
-        return 10
+        return 8   # Income
     # COGS
     if 'cost of goods' in n or 'cogs' in n:
-        return 11
+        return 3   # CostOfGoodsSold
     # Liability hints
     if any(k in n for k in ('loan', 'payable', 'liability', 'note payable', 'mortgage')):
-        return 8 if 'long' in n or 'mortgage' in n else 7
+        return 9 if 'long' in n or 'mortgage' in n else 13  # LTL or OtherCurrentLiability
     # Asset hints
     if any(k in n for k in ('depreciation', 'fixed asset', 'equipment', 'building', 'vehicle', 'furniture')):
-        return 3  # FixedAsset
+        return 7   # FixedAsset
     if any(k in n for k in ('asset', 'prepaid', 'deposit', 'receivable')):
-        return 2  # OtherCurrentAsset
+        return 12  # OtherCurrentAsset
     # Expense (default for unrecognized)
     if any(k in n for k in ('expense', 'fee', 'cost', 'tax', 'utilities', 'rent', 'insurance', 'supplies', 'payroll', 'wages', 'meals')):
-        return 12
+        return 6   # Expense
     # Final fallback: Bank (safe for transfers/checks which is what triggers missing refs)
-    return 0
+    return 2  # Bank
 
 
 def _list_existing_accounts(session: Any, log_fn: Optional[LogFn] = None) -> set:
@@ -835,6 +872,166 @@ def _ensure_referenced_accounts(session: Any, transactions: List[Dict], log_fn: 
     return created
 
 
+def _fix_account_types_for_native_txns(
+    session: Any,
+    transactions: List[Dict],
+    log_fn: Optional[LogFn] = None,
+) -> int:
+    """Detect and fix accounts whose QB type conflicts with native transaction needs.
+
+    Check/Transfer/Deposit/CreditCardCharge each require their primary account
+    to be a specific type (Bank, CreditCard, etc.).  If the template pre-loaded
+    an account with the wrong type, QBFC native handlers will fail (status 3140).
+
+    Fix strategy: delete the wrong-type account via ListDelRq, then recreate it
+    with the correct type.  This works because the template's account has zero
+    transactions at this point (we haven't imported any yet).
+
+    Returns the number of accounts fixed.
+    """
+    # Build a map: account_name -> required_type for the PRIMARY account of each tx
+    # (the "bank" account for a Check, the "credit card" for a CC charge, etc.)
+    REQUIRED_TYPES = {
+        'Check':             2,   # Bank (QBFC enum 2)
+        'Deposit':           2,   # Bank
+        'Transfer':          2,   # Bank (both sides)
+        'CreditCardCharge':  4,   # CreditCard (QBFC enum 4)
+        'CreditCardCredit':  4,   # CreditCard
+        'SalesTaxPaymentCheck': 2, # Bank (routed through Check)
+    }
+
+    # Collect account names that MUST be a certain type
+    needed: Dict[str, int] = {}  # name -> required QBFC type enum
+    for tx in transactions:
+        tx_type = tx.get('type', '')
+        req_type = REQUIRED_TYPES.get(tx_type)
+        if req_type is None:
+            continue
+        lines = tx.get('lines') or []
+        if not lines:
+            continue
+
+        if tx_type in ('Check', 'SalesTaxPaymentCheck'):
+            # Credit line = bank account (money FROM)
+            for ln in lines:
+                if ln.get('credit', 0) and not ln.get('debit', 0):
+                    acct = (ln.get('account') or '').strip()
+                    if acct:
+                        needed[acct] = req_type
+        elif tx_type == 'Deposit':
+            # Debit line = bank account (money INTO)
+            for ln in lines:
+                if ln.get('debit', 0) and not ln.get('credit', 0):
+                    acct = (ln.get('account') or '').strip()
+                    if acct:
+                        needed[acct] = req_type
+        elif tx_type == 'Transfer':
+            # QBFC TransferAdd accepts any account type for both From and To
+            # (bank-to-bank, bank-to-CC, bank-to-loan, etc.).
+            # Do NOT force any account type — let the accounts stay as-is.
+            pass
+        elif tx_type == 'CreditCardCharge':
+            # CC Charge: Credit line = CC account (liability increases)
+            # Debit lines are expense/COGS accounts — do NOT mark them!
+            for ln in lines:
+                if ln.get('credit', 0) and not ln.get('debit', 0):
+                    acct = (ln.get('account') or '').strip()
+                    if acct:
+                        needed[acct] = req_type
+        elif tx_type == 'CreditCardCredit':
+            # CC Credit (refund): Debit line = CC account (liability decreases)
+            # Credit lines are expense/COGS reversals — do NOT mark them!
+            for ln in lines:
+                if ln.get('debit', 0) and not ln.get('credit', 0):
+                    acct = (ln.get('account') or '').strip()
+                    if acct:
+                        needed[acct] = req_type
+
+    # NEVER change system accounts — they serve special purposes
+    PROTECTED_ACCOUNTS = {'opening balance equity', 'retained earnings',
+                          'undeposited funds', 'accounts receivable',
+                          'accounts payable'}
+    needed = {k: v for k, v in needed.items()
+              if k.strip().lower() not in PROTECTED_ACCOUNTS}
+
+    if not needed:
+        return 0
+
+    _emit(f"QBFC Import: Checking {len(needed)} accounts for type compatibility...", log_fn)
+
+    # Query current types from QB
+    _, existing_types = _list_accounts_with_types(session, log_fn)
+
+    fixed = 0
+    for acct_name, req_type in needed.items():
+        key = acct_name.strip().lower()
+        current_type = existing_types.get(key)
+        if current_type is None:
+            continue  # doesn't exist yet — will be created by pre-flight
+        if current_type == req_type:
+            continue  # correct type
+
+        _emit(f"  Account '{acct_name}': type {current_type} but need {req_type} — fixing...", log_fn)
+
+        # Step 1: Get the ListID so we can delete
+        try:
+            req = _create_request_set(session)
+            q = req.AppendAccountQueryRq()
+            q.ORAccountListQuery.FullNameList.Add(acct_name)
+            resp_set = session.session_manager.DoRequests(req)
+            resp = resp_set.ResponseList.GetAt(0)
+            if resp.StatusCode != 0 or resp.Detail is None:
+                _emit(f"    Could not query '{acct_name}': {resp.StatusCode}", log_fn)
+                continue
+            list_id = resp.Detail.AccountRetList.GetAt(0).ListID.GetValue()
+        except Exception as exc:
+            _emit(f"    Query failed for '{acct_name}': {exc}", log_fn)
+            continue
+
+        # Step 2: Delete the wrong-type account
+        try:
+            req = _create_request_set(session)
+            d = req.AppendListDelRq()
+            d.ListDelType.SetValue(1)  # 1 = Account
+            d.ListID.SetValue(list_id)
+            resp_set = session.session_manager.DoRequests(req)
+            resp = resp_set.ResponseList.GetAt(0)
+            if resp.StatusCode != 0:
+                _emit(f"    Delete failed for '{acct_name}': {resp.StatusCode} {resp.StatusMessage}", log_fn)
+                continue
+            _emit(f"    Deleted '{acct_name}' (was type {current_type})", log_fn)
+        except Exception as exc:
+            _emit(f"    Delete exception for '{acct_name}': {exc}", log_fn)
+            continue
+
+        # Step 3: Recreate with correct type
+        try:
+            req = _create_request_set(session)
+            add = req.AppendAccountAddRq()
+            add.Name.SetValue(acct_name)
+            add.AccountType.SetValue(req_type)
+            try:
+                add.Desc.SetValue('Recreated by TimeWarp (type fix)')
+            except Exception:
+                pass
+            resp_set = session.session_manager.DoRequests(req)
+            resp = resp_set.ResponseList.GetAt(0)
+            if resp.StatusCode == 0:
+                _emit(f"    ✓ Recreated '{acct_name}' as type {req_type}", log_fn)
+                _ACCOUNT_TYPE_CACHE[key] = req_type
+                fixed += 1
+            else:
+                _emit(f"    Recreate failed: {resp.StatusCode} {resp.StatusMessage}", log_fn)
+        except Exception as exc:
+            _emit(f"    Recreate exception for '{acct_name}': {exc}", log_fn)
+
+    if fixed:
+        _emit(f"QBFC Import: Fixed {fixed} account type(s).", log_fn)
+    else:
+        _emit("QBFC Import: All account types are compatible.", log_fn)
+    return fixed
+
+
 # ---------------------------------------------------------------------------
 # Native Credit Card transaction import
 # ---------------------------------------------------------------------------
@@ -913,7 +1110,7 @@ def _import_cc_credit(session, tx, date_str, ref_num, entity, memo, lines, log_f
             # But could also be an expense line... need to distinguish.
             acct_key = acct.strip().lower()
             acct_type = _ACCOUNT_TYPE_CACHE.get(acct_key)
-            if acct_type == 6:  # CreditCard
+            if acct_type == 4:  # CreditCard (QBFC enum 4)
                 cc_acct = acct
             else:
                 # Check by name heuristic
@@ -957,6 +1154,336 @@ def _import_cc_credit(session, tx, date_str, ref_num, entity, memo, lines, log_f
 
 
 
+# ---------------------------------------------------------------------------
+# Native transaction importers — route each type through its proper QBFC
+# Add request so it shows correctly in the register (no GENJRN entries).
+# ---------------------------------------------------------------------------
+
+
+def _import_check(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                  return_txn_id=False):
+    """Import a Check using AppendCheckAddRq.
+
+    In the snapshot, a Check has:
+      - One credit line = the bank account (money leaves)
+      - One or more debit lines = expense/destination accounts
+
+    Returns TxnID string if return_txn_id, else 1=ok/0=skipped/-1=failed.
+    """
+    bank_acct = ""
+    expense_lines = []
+    for ln in lines:
+        acct = (ln.get('account') or '').strip()
+        debit = float(ln.get('debit', 0) or 0)
+        credit = float(ln.get('credit', 0) or 0)
+        if credit > 0 and not debit:
+            # Credit line = the bank account
+            if not bank_acct:
+                bank_acct = acct
+            else:
+                # Multiple credit lines — unusual, treat extras as expense
+                expense_lines.append((acct, round(credit, 2), 'credit'))
+        elif debit > 0:
+            expense_lines.append((acct, round(debit, 2), 'debit'))
+
+    if not bank_acct or not expense_lines:
+        return 0  # can't determine structure, skip
+
+    try:
+        req = _create_request_set(session)
+        add = req.AppendCheckAddRq()
+        add.AccountRef.FullName.SetValue(bank_acct)
+        _set_date_if(add, 'TxnDate', date_str)
+        _set_if(add, 'RefNumber', ref_num)
+        _set_if(add, 'Memo', memo[:4095] if memo else f"TimeWarp: Check")
+        if entity:
+            try:
+                add.PayeeEntityRef.FullName.SetValue(entity)
+            except Exception:
+                pass
+
+        for acct, amt, _ in expense_lines:
+            el = add.ExpenseLineAddList.Append()
+            el.AccountRef.FullName.SetValue(acct)
+            el.Amount.SetValue(amt)
+
+        result = _do_add_request(session, req, f"Check {ref_num} {entity}", log_fn,
+                                return_txn_id=return_txn_id)
+        if return_txn_id:
+            return result
+        return 1 if result else -1
+    except Exception as exc:
+        _emit(f"  Check failed: {exc}", log_fn)
+        return None if return_txn_id else -1
+
+
+def _import_deposit(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                    return_txn_id=False):
+    """Import a Deposit using AppendDepositAddRq.
+
+    In the snapshot, a Deposit has:
+      - One debit line = the bank account (money goes into)
+      - One or more credit lines = the income/source accounts
+
+    QBFC DepositAdd structure:
+      - DepositToAccountRef = bank account
+      - DepositLineAddList = each source line (amount, account, entity)
+      - No ExpenseLineAddList — deposits use DepositLineAddList
+
+    Returns TxnID string if return_txn_id, else 1=ok/0=skipped/-1=failed.
+    """
+    bank_acct = ""
+    source_lines = []
+    for ln in lines:
+        acct = (ln.get('account') or '').strip()
+        debit = float(ln.get('debit', 0) or 0)
+        credit = float(ln.get('credit', 0) or 0)
+        if debit > 0 and not credit:
+            # Debit line = the bank account
+            if not bank_acct:
+                bank_acct = acct
+            else:
+                source_lines.append((acct, round(debit, 2)))
+        elif credit > 0:
+            source_lines.append((acct, round(credit, 2)))
+
+    if not bank_acct or not source_lines:
+        return 0
+
+    try:
+        req = _create_request_set(session)
+        add = req.AppendDepositAddRq()
+        add.DepositToAccountRef.FullName.SetValue(bank_acct)
+        _set_date_if(add, 'TxnDate', date_str)
+        _set_if(add, 'Memo', memo[:4095] if memo else f"TimeWarp: Deposit")
+
+        for acct, amt in source_lines:
+            dl = add.DepositLineAddList.Append()
+            # DepositLineAdd uses ORDepositLineAdd — we use the AccountRef variant
+            try:
+                dl.ORDepositLineAdd.DepositInfo.AccountRef.FullName.SetValue(acct)
+                dl.ORDepositLineAdd.DepositInfo.Amount.SetValue(amt)
+            except Exception:
+                # Fallback: some QBFC versions expose it differently
+                try:
+                    dl.AccountRef.FullName.SetValue(acct)
+                    dl.Amount.SetValue(amt)
+                except Exception as e2:
+                    _emit(f"  Deposit line failed for {acct}: {e2}", log_fn)
+
+        result = _do_add_request(session, req, f"Deposit {date_str} {memo[:30]}", log_fn,
+                                return_txn_id=return_txn_id)
+        if return_txn_id:
+            return result
+        return 1 if result else -1
+    except Exception as exc:
+        _emit(f"  Deposit failed: {exc}", log_fn)
+        return None if return_txn_id else -1
+
+
+def _import_transfer(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                     return_txn_id=False):
+    """Import a Transfer using AppendTransferAddRq.
+
+    In the snapshot, a Transfer has exactly 2 lines:
+      - Debit line = the TO account (receives money)
+      - Credit line = the FROM account (sends money)
+
+    QBFC TransferAdd:
+      - TransferFromAccountRef = source account
+      - TransferToAccountRef = destination account
+      - Amount = transfer amount
+
+    Returns TxnID string if return_txn_id, else 1=ok/0=skipped/-1=failed.
+    """
+    from_acct = ""
+    to_acct = ""
+    amount = 0.0
+    for ln in lines:
+        acct = (ln.get('account') or '').strip()
+        debit = float(ln.get('debit', 0) or 0)
+        credit = float(ln.get('credit', 0) or 0)
+        if debit > 0:
+            to_acct = acct
+            amount = round(debit, 2)
+        elif credit > 0:
+            from_acct = acct
+
+    if not from_acct or not to_acct or amount <= 0:
+        return 0
+
+    try:
+        req = _create_request_set(session)
+        add = req.AppendTransferAddRq()
+        add.TransferFromAccountRef.FullName.SetValue(from_acct)
+        add.TransferToAccountRef.FullName.SetValue(to_acct)
+        _set_date_if(add, 'TxnDate', date_str)
+        add.Amount.SetValue(amount)
+        _set_if(add, 'Memo', memo[:4095] if memo else f"TimeWarp: Transfer")
+
+        result = _do_add_request(session, req, f"Transfer {from_acct}->{to_acct} ${amount}", log_fn,
+                                return_txn_id=return_txn_id)
+        if return_txn_id:
+            return result
+        return 1 if result else -1
+    except Exception as exc:
+        _emit(f"  Transfer failed: {exc}", log_fn)
+        return None if return_txn_id else -1
+
+
+def _import_sales_tax_payment(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                              return_txn_id=False):
+    """Import a SalesTaxPaymentCheck using AppendSalesTaxPaymentCheckAddRq.
+
+    In the snapshot, a SalesTaxPaymentCheck has:
+      - Debit line(s) = Sales Tax Payable (reduces liability)
+      - Credit line = the bank account (money leaves)
+
+    QBFC SalesTaxPaymentCheckAdd:
+      - PayeeEntityRef = tax authority vendor
+      - BankAccountRef = bank account
+      - TxnDate, RefNumber
+      - AppliedToTxnAddList = applied to specific tax liabilities
+      
+    BUT: SalesTaxPaymentCheckAdd requires linking to specific sales tax
+    items/transactions which we may not have. Fall back to Check if needed.
+
+    Returns TxnID string if return_txn_id, else 1=ok/0=skipped/-1=failed.
+    """
+    # Try as a Check first — it's simpler and always works.
+    # SalesTaxPaymentCheckAdd requires AppliedToTxn which references
+    # specific sales tax liability transactions that may not exist yet.
+    return _import_check(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                         return_txn_id=return_txn_id)
+
+
+_GENERIC_ITEM_NAME = "Migrated Item"
+_generic_item_ensured = False
+
+
+def _ensure_generic_service_item(session, log_fn=None):
+    """Create a generic service item for SalesReceipt lines if it doesn't exist.
+
+    SalesReceiptLineAdd requires an ItemRef — we use this catch-all service item
+    for migrated SalesReceipts whose original line items are account-based.
+    """
+    global _generic_item_ensured
+    if _generic_item_ensured:
+        return True
+
+    # First, query whether the item already exists
+    try:
+        req = _create_request_set(session)
+        query = req.AppendItemServiceQueryRq()
+        query.ORListQuery.FullNameList.Add(_GENERIC_ITEM_NAME)
+        resp_set = session.session_manager.DoRequests(req)
+        if resp_set and resp_set.ResponseList and resp_set.ResponseList.GetAt(0).StatusCode == 0:
+            _emit(f"  Generic item '{_GENERIC_ITEM_NAME}' already exists", log_fn)
+            _generic_item_ensured = True
+            return True
+    except Exception:
+        pass  # Item doesn't exist — create it
+
+    # Create the service item
+    try:
+        req = _create_request_set(session)
+        add = req.AppendItemServiceAddRq()
+        add.Name.SetValue(_GENERIC_ITEM_NAME)
+        try:
+            add.ORSalesPurchase.SalesOrPurchase.Desc.SetValue(
+                "Generic service item for migrated transactions"
+            )
+            add.ORSalesPurchase.SalesOrPurchase.ORPrice.Price.SetValue(0.0)
+            add.ORSalesPurchase.SalesOrPurchase.AccountRef.FullName.SetValue("Sales")
+        except Exception:
+            pass
+        result = _do_add_request(session, req, f"ItemService '{_GENERIC_ITEM_NAME}'", log_fn)
+        if result:
+            _emit(f"  Created generic item '{_GENERIC_ITEM_NAME}' for SalesReceipt lines", log_fn)
+            _generic_item_ensured = True
+            return True
+    except Exception as exc:
+        _emit(f"  Failed to create generic item: {exc}", log_fn)
+
+    return False
+
+
+def _import_sales_receipt(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                          return_txn_id=False):
+    """Import a SalesReceipt using AppendSalesReceiptAddRq.
+
+    In the snapshot, a SalesReceipt has:
+      - Credit lines = revenue/income accounts
+      - Debit line = the Undeposited Funds or bank account
+
+    QBFC SalesReceiptAdd:
+      - CustomerRef = customer
+      - SalesReceiptLineAddList = line items (each needs ItemRef)
+      - DepositToAccountRef = where the money goes
+
+    Returns TxnID string if return_txn_id, else 1=ok/0=skipped/-1=failed.
+    """
+    # Identify deposit-to account (debit side) and revenue lines (credit side)
+    deposit_acct = ""
+    revenue_lines = []
+    for ln in lines:
+        acct = (ln.get('account') or '').strip()
+        debit = float(ln.get('debit', 0) or 0)
+        credit = float(ln.get('credit', 0) or 0)
+        if debit > 0 and not credit:
+            if not deposit_acct:
+                deposit_acct = acct
+            else:
+                revenue_lines.append((acct, round(debit, 2)))
+        elif credit > 0:
+            revenue_lines.append((acct, round(credit, 2)))
+
+    if not deposit_acct or not revenue_lines:
+        return 0
+
+    # Ensure generic service item exists for line ItemRef
+    _ensure_generic_service_item(session, log_fn)
+
+    try:
+        req = _create_request_set(session)
+        add = req.AppendSalesReceiptAddRq()
+
+        if entity:
+            try:
+                add.CustomerRef.FullName.SetValue(entity)
+            except Exception:
+                pass
+
+        _set_date_if(add, 'TxnDate', date_str)
+        _set_if(add, 'RefNumber', ref_num)
+        _set_if(add, 'Memo', memo[:4095] if memo else f"TimeWarp: SalesReceipt")
+
+        try:
+            add.DepositToAccountRef.FullName.SetValue(deposit_acct)
+        except Exception:
+            pass
+
+        # Add revenue lines as SalesReceiptLineAdd items
+        for acct, amt in revenue_lines:
+            try:
+                srl = add.ORSalesReceiptLineAddList.Append()
+                line_add = srl.SalesReceiptLineAdd
+                line_add.ItemRef.FullName.SetValue(_GENERIC_ITEM_NAME)
+                line_add.Amount.SetValue(amt)
+                line_add.Desc.SetValue(memo[:4095] if memo else acct)
+            except Exception:
+                pass
+
+        result = _do_add_request(session, req, f"SalesReceipt {ref_num} {entity}", log_fn,
+                                return_txn_id=return_txn_id)
+        if return_txn_id:
+            return result
+        return 1 if result else -1
+    except Exception as exc:
+        _emit(f"  SalesReceipt native failed ({exc}), falling back to JE", log_fn)
+        return None if return_txn_id else -1
+
+
 def _set_cleared_status(session: Any, txn_id: str, status: str, log_fn: Optional[LogFn] = None) -> bool:
     """Set the ClearedStatus on a transaction via ClearedStatusModRq.
 
@@ -975,13 +1502,28 @@ def _set_cleared_status(session: Any, txn_id: str, status: str, log_fn: Optional
         resp = resp_set.ResponseList.GetAt(0)
         if resp and resp.StatusCode == 0:
             return True
+        if resp:
+            _emit(f"    ClearedStatusMod {txn_id}: status={resp.StatusCode} msg={resp.StatusMessage}", log_fn)
         return False
-    except Exception:
+    except Exception as exc:
+        _emit(f"    ClearedStatusMod {txn_id}: exception: {exc}", log_fn)
         return False
+
+
+# Dispatch table for native transaction types — used by import_transactions()
+_NATIVE_TX_HANDLERS = {
+    'CreditCardCharge':      _import_cc_charge,
+    'CreditCardCredit':      _import_cc_credit,
+    'Check':                 _import_check,
+    'Deposit':               _import_deposit,
+    'Transfer':              _import_transfer,
+    'SalesTaxPaymentCheck':  _import_sales_tax_payment,
+    'SalesReceipt':          _import_sales_receipt,
+}
 
 
 def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional[LogFn] = None) -> int:
-    """Import transactions into QB as JournalEntries.
+    """Import transactions into QB using native types where possible, JournalEntries as fallback.
 
     NEW FORMAT (from per-type export):
       {type, date, num, entity, memo, txn_id,
@@ -992,12 +1534,30 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
       {type, date, account, amount, ...}
       Uses Opening Balance Equity as the offset.
     """
+    global _generic_item_ensured
+    _generic_item_ensured = False  # Reset for each import run
     _emit(f"QBFC Import: Importing {len(transactions)} transactions...", log_fn)
     if transactions:
         sample = transactions[0]
         has_lines = "lines" in sample
         _emit(f"  Format: {'new (with lines)' if has_lines else 'legacy (account+amount)'}", log_fn)
         _emit(f"  Sample tx[0] keys: {list(sample.keys())}", log_fn)
+
+        # Show breakdown by type and native vs JE routing
+        type_counts: Dict[str, int] = {}
+        for t in transactions:
+            tp = t.get('type', 'Unknown')
+            type_counts[tp] = type_counts.get(tp, 0) + 1
+        native_types = set(_NATIVE_TX_HANDLERS.keys())
+        native_count = sum(c for t, c in type_counts.items() if t in native_types)
+        je_count = len(transactions) - native_count
+        _emit(f"  Transaction types: {type_counts}", log_fn)
+        _emit(f"  Native routing: {native_count} txns via native handlers, {je_count} via JournalEntry fallback", log_fn)
+
+    # ── Pre-flight: fix accounts with wrong types for native handlers ──
+    # Must run BEFORE _ensure_referenced_accounts so deleted accounts get
+    # properly recreated.
+    _fix_account_types_for_native_txns(session, transactions, log_fn)
 
     # ── Pre-flight: ensure all referenced accounts exist (auto-create stubs) ──
     _ensure_referenced_accounts(session, transactions, log_fn)
@@ -1039,33 +1599,34 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
         if ' ' in date_str:
             date_str = date_str.split(' ')[0]
 
-        # --- Native credit card transactions ---
-        # JournalEntries flip the charge/payment presentation in the CC
-        # register, so we must use native CreditCardCharge / CreditCardCredit.
-        if tx_type == 'CreditCardCharge' and lines:
-            result = _import_cc_charge(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
-                                       return_txn_id=True)
+        # --- Native transaction routing ---
+        # Route each transaction type through its proper QBFC Add request
+        # so it shows correctly in the register (no GENJRN entries).
+        native_handler = _NATIVE_TX_HANDLERS.get(tx_type)
+        if native_handler and lines:
+            result = native_handler(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
+                                    return_txn_id=True)
             if result and result not in (None, -1, 0):
                 ok += 1
                 if isinstance(result, str) and result not in ('OK', 'EXISTS'):
                     txns_to_clear.append(result)
             elif result == 0 or result is None:
-                skipped += 1
+                # Native handler returned skip/None — fall through to JE
+                if result == 0:
+                    skipped += 1
+                else:
+                    # None means native failed, try JE fallback
+                    pass
             else:
                 failed += 1
-            continue
-        if tx_type == 'CreditCardCredit' and lines:
-            result = _import_cc_credit(session, tx, date_str, ref_num, entity, memo, lines, log_fn,
-                                       return_txn_id=True)
-            if result and result not in (None, -1, 0):
-                ok += 1
-                if isinstance(result, str) and result not in ('OK', 'EXISTS'):
-                    txns_to_clear.append(result)
-            elif result == 0 or result is None:
-                skipped += 1
-            else:
-                failed += 1
-            continue
+            # If result was truthy or 0 (skipped), move to next tx
+            if result is not None:
+                # Progress update
+                if (i + 1) % 250 == 0:
+                    _emit(f"  Progress: {i+1}/{len(transactions)} ({ok} ok, {failed} failed, {skipped} skipped)", log_fn)
+                continue
+            # result is None → native handler failed, fall through to JE path
+            _emit(f"  {tx_type} #{i}: native failed, falling back to JournalEntry", log_fn)
 
         # --- New format: transaction has explicit debit/credit lines ---
         if lines:
@@ -1111,8 +1672,10 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
 
             try:
                 for acct, debit, credit in valid_lines:
-                    # QB requires entity on A/P (type=5) and A/R (type=1) lines.
-                    # Use the cached account type, falling back to name heuristic.
+                    # QB REQUIRES entity on A/P (type=0) and A/R (type=1) lines —
+                    # for those, fall back to a dummy entity if none provided.
+                    # For ALL other account types, set entity if available so
+                    # the transaction appears under the customer/vendor in QB.
                     acct_key = acct.strip().lower()
                     acct_type = _ACCOUNT_TYPE_CACHE.get(acct_key)
                     if acct_type is None:
@@ -1121,11 +1684,11 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                             acct_type = 0  # QBFC enum: 0=AP
                         elif 'accounts receivable' in acct_lower or acct_lower.startswith('a/r'):
                             acct_type = 1  # QBFC enum: 1=AR
-                    needs_entity = acct_type in (0, 1)
+                    is_ap_ar = acct_type in (0, 1)
                     line_entity = entity
-                    if needs_entity and not line_entity:
+                    if is_ap_ar and not line_entity:
                         line_entity = 'TimeWarp Migration'
-                    if needs_entity:
+                    if is_ap_ar:
                         _emit(f"    -> AP/AR line: acct='{acct}' type={acct_type} entity='{line_entity}'", log_fn)
 
                     if debit > 0:
@@ -1195,6 +1758,9 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                     ol.JournalDebitLine.Amount.SetValue(abs(amount))
                     try: ol.JournalDebitLine.Memo.SetValue(line_memo[:4095])
                     except Exception: pass
+                    if entity:
+                        try: ol.JournalDebitLine.EntityRef.FullName.SetValue(entity)
+                        except Exception: pass
                     ol2 = je.ORJournalLineList.Append()
                     ol2.JournalCreditLine.AccountRef.FullName.SetValue('Opening Balance Equity')
                     ol2.JournalCreditLine.Amount.SetValue(abs(amount))
@@ -1206,6 +1772,9 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
                     ol.JournalCreditLine.Amount.SetValue(abs(amount))
                     try: ol.JournalCreditLine.Memo.SetValue(line_memo[:4095])
                     except Exception: pass
+                    if entity:
+                        try: ol.JournalCreditLine.EntityRef.FullName.SetValue(entity)
+                        except Exception: pass
                     ol2 = je.ORJournalLineList.Append()
                     ol2.JournalDebitLine.AccountRef.FullName.SetValue('Opening Balance Equity')
                     ol2.JournalDebitLine.Amount.SetValue(abs(amount))
@@ -1236,10 +1805,16 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
     if txns_to_clear:
         _emit(f"  Marking all {len(txns_to_clear)} transactions as reconciled...", log_fn)
         cleared_ok = 0
+        cleared_fail = 0
         for txn_id in txns_to_clear:
             if _set_cleared_status(session, txn_id, "Cleared", log_fn):
                 cleared_ok += 1
-        _emit(f"  Reconciled: {cleared_ok}/{len(txns_to_clear)} marked as cleared ✓", log_fn)
+            else:
+                cleared_fail += 1
+                if cleared_fail <= 5:
+                    _emit(f"    FAILED to clear TxnID={txn_id}", log_fn)
+        _emit(f"  Reconciled: {cleared_ok}/{len(txns_to_clear)} marked as cleared "
+              f"({cleared_fail} failed)", log_fn)
 
     return ok
 
@@ -1248,20 +1823,52 @@ def import_transactions(session: Any, transactions: List[Dict], log_fn: Optional
 # Opening-balance adjustments
 # ---------------------------------------------------------------------------
 
+def _query_qb_account_balances(session: Any, log_fn: Optional[LogFn] = None) -> Dict[str, float]:
+    """Query actual account balances from the open QB company file.
+
+    Returns dict of {account_full_name: balance} where balance is the
+    raw value from QB (positive for debit-normal, positive for credit-normal).
+    """
+    balances: Dict[str, float] = {}
+    try:
+        req = _create_request_set(session)
+        req.AppendAccountQueryRq()
+        resp_set = session.session_manager.DoRequests(req)
+        resp = resp_set.ResponseList.GetAt(0)
+        if resp and resp.StatusCode == 0 and resp.Detail:
+            for i in range(resp.Detail.Count):
+                acct = resp.Detail.GetAt(i)
+                name = ""
+                bal = 0.0
+                try:
+                    name = acct.FullName.GetValue() if acct.FullName else ""
+                except Exception:
+                    pass
+                try:
+                    bal = float(acct.Balance.GetValue()) if acct.Balance else 0.0
+                except Exception:
+                    pass
+                if name:
+                    balances[name] = bal
+            _emit(f"  Queried {len(balances)} account balances from QB", log_fn)
+    except Exception as exc:
+        _emit(f"  WARNING: Could not query QB account balances: {exc}", log_fn)
+    return balances
+
+
 def import_opening_balances(
     session: Any,
     accounts: List[Dict],
     transactions: List[Dict],
     log_fn: Optional[LogFn] = None,
 ) -> int:
-    """Create JE(s) to adjust for opening balances that QB stores outside
-    of the visible transaction stream.
+    """Create JE(s) to adjust opening balances after all transactions imported.
 
-    For each account, compute the net movement implied by the snapshot
-    transactions, compare to the actual balance recorded by QB 2023, and
-    post the difference against "Opening Balance Equity".
+    APPROACH: Query the ACTUAL balances from QB 2021 (post-import), compare
+    to the TARGET balances from the QB 2023 snapshot, and only post JEs for
+    the real differences. This avoids double-counting.
 
-    This must run AFTER import_transactions so we don't double-count.
+    This must run AFTER import_transactions.
     The JE is dated one day before the earliest transaction.
     """
     import math
@@ -1269,16 +1876,8 @@ def import_opening_balances(
 
     _emit("QBFC Import: Computing opening-balance adjustments...", log_fn)
 
-    # 1. Derive per-account net movement from snapshot txns
-    derived: Dict[str, float] = {}
-    for tx in transactions:
-        for ln in tx.get("lines", []):
-            acct = (ln.get("account") or "").strip()
-            if not acct:
-                continue
-            d = float(ln.get("debit", 0) or 0)
-            c = float(ln.get("credit", 0) or 0)
-            derived[acct] = derived.get(acct, 0.0) + d - c
+    # 1. Query ACTUAL balances from QB 2021 (what transactions produced)
+    qb_balances = _query_qb_account_balances(session, log_fn)
 
     # 2. Find the earliest txn date, OB JE goes one day earlier
     dates = [tx.get("date", "") for tx in transactions if tx.get("date")]
@@ -1291,21 +1890,98 @@ def import_opening_balances(
     else:
         ob_date = "2000-01-01"
 
-    # 3. Compare actual vs derived, collect gaps
-    gaps: List[tuple] = []  # (account_name, gap_amount)  positive = debit needed
+    # 3. Compare target (snapshot) vs actual (QB 2021), collect gaps
+    # Both QB 2023 and QB 2021 report balances the same way —
+    # positive for the "natural" direction of each account type.
+    # So we can compare them DIRECTLY without sign conversion.
+    # The gap in QB's native sign tells us what adjustment is needed.
+
+    # Credit-normal QBFC ENAccountType enum values (for building the JE correctly):
+    # These accounts naturally carry credit balances; positive QB balance = credit.
+    CREDIT_NORMAL_TYPES = {
+        0,   # AccountsPayable
+        4,   # CreditCard
+        5,   # Equity
+        8,   # Income
+        9,   # LongTermLiability
+        13,  # OtherCurrentLiability
+        15,  # OtherIncome
+    }
+    # Build name→type map from account list
+    acct_type_map: Dict[str, int] = {}
+    for ai in accounts:
+        n = (ai.get("name") or "").strip()
+        t = ai.get("type")
+        if n and t is not None:
+            try:
+                acct_type_map[n] = int(t)
+            except (ValueError, TypeError):
+                pass
+
+    gaps: List[tuple] = []  # (account_name, gap_amount)
     for acct_info in accounts:
         name = (acct_info.get("name") or "").strip()
         if not name:
             continue
-        actual = float(acct_info.get("balance", 0) or 0)
-        txn_derived = derived.get(name, 0.0)
-        gap = actual - txn_derived
+        # Skip Opening Balance Equity — we use it as the offset account
+        if name.lower() in ("opening balance equity", "retained earnings"):
+            continue
 
-        if abs(gap) < 0.005:
+        target = float(acct_info.get("balance", 0) or 0)
+        current = qb_balances.get(name, 0.0)
+
+        # Both are in QB's native sign, so gap = target - current
+        # represents how much MORE balance the account needs.
+        # For debit-normal accounts: positive gap = needs more debit
+        # For credit-normal accounts: positive gap = needs more credit
+        raw_gap = target - current
+
+        if abs(raw_gap) < 0.005:
             continue  # close enough
 
-        gap = round(gap, 2)
-        gaps.append((name, gap))
+        raw_gap = round(raw_gap, 2)
+        acct_type = acct_type_map.get(name)
+        is_credit_normal = acct_type is not None and acct_type in CREDIT_NORMAL_TYPES
+
+        # Convert to debit-positive convention for the JE:
+        # For debit-normal: positive gap → debit the account
+        # For credit-normal: positive gap means needs more credit → credit the account
+        if is_credit_normal:
+            je_amount = -raw_gap  # positive raw_gap → credit → negative in debit convention
+        else:
+            je_amount = raw_gap   # positive raw_gap → debit
+
+        gaps.append((name, je_amount))
+        _emit(f"    {name}: target={target:.2f} current={current:.2f} gap={raw_gap:+.2f} (JE: {je_amount:+.2f})", log_fn)
+
+    # Also check QB 2021 accounts that are NOT in the snapshot but have
+    # non-zero balances (e.g., accounts created on-the-fly during import
+    # like "Personal Bk Acct").  Their target balance is 0.
+    snapshot_names = {(a.get("name") or "").strip().lower() for a in accounts}
+    SKIP_AUTO = {"opening balance equity", "retained earnings",
+                 "undeposited funds", "payroll liabilities"}
+    _, existing_types = _list_accounts_with_types(session, log_fn=None)
+    for acct_name_lower, acct_type in existing_types.items():
+        if acct_name_lower in snapshot_names:
+            continue
+        if acct_name_lower in SKIP_AUTO:
+            continue
+        current = qb_balances.get(acct_name_lower, 0.0)
+        # Try original-cased name first; fall back to lower-cased lookup
+        orig_name = acct_name_lower
+        for n2 in qb_balances:
+            if n2.lower() == acct_name_lower:
+                orig_name = n2
+                current = qb_balances[n2]
+                break
+        if abs(current) < 0.005:
+            continue
+        raw_gap = -current  # target is 0, so gap = 0 - current
+        raw_gap = round(raw_gap, 2)
+        is_credit_normal = acct_type in CREDIT_NORMAL_TYPES
+        je_amount = -raw_gap if is_credit_normal else raw_gap
+        gaps.append((orig_name, je_amount))
+        _emit(f"    {orig_name}: target=0.00 current={current:.2f} gap={raw_gap:+.2f} (JE: {je_amount:+.2f}) [auto-created acct]", log_fn)
 
     if not gaps:
         _emit("  No opening-balance adjustments needed — all accounts match.", log_fn)
@@ -1321,7 +1997,7 @@ def import_opening_balances(
         req = _create_request_set(session)
         add = req.AppendAccountAddRq()
         add.Name.SetValue("Opening Balance Equity")
-        add.AccountType.SetValue(14)  # Equity
+        add.AccountType.SetValue(5)  # Equity (QBFC enum 5)
         resp_set = session.session_manager.DoRequests(req)
         resp = resp_set.ResponseList.GetAt(0)
         if resp.StatusCode == 0:
@@ -1430,50 +2106,81 @@ def _apply_address_block(addr_obj: Any, src: Dict[str, str]) -> None:
 
 
 def import_company_info(session: Any, info: Dict[str, Any], log_fn: Optional[LogFn] = None) -> int:
-    """Restore company profile via AppendCompanyActivityModRq.
+    """Restore company profile fields.
 
-    Writes back every field captured by _extract_company_info on the export side.
-    Empty fields are skipped (so we never clobber a value with an empty string).
-    Returns 1 on success, 0 on no-op/failure.
+    Tries multiple QBFC method names because the Mod request varies across
+    SDK versions and QB years.  Empty fields are skipped so we never clobber
+    a value with an empty string.  Returns 1 on success, 0 on failure.
     """
     if not info:
         _emit("  Company: no company info in snapshot, skipping", log_fn)
         return 0
+
+    # Try each known Mod appender name until one works
+    mod_method_names = [
+        "AppendCompanyModRq",
+        "AppendCompanyActivityModRq",
+    ]
+
+    def _try_company_mod(method_name: str) -> int:
+        try:
+            req = _create_request_set(session)
+            appender = getattr(req, method_name, None)
+            if appender is None:
+                _emit(f"  Company: {method_name} not available on this SDK", log_fn)
+                return -1  # method not found, try next
+            mod = appender()
+
+            _set_if(mod, "CompanyName",                info.get("company_name"))
+            _set_if(mod, "LegalCompanyName",           info.get("legal_name"))
+            _apply_address_block(getattr(mod, "Address", None),       info.get("address") or {})
+            _apply_address_block(getattr(mod, "LegalAddress", None),  info.get("legal_address") or {})
+            _set_if(mod, "Phone",                      info.get("phone"))
+            _set_if(mod, "Fax",                        info.get("fax"))
+            _set_if(mod, "Email",                      info.get("email"))
+            _set_if(mod, "CompanyWebSite",             info.get("website"))
+            _set_if(mod, "EIN",                        info.get("ein"))
+            _set_if(mod, "SSN",                        info.get("ssn"))
+            _set_if(mod, "TaxForm",                    info.get("tax_form"))
+            _set_if(mod, "FirstMonthInFiscalYear",     info.get("first_month_fiscal_year"))
+            _set_if(mod, "FirstMonthInIncomeTaxYear",  info.get("first_month_income_tax_year"))
+            _set_if(mod, "CompanyType",                info.get("company_type"))
+
+            resp_set = session.session_manager.DoRequests(req)
+            resp = resp_set.ResponseList.GetAt(0)
+            if resp is None:
+                _emit(f"  Company: {method_name} — no response", log_fn)
+                return 0
+            if resp.StatusCode == 0:
+                cn = info.get("company_name") or "(no name)"
+                ln = info.get("legal_name") or "(no legal name)"
+                _emit(f"  Company: restored '{cn}' / legal '{ln}' via {method_name}", log_fn)
+                return 1
+            else:
+                _emit(f"  Company: {method_name} status={resp.StatusCode} msg={resp.StatusMessage}", log_fn)
+                return 0
+        except Exception as exc:  # noqa: BLE001
+            _emit(f"  Company: {method_name} failed: {exc}", log_fn)
+            return -1  # exception = try next method
+
+    for mname in mod_method_names:
+        result = _try_company_mod(mname)
+        if result >= 0:
+            return result
+    _emit("  Company: no working Mod method found — enumerating available methods", log_fn)
+    # Last resort: enumerate all Append*Mod* methods on the request set
     try:
         req = _create_request_set(session)
-        mod = req.AppendCompanyActivityModRq()
-
-        _set_if(mod, "CompanyName",                info.get("company_name"))
-        _set_if(mod, "LegalCompanyName",           info.get("legal_name"))
-        _apply_address_block(getattr(mod, "Address", None),       info.get("address") or {})
-        _apply_address_block(getattr(mod, "LegalAddress", None),  info.get("legal_address") or {})
-        _set_if(mod, "Phone",                      info.get("phone"))
-        _set_if(mod, "Fax",                        info.get("fax"))
-        _set_if(mod, "Email",                      info.get("email"))
-        _set_if(mod, "CompanyWebSite",             info.get("website"))
-        _set_if(mod, "EIN",                        info.get("ein"))
-        _set_if(mod, "SSN",                        info.get("ssn"))
-        _set_if(mod, "TaxForm",                    info.get("tax_form"))
-        _set_if(mod, "FirstMonthInFiscalYear",     info.get("first_month_fiscal_year"))
-        _set_if(mod, "FirstMonthInIncomeTaxYear",  info.get("first_month_income_tax_year"))
-        _set_if(mod, "CompanyType",                info.get("company_type"))
-
-        resp_set = session.session_manager.DoRequests(req)
-        resp = resp_set.ResponseList.GetAt(0)
-        if resp is None:
-            _emit("  Company: no response", log_fn)
-            return 0
-        if resp.StatusCode == 0:
-            cn = info.get("company_name") or "(no name)"
-            ln = info.get("legal_name") or "(no legal name)"
-            _emit(f"  Company: restored '{cn}' / legal '{ln}'", log_fn)
-            return 1
-        else:
-            _emit(f"  Company: CompanyActivityMod status={resp.StatusCode} msg={resp.StatusMessage}", log_fn)
-            return 0
-    except Exception as exc:  # noqa: BLE001
-        _emit(f"  Company: import_company_info failed: {exc}", log_fn)
-        return 0
+        candidates = [m for m in dir(req) if 'company' in m.lower() and 'mod' in m.lower()]
+        _emit(f"  Company: candidate methods = {candidates}", log_fn)
+        for cand in candidates:
+            result = _try_company_mod(cand)
+            if result >= 0:
+                return result
+    except Exception as exc:
+        _emit(f"  Company: enumeration failed: {exc}", log_fn)
+    _emit("  Company: could not restore company info — no compatible SDK method found", log_fn)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1529,25 +2236,59 @@ def import_accounting_preferences(session: Any, prefs: Dict[str, Any], log_fn: O
 
     MUST be called BEFORE importing accounts — otherwise account numbers
     are silently accepted but never displayed in the Chart of Accounts.
+
+    Uses direct COM attribute access (not getattr) for reliable interop.
     """
     acct_prefs = (prefs or {}).get("accounting") or {}
     if not acct_prefs:
         _emit("  Preferences: no accounting preferences in snapshot", log_fn)
         return 0
+
+    _emit(f"  Preferences: snapshot accounting data = {acct_prefs}", log_fn)
+
+    # --- Attempt 1: Direct COM property access (most reliable) ---
     try:
         req = _create_request_set(session)
         mod = req.AppendPreferencesModRq()
-        ap = getattr(mod, "AccountingPreferences", None)
+
+        # Direct COM access — don't use getattr which can fail with win32com
+        try:
+            ap = mod.AccountingPreferences
+            _emit("  Preferences: AccountingPreferences accessed via direct property", log_fn)
+        except AttributeError:
+            _emit("  Preferences: AccountingPreferences not available as property, trying getattr", log_fn)
+            ap = getattr(mod, "AccountingPreferences", None)
+
         if ap is None:
             _emit("  Preferences: AccountingPreferences block not exposed by SDK", log_fn)
             return 0
 
-        _set_if(ap, "IsUsingAccountNumbers",         acct_prefs.get("is_using_account_numbers"))
-        _set_if(ap, "IsRequiringAccounts",            acct_prefs.get("is_requiring_accounts"))
-        _set_if(ap, "IsUsingClassTracking",           acct_prefs.get("is_using_class_tracking"))
-        _set_if(ap, "IsUsingAuditTrail",              acct_prefs.get("is_using_audit_trail"))
-        _set_if(ap, "IsAssigningJournalEntryNumbers", acct_prefs.get("is_assigning_journal_no"))
-        # ClosingDate is read-only via PreferencesMod in most QB versions — skip
+        # Set each preference with verbose logging
+        fields = [
+            ("IsUsingAccountNumbers",         acct_prefs.get("is_using_account_numbers")),
+            ("IsRequiringAccounts",            acct_prefs.get("is_requiring_accounts")),
+            ("IsUsingClassTracking",           acct_prefs.get("is_using_class_tracking")),
+            ("IsUsingAuditTrail",              acct_prefs.get("is_using_audit_trail")),
+            ("IsAssigningJournalEntryNumbers", acct_prefs.get("is_assigning_journal_no")),
+        ]
+        for attr_name, val in fields:
+            if val is None or val == '':
+                _emit(f"    {attr_name}: skipped (empty/None)", log_fn)
+                continue
+            try:
+                # Direct COM access for each field
+                field = getattr(ap, attr_name, None)
+                if field is None:
+                    _emit(f"    {attr_name}: field is None", log_fn)
+                    continue
+                if isinstance(val, str):
+                    bool_val = val.lower() in ('true', '1', 'yes')
+                else:
+                    bool_val = bool(val)
+                field.SetValue(bool_val)
+                _emit(f"    {attr_name}: set to {bool_val}", log_fn)
+            except Exception as exc:
+                _emit(f"    {attr_name}: FAILED to set ({exc})", log_fn)
 
         resp_set = session.session_manager.DoRequests(req)
         resp = resp_set.ResponseList.GetAt(0)
@@ -1555,13 +2296,39 @@ def import_accounting_preferences(session: Any, prefs: Dict[str, Any], log_fn: O
             _emit("  Preferences: no response for accounting prefs", log_fn)
             return 0
         if resp.StatusCode == 0:
-            _emit("  Preferences: Accounting preferences restored (account numbers ON)", log_fn)
+            _emit("  Preferences: ✓ Accounting preferences restored (account numbers ON)", log_fn)
             return 1
         else:
-            _emit(f"  Preferences: accounting status={resp.StatusCode} msg={resp.StatusMessage}", log_fn)
+            _emit(f"  Preferences: SDK returned status={resp.StatusCode} msg={resp.StatusMessage}", log_fn)
+            # Fall through to attempt 2
+    except Exception as exc:  # noqa: BLE001
+        _emit(f"  Preferences: attempt 1 (QBFC) failed: {exc}", log_fn)
+
+    # --- Attempt 2: Retry with fresh session request ---
+    try:
+        _emit("  Preferences: retrying with fresh request...", log_fn)
+        req2 = _create_request_set(session)
+        mod2 = req2.AppendPreferencesModRq()
+        # Only set the most critical one: account numbers
+        try:
+            mod2.AccountingPreferences.IsUsingAccountNumbers.SetValue(True)
+            _emit("  Preferences: set IsUsingAccountNumbers=True (direct chain)", log_fn)
+        except Exception as exc:
+            _emit(f"  Preferences: direct chain failed: {exc}", log_fn)
+            return 0
+
+        resp_set2 = session.session_manager.DoRequests(req2)
+        resp2 = resp_set2.ResponseList.GetAt(0)
+        if resp2 and resp2.StatusCode == 0:
+            _emit("  Preferences: ✓ Account numbers enabled (attempt 2)", log_fn)
+            return 1
+        else:
+            sc = resp2.StatusCode if resp2 else "None"
+            sm = resp2.StatusMessage if resp2 else "no response"
+            _emit(f"  Preferences: attempt 2 status={sc} msg={sm}", log_fn)
             return 0
     except Exception as exc:  # noqa: BLE001
-        _emit(f"  Preferences: accounting failed: {exc}", log_fn)
+        _emit(f"  Preferences: attempt 2 failed: {exc}", log_fn)
         return 0
 
 
@@ -1577,17 +2344,17 @@ def import_preferences(session: Any, prefs: Dict[str, Any], log_fn: Optional[Log
         if rp is None:
             _emit("  Preferences: RemindersPreferences block not exposed by SDK", log_fn)
             return 0
-        _set_if(rp, "IsShowSummary",            rem.get("show_summary"))
-        _set_if(rp, "IsShowList",               rem.get("show_list"))
-        _set_if(rp, "RemindChecksToPrint",      rem.get("remind_chk_to_print"))
-        _set_if(rp, "RemindPaychecksToPrint",   rem.get("remind_paychks_to_print"))
-        _set_if(rp, "RemindInvoicesToSend",     rem.get("remind_invoices_to_send"))
-        _set_if(rp, "RemindOverdueInvoices",    rem.get("remind_overdue_invoices"))
-        _set_if(rp, "RemindToDeposit",          rem.get("remind_to_deposit"))
-        _set_if(rp, "RemindBillsToPay",         rem.get("remind_bills_to_pay"))
-        _set_if(rp, "RemindMemorizedTxns",      rem.get("remind_memorized_txns"))
-        _set_if(rp, "RemindToDoNotes",          rem.get("remind_to_do"))
-        _set_if(rp, "RemindInventoryToReorder", rem.get("remind_inventory"))
+        _set_bool_if(rp, "IsShowSummary",            rem.get("show_summary"))
+        _set_bool_if(rp, "IsShowList",               rem.get("show_list"))
+        _set_bool_if(rp, "RemindChecksToPrint",      rem.get("remind_chk_to_print"))
+        _set_bool_if(rp, "RemindPaychecksToPrint",   rem.get("remind_paychks_to_print"))
+        _set_bool_if(rp, "RemindInvoicesToSend",     rem.get("remind_invoices_to_send"))
+        _set_bool_if(rp, "RemindOverdueInvoices",    rem.get("remind_overdue_invoices"))
+        _set_bool_if(rp, "RemindToDeposit",          rem.get("remind_to_deposit"))
+        _set_bool_if(rp, "RemindBillsToPay",         rem.get("remind_bills_to_pay"))
+        _set_bool_if(rp, "RemindMemorizedTxns",      rem.get("remind_memorized_txns"))
+        _set_bool_if(rp, "RemindToDoNotes",          rem.get("remind_to_do"))
+        _set_bool_if(rp, "RemindInventoryToReorder", rem.get("remind_inventory"))
         _set_if(rp, "RemindOpenPurchaseOrders", rem.get("remind_purchase_orders"))
 
         resp_set = session.session_manager.DoRequests(req)
