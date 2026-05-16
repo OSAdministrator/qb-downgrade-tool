@@ -1748,8 +1748,8 @@ class QuickBooksAutomationEngine:
         # QB 2021 is slow — it checks for updates during shutdown.
         # -----------------------------------------------------------
         if menu_close_done:
-            self._emit("  Waiting up to 90s for QB to exit...", log_fn)
-            deadline = time.time() + 90
+            self._emit("  Waiting up to 120s for QB to gracefully exit...", log_fn)
+            deadline = time.time() + 120
             while time.time() < deadline:
                 try:
                     result = subprocess.run(
@@ -1763,7 +1763,7 @@ class QuickBooksAutomationEngine:
                 except Exception:  # noqa: BLE001
                     pass
                 time.sleep(3)
-            self._emit("  QB still running after 90s — will force-kill.", log_fn)
+            self._emit("  QB still running after 120s — will force-kill.", log_fn)
 
         # -----------------------------------------------------------
         # PHASE 3 — Force-kill only as absolute last resort
